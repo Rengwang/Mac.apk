@@ -102,6 +102,23 @@ Mac.apk serves no ads and supports no in-app purchases, by design. If you publis
 app that runs on Mac.apk and want to talk about a partnership, or would rather it
 not run here, email Kaleb@voltare.us. [Details →](https://github.com/kksimp/Mac.apk/wiki/For-Developers-and-Publishers)
 
+## Mac.apk coin
+
+Mac.apk has a coin on [pump.fun](https://pump.fun/coin/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump).
+It is optional. You do not need it to use Mac.apk, it unlocks nothing in the app, and
+it does not change the [license](#license) or give any rights to the code.
+
+Contract address (Solana):
+
+```
+2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump
+```
+
+[pump.fun](https://pump.fun/coin/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump) · [Solscan](https://solscan.io/token/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump)
+
+Always check the address above against this repository before you trade anything.
+This is not financial advice.
+
 ## License
 
 Mac.apk is **open source under the [GNU AGPL v3.0](LICENSE)**, and a **commercial
@@ -142,5 +159,6 @@ build recipe) is attached to that release on the
 
 - **Project page:** https://projects.voltare.us/macapk
 - **Wiki:** https://github.com/kksimp/Mac.apk/wiki
+- **Coin:** https://pump.fun/coin/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump
 - **Commercial licensing:** Kaleb@voltare.us
 - **Bug reports:** Kaleb@voltare.us or [open an issue](../../issues/new)
