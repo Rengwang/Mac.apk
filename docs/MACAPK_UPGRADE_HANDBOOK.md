@@ -1,7 +1,8 @@
 # Mac.apk 通用 Android 兼容运行时升级手册
 
 - 最后整理：2026-10-29
-- 已验证实现提交：`4706bf2`；Activity 任务 API 修复：`cb0e055`
+- 已验证实现提交：`4706bf2`；Activity 任务 API 修复：`cb0e055`；DEX
+  成员类动态代理修复见 5.8
 - 工作分支：`codex/universal-android-runtime-20261029`
 - 上游仓库：<https://github.com/kksimp/Mac.apk>
 - 上游兼容分支基点：`25bc68b`（v1.0.2303）
@@ -47,13 +48,13 @@ Mac.apk 缺的是哪一项 Android 语义；只有业务自身依赖的 native V
 - 没有对远端主线强推，也没有改写任何历史。整理结果保存在独立分支，便于
   分阶段审查和后续合并。
 
-当前最终基线（2026-10-29 的 clean build，内容指纹如下）：
+当前最终基线（2026-10-29 最近一次完整 build，内容指纹如下）：
 
 ```text
-CONVERTER_ID=ff20d6c275f1c044
+CONVERTER_ID=1b0ad561c01dc6ff
 FRAMEWORK_ID=440bb2dbd3c3b4b6
-JAVA_ID=6300f4c686b4553e
-JARS_ID=05e2ecb996eff2d7
+JAVA_ID=81b79c4b93020dff
+JARS_ID=ee52ea0480521493
 NATIVE_ID=773fd23055a186aa
 ```
 
@@ -114,7 +115,8 @@ NATIVE_ID=773fd23055a186aa
 
 1. runtime 创建 HotSpot JVM，加载 Java 引导和 Android Framework jar。
 2. 自定义 class loader 读取 DEX，`dex2jvm` 将其转换为 JVM bytecode。
-3. `ClassFileRewriter` 修补 JVM 与 Android 的少量结构性差异，例如 boot class
+3. `DexConverter` 重建 classfile 结构，并把 DEX `InnerClass` 注解中的源码级
+   可见性同步到 JVM 顶层类访问标志；`ClassFileRewriter` 再修补 boot class
    loader 和 mixin 生成本应只存在于 `<init>`/`<clinit>` 的 final 写入。
 4. `ActivityHost`、`ViewRootImpl`、Looper 和 Cocoa bridge 共同建立 Android
    生命周期、窗口、输入与绘制循环。
@@ -329,6 +331,45 @@ String root = tasks.get(0).getTaskInfo().baseActivity.getClassName();
 Flutter、Compose、React Native 和自定义返回导航。2026-10-29 的安装态验收中，
 “每周必看”成功显示第 396 期正文和视频卡片，“入站必刷”也由用户确认正常显示。
 
+### 5.8 2026-10-29：DEX 成员类可见性与动态代理白屏
+
+从“每周必看”列表点入具体视频时，页面能进入对应的活动，却整页持续白屏。
+日志中的首个致命异常是：
+
+```text
+java.lang.IllegalAccessError: class jdk.proxy2.$Proxy61 cannot access
+its superinterface com.bilibili.ship.theseus.playlist.f$a
+```
+
+这不是页面网络数据为空，也不是 Compose、WebView 或视频层绘制停止。DEX 中该
+成员接口的 `class_def` 访问位是包私有，而同一类型的
+`Ldalvik/annotation/InnerClass;` 系统注解把源码级成员标志声明为 `public`。
+Android ART 按 `InnerClass` 标志理解该接口；旧转换器却只把前者写入 JVM
+classfile 的顶层访问位。
+
+页面初始化 Retrofit 时调用 `Proxy.newProxyInstance()`。JDK 依据
+`Class.getModifiers()` 把这组接口视为 public，并把代理放入 `jdk.proxy2` 动态
+模块；HotSpot 随后读取代理父接口的实际 classfile 标志，以包私有为由拒绝访问，
+导致动态代理创建失败。异常中断了启动视频详情页所需的依赖图，活动背景仍然
+存在，所以用户看到的是整页白色，而不是应用进程崩溃或视频缓冲界面。
+
+修复位于 DEX 转换边界：
+
+- `DexConverter.classAccessFlags()` 读取成员类自身的 `InnerClass` 系统注解；
+- 源码级标志为 `ACC_PUBLIC` 或 `ACC_PROTECTED` 时，为非接口 classfile 顶层
+  补上 `ACC_PUBLIC`，protected 的源码语义仍由 `InnerClasses` 属性保存；
+- private 和包私有成员类型不提升，继续按原包访问路径执行；
+- 新增 `debug/InnerClassAccessTest.java`，覆盖成员接口与普通成员类的 public、
+  protected、private、包私有和已经 public 的幂等情况；
+- `DEX2JVM_INNER_CLASS_PUBLIC=0` 可让转换器回到旧的原始 `class_def` 标志，供
+  定位转换回归时 bisect。
+
+这项修复没有应用包名、类名、资源 ID、Retrofit 或业务接口判断。任何 DEX 中
+带同类 public/protected `InnerClass` 元数据、又通过 Java 动态代理访问成员接口
+的 Android 应用都走同一条修复路径。用户已确认修复后的安装版可以打开该视频
+页面；后续仍需用合成 DEX fixture 做转换后 classfile、`Proxy` 和回退开关的端到端
+回归，不能把单一应用验收当作长期测试替代。
+
 ## 6. 兼容运行时关键实现
 
 `4706bf2` 共修改 39 个文件：3347 行新增、213 行删除。以下按能力拆分，而不是按
@@ -508,6 +549,37 @@ installed-bundle LaunchServices 环境；用户显式环境变量统一在默认
 或跨应用 Recents。后续扩展应保留当前快照边界，再让 `ActivityHost` 真正维护
 任务集合，而不是让 Framework 层猜一个任务。
 
+### 6.10 DEX 成员类访问标志归一化
+
+DEX 和 JVM classfile 对嵌套类型的访问信息采用不同结构。DEX 的 `class_def_item`
+保存类型本身的访问位，`dalvik.annotation.InnerClass` 另存编译器生成的源码级成员
+标志；JVM classfile 用顶层 `access_flags` 控制系统访问，再以 `InnerClasses`
+属性保存成员可见性。D8/R8 合法地产生两处不一致的表示时，转换器必须保留两者的
+组合语义。
+
+当前处理顺序是：
+
+1. 从 `class_def` 复制 JVM 支持的类访问位；
+2. 对非接口类型补上 JVM 要求的 `ACC_SUPER`；
+3. 读取该类型自身的系统 `InnerClass` 注解；
+4. 若注解为 public/protected，则确保顶层 classfile 有 `ACC_PUBLIC`；
+5. 保持 private 和包私有不变，并继续生成原有 `InnerClasses` 属性。
+
+这个顺序同时保证嵌套接口不会错误获得 `ACC_SUPER`。protected 嵌套类在 JVM
+classfile 顶层不能直接表达 protected，javac 同样使用 public 顶层访问位，并把
+源码级 protected 保留在 `InnerClasses` 中。改变的是 HotSpot 定义动态代理时的
+实际访问判断，应用通过反射看到的 `Class.getModifiers()` 仍来自成员元数据。
+
+最近一次完整构建得到：
+
+```text
+CONVERTER_ID=1b0ad561c01dc6ff
+FRAMEWORK_ID=440bb2dbd3c3b4b6
+JAVA_ID=81b79c4b93020dff
+JARS_ID=ee52ea0480521493
+NATIVE_ID=773fd23055a186aa
+```
+
 ## 7. 验证与可重复检查
 
 ### 7.1 构建
@@ -579,11 +651,11 @@ debug/entitlements_check.sh
   的完整 LaunchServices 路径。
 
 补齐 `ActivityManager.getAppTasks()` 后，再次执行 Java-only 编译、完整 clean
-build 和 launcher 构建。最终源码对应的五项内容标识为
+build 和 launcher 构建。该阶段五项内容标识为
 `CONVERTER_ID=ff20d6c275f1c044`、`FRAMEWORK_ID=440bb2dbd3c3b4b6`、
 `JAVA_ID=6300f4c686b4553e`、`JARS_ID=05e2ecb996eff2d7`、
 `NATIVE_ID=773fd23055a186aa`。此前看到的 `JARS_ID=3f30e4cc81407f80`
-只是任务 API 接入过程中的中间产物，不是当前基线。以下检查通过：
+只是任务 API 接入过程中的中间产物。以下检查通过：
 
 - 新增的 `ActivityManagerTasksTest`；
 - 此前 9 个不启动完整 runtime 的 Java 测试；
@@ -591,6 +663,14 @@ build 和 launcher 构建。最终源码对应的五项内容标识为
 - bundle self-containment 审计；
 - 安装态“每周必看”显示第 396 期正文和视频卡片；
 - 用户安装态验收：“每周必看、入站必刷”均成功显示，弹幕和视频未报告回归。
+
+InnerClass 修复随后重新生成转换缓存，并完成完整构建、launcher 构建和安装迁移，
+得到当前五项标识 `CONVERTER_ID=1b0ad561c01dc6ff`、
+`FRAMEWORK_ID=440bb2dbd3c3b4b6`、`JAVA_ID=81b79c4b93020dff`、
+`JARS_ID=ee52ea0480521493`、`NATIVE_ID=773fd23055a186aa`。新增的
+`InnerClassAccessTest` 通过。用户随后在安装态从“每周必看”点进具体视频，确认
+此前整页白屏的详情页恢复正常。本次整理按用户要求没有再次启动应用或重跑测试，
+后续提交只增加文档，不改变已构建的生产转换器。
 
 三个需要真实 Mac.apk runtime 的检查不能在裸 `java -cp android-framework.jar` 中
 替代完整宿主：`DrawableIdentityAndTintTest` 需要 JNI 日志绑定和真实 APK，
@@ -701,15 +781,32 @@ README/CLA 改动，再重跑全套验证；不要把现有兼容分支 force-pu
 如果后续发现应用依赖多项 `getAppTasks()`，应扩展 `ActivityHost` 内部的任务集合
 和稳定 ID 分配，不应在 `ActivityManager` 里复制当前 Activity 来伪造第二项。
 
+### 8.11 DEX 成员类修复仍需端到端 fixture
+
+`InnerClassAccessTest` 验证的是访问位归一化函数，尚未覆盖从最小 DEX 输入到最终
+classfile 的完整链路。后续应加入一个不依赖商用 APK 的 fixture，至少同时检查：
+
+- 转换后 classfile 的真实 `access_flags`；
+- 保留的 `InnerClasses` 属性、`getEnclosingClass()` 和 `isMemberClass()`；
+- public/protected 成员接口可以创建 `Proxy.newProxyInstance()`；
+- private/包私有接口仍走非 public 代理路径；
+- 普通嵌套类与嵌套接口都不会获得错误标志；
+- 独立 JVM 进程设置 `DEX2JVM_INNER_CLASS_PUBLIC=0` 后确实恢复旧行为。
+
+这项测试缺口不会改变当前通用实现的结论，但必须补入持续集成。回退开关只在
+转换器 JVM 启动时读取一次，测试不能在同一进程里运行时修改环境变量。
+
 ## 9. 后续升级路线
 
 ### 阶段 0：稳定当前分支
 
 验收标准：
 
-- 固定 `cb0e055` 的 build ID 和 app bundle 校验值；
+- 固定当前 `CONVERTER_ID=1b0ad561c01dc6ff` 的 build ID、app bundle 和 DEX
+  fixture 校验值；
 - `OwnerFrameBarrierTest` 连续 100 次通过；
 - Java/native 测试纳入一条可重复脚本；
+- 增加 DEX→classfile→`Proxy.newProxyInstance()` 的端到端 fixture；
 - 记录 Dock、控制面板、Finder 的启动环境完全一致；
 - 将 4 个稳定兼容 feature gate 做显式版本号和 fallback。
 
@@ -811,6 +908,11 @@ README/CLA 改动，再重跑全套验证；不要把现有兼容分支 force-pu
 - `build/`、`runtime/build/`、`runtime/translator/build/` 和
   `thirdparty/framework-res/` 是可再生本地产物，不应进入提交或发布分支。
 
+2026-10-29 的最终残留检查确认，除本手册的说明更新外，工作树只有
+`runtime/java/com/macapk/dex/DexConverter.java` 和
+`debug/InnerClassAccessTest.java` 两个本次功能文件；没有发现需要删除或归档的
+未跟踪过程文件。GitHub 发布树继续保留上游 README、赞助和 CLA 配置。
+
 源码注释中仍有许多对早期 `docs/*.md` 设计记录的引用。这些文档已从公开工作树
 移除，引用保留的是当时的 AOSP 依据、测量过程和设计理由，不是运行时依赖，也不
 是损坏的链接。不要为了消除链接而批量删除注释；需要追溯时从 Git 历史读取原文，
@@ -851,6 +953,7 @@ git show <旧提交>:<路径>
 | `MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE=0` | 关闭 native SurfaceTexture 合成 |
 | `MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA=0` | 关闭透明 Surface alpha 保护 |
 | `MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE=0` | 关闭 Choreographer native 唤醒 |
+| `DEX2JVM_INNER_CLASS_PUBLIC=0` | 恢复 DEX 成员类的旧顶层访问位，用于动态代理问题 bisect |
 
 诊断 Surface 问题时同时记录 codec、present、size、z-order 和 owner 五类信息；
 只看“是否仍在解码”无法判断屏幕是否被另一个透明或不透明层覆盖。
