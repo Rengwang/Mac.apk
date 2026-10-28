@@ -43,8 +43,10 @@ in a verbose virtual-register-file style, that reasoning applied to the old
 path only: it existed so LLVM's mem2reg/GVN could fold it back down, and no
 optimizer runs on this path any more.
 
-See `docs/arm32rc-integration_2026-07-25.md` for the host-ABI contract and the
-sharp edges before editing anything under `src/arm32rc/`.
+The host-ABI contract and register-allocation invariants are documented in
+`src/arm32rc/arm32rc_driver.h`, `src/arm32rc/regmap.h` and `src/arm32rc/guest_state.h`.
+Read those headers together with the mapper and emitter sources before editing anything
+under `src/arm32rc/`.
 
 ## Status
 
@@ -86,8 +88,8 @@ A handful of lifted symbols get **replaced** with hand-written IR instead of lif
 |-----------------|-----|
 | `__cxa_guard_acquire`/`release`/`abort` | Lifted versions deref the guard byte through the host's low-memory layout (wrong) instead of the guest's `.bss` (right). The shim does the bit-test/bit-set on `guest_base + guard_addr`. |
 | `__cxa_atexit`/`finalize`, `atexit` | No-ops — statics live until process exit anyway. |
-| `_ZN7cocos2d11CCFileUtils24fullPathFromRelativePathEPKc` | RETIRED by default (2026-09-26, `MACAPK_COCOS_OWN_FULLPATH`): the guest's own body (`return pszRelativePath;`) is translated, as a device runs it, and getFileData reads the asset through minizip against the installed base.apk. `MACAPK_COCOS_OWN_FULLPATH=0` or `MACAPK_COCOS_FORCE_FOPEN=1` re-installs the historical override, whose shim can prepend the asset directory. See `docs/cocos-fullpath-override-retired_2026-09-26.md`. |
-| `__dynamic_cast` | RETIRED by default (2026-09-26, `MACAPK_ARM32_GUEST_DYNAMIC_CAST`): the image's own libsupc++ / libc++abi body is translated, as a device runs it; the arm32rc translation matched the guest bytes on an ARMv7 CPU in every in-contract cast measured on HCR 1.8.1, HCR 1.43, GD Lite 2.2.11 and JJ 1.3.5. `=0` re-installs the historical host RTTI walker (written for the deleted LLVM lifter's miscompile), which ignores private bases and ARM EABI's by-name type_info compare. See `docs/dynamic-cast-override-retired_2026-09-26.md`. |
+| `_ZN7cocos2d11CCFileUtils24fullPathFromRelativePathEPKc` | RETIRED by default (2026-09-26, `MACAPK_COCOS_OWN_FULLPATH`): the guest's own body (`return pszRelativePath;`) is translated, as a device runs it, and getFileData reads the asset through minizip against the installed base.apk. `MACAPK_COCOS_OWN_FULLPATH=0` or `MACAPK_COCOS_FORCE_FOPEN=1` re-installs the historical override, whose shim can prepend the asset directory. The current rationale and branch points are recorded at `src/main.cpp` near `cocos_own_fullpath_on`. |
+| `__dynamic_cast` | RETIRED by default (2026-09-26, `MACAPK_ARM32_GUEST_DYNAMIC_CAST`): the image's own libsupc++ / libc++abi body is translated, as a device runs it; the arm32rc translation matched the guest bytes on an ARMv7 CPU in every in-contract cast measured on HCR 1.8.1, HCR 1.43, GD Lite 2.2.11 and JJ 1.3.5. `=0` re-installs the historical host RTTI walker (written for the deleted LLVM lifter's miscompile), which ignores private bases and ARM EABI's by-name type_info compare. The current rationale and branch points are recorded at `src/main.cpp` near `guest_dynamic_cast_on`. |
 | `_ZN7cocos2d7CCImage16_initWithPngDataEPvi` | Lifted libpng corrupts a `png_struct` field after ~95 decoded rows under `-O1`. Routed to host libpng instead. |
 | `__aeabi_idiv0`/`__aeabi_ldiv0` | Real ARM EABI raises SIGFPE on divide-by-zero; macOS arm64 silently returns 0. The lifted stubs raised SIGFPE, our handler longjmp'd, and the BMFont parser retried forever. Override returns INT_MAX, matching macOS semantics. |
 | Exception-runtime helpers (`__cxa_throw` etc.) | macOS uses Itanium C++ ABI but the symbol set differs from Bionic's. Stubbed to no-op-returning-0; no current APK exercises real C++ exceptions in the hot path. |
@@ -161,7 +163,7 @@ removed LLVM path.
 bash runtime/translator/test/run_stage0.sh
 ```
 
-Cross-compiles `test/test_add.c` to ARM32 ELF via `clang -target armv7-linux-gnueabihf` + lld, runs the translator on it, builds a tiny C harness that dlopens the result and verifies `add(2, 3) == 5`, `sub(10, 4) == 6`, `triple_add(1, 2, 3) == 6`.
+Cross-compiles `test/test_add.c` to ARM32 ELF via `clang -target armv7-linux-gnueabihf` + lld, runs the translator on it, builds a tiny C harness that dlopens the result and verifies `add(2, 3) == 5`. The larger `test_branches.c` fixture has a separate Stage 1 runner.
 
 ## License
 

@@ -1,9 +1,11 @@
-# macapk-dump
+# macapk-dump（历史诊断工具）
 
 Dump decrypted DEX files from a rooted Android process (MuMu/rooted device).
 
 This is the generalized version of the script used for the official CoolApk
-16.6.5 (NetEase Yidun) dump.
+16.6.5 (NetEase Yidun) dump. It is kept as a standalone compatibility research
+tool and is not called by the normal Mac.apk build or runtime. Its CoolApk
+workflow is a historical example, not a supported production path.
 
 ## Key trick
 
@@ -44,6 +46,6 @@ PY
 - It skips file-backed regions; for Yidun the decrypted DEXes are anonymous rw-p.
 - Some packers split DEXes into more than one page-sized region; every recovered
   region is written as its own `classesN.dex`.
-- After dumping, replace the shell `classes.dex`, set the real Application in the
-  manifest, remove the packer native libs, sign, and provide the original
-  certificate to `macapk-signature-override.sh`.
+- Reconstructing the Application and signing a dumped APK are separate,
+  application-specific research steps. This repository contains no automatic
+  signature-override command for that legacy workflow.

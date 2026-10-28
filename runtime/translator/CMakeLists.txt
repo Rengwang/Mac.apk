@@ -1,12 +1,10 @@
 # Mac.apk translator -- standalone CLI that converts an ARM32 Bionic
 # ELF .so into an arm64-apple-darwin Mach-O dylib.
 #
-# Stage 0 is leaf-function only (PUSH, POP, MOV, ADD, SUB, STR, LDR,
-# BX). Lift target output is LLVM IR text, compiled by an external
-# clang invocation.
-#
-# Linked against Capstone (BSD-3-Clause) for ARM disassembly. No LLVM
-# library link -- we generate IR text and shell out to clang.
+# The current pipeline discovers ARM32 functions with Capstone and translates
+# instructions directly into arm64 machine code. arm32rc emits the Mach-O image
+# in-process; it does not generate LLVM IR or invoke clang/lld for the output.
+# `--keep-ir` remains a discovery-debugging artifact only.
 
 cmake_minimum_required(VERSION 3.20)
 project(macapk_translator LANGUAGES CXX)

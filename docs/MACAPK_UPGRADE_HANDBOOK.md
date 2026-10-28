@@ -1,7 +1,7 @@
 # Mac.apk 通用 Android 兼容运行时升级手册
 
 - 最后整理：2026-10-29
-- 已验证实现提交：`4706bf2`
+- 已验证实现提交：`4706bf2`；Activity 任务 API 修复：`cb0e055`
 - 工作分支：`codex/universal-android-runtime-20261029`
 - 上游仓库：<https://github.com/kksimp/Mac.apk>
 - 上游兼容分支基点：`25bc68b`（v1.0.2303）
@@ -40,19 +40,20 @@ Mac.apk 缺的是哪一项 Android 语义；只有业务自身依赖的 native V
 本分支当前相对上游 `main` 分为两条历史：
 
 - 上游 `main` 为 `ce1499e`。
-- 本地兼容链从 `25bc68b` 分出，当前已验证实现点为 `4706bf2`。
+- 本地兼容链从 `25bc68b` 分出；`4706bf2` 是视频、Surface、资源和 Binder 的
+  综合里程碑，`cb0e055` 在其上补齐 `ActivityManager` 的真实任务快照。
 - `4706bf2` 相对共同基点共有 39 个兼容提交，同时少 4 个只修改 README、赞助和
   CLA 状态的上游提交。
 - 没有对远端主线强推，也没有改写任何历史。整理结果保存在独立分支，便于
   分阶段审查和后续合并。
 
-已完成的最终构建验证记录如下：
+当前最终基线（2026-10-29 的 clean build，内容指纹如下）：
 
 ```text
 CONVERTER_ID=ff20d6c275f1c044
-FRAMEWORK_ID=1ed4df263da048a6
-JAVA_ID=133337705a8f4258
-JARS_ID=7ccf23276b3a970c
+FRAMEWORK_ID=440bb2dbd3c3b4b6
+JAVA_ID=6300f4c686b4553e
+JARS_ID=05e2ecb996eff2d7
 NATIVE_ID=773fd23055a186aa
 ```
 
@@ -167,7 +168,7 @@ Android app / codec
 
 ## 5. 完整演进时间线
 
-### 5.1 2026-10-21 至 2026-10-23：吸收 AOSP 语义修复
+### 5.1 AOSP 语义修复（作者日期 2026-10-21 至 2026-10-26，实际合入 2026-10-28）
 
 这一阶段修复 shrunk APK 的属性名称、XML 尺寸取整、weight 资源、包 archive
 feature、SearchableInfo、Activity 创建期间输入排队、DialogFragment 生命周期、
@@ -180,7 +181,7 @@ AOSP 可观察行为一致。
 最初工作是直接处理公考雷达、c001apk、酷安和哔哩哔哩。实验产出了以下通用
 修复：资源与 Assets 回退、`ActivityThread` 兼容字段、DexVMP 空方法安全桩、
 隐藏系统代理、原始签名覆盖、真实 `isTaskRoot()`、`finish()` 后的图层回退、
-`mmap`/`munmap`/`msync`，以及通用 DEX 转储工具。
+`mmap`，以及通用 DEX 转储工具。
 
 同一时期也确认了边界：商业壳、native 方法虚拟化、服务端完整性检查和业务层
 native 初始化不能由 Framework 自动补全。对酷安详情页和哔哩哔哩 Gripper 的
@@ -197,6 +198,7 @@ Smali/native 补丁只属于实验记录，不保留为本分支交付物。
 - JVM 不接受 mixin helper 对 `final` 字段的合法写入；
 - 数字资源引用只识别十进制，造成洋红色 UI；
 - `isnanf`、`posix_fallocate` 等 Bionic 符号缺失会使原生解码线程冻结；
+- `munmap`/`msync` 等与 `mmap` 相配套的内存生命周期语义需要在后续提交中补齐；
 - VideoToolbox、SurfaceTexture、EGL window surface 和 Canvas 视频路径需要
   独立帧队列、有界轮询、正确 transform、release 和 damage 管理。
 
@@ -267,9 +269,69 @@ ImageView level、attached display、远程 service process、Parcel/Binder hand
 `*` 标记的是从上游 cherry-pick 的提交，表格中的日期是原作者日期；它们在本兼容
 分支中位于 `d950ea3` 之后，不能仅按日期推断依赖。
 
-## 6. `4706bf2` 的逐项修改
+### 5.6 文档整理与发布记录
 
-该提交共修改 39 个文件：3347 行新增、213 行删除。以下按能力拆分，而不是按
+运行时提交台账之后还有三次独立的整理和发布操作：
+
+| 提交 | 作用 |
+|---|---|
+| `e5be54e` | 将重叠的兼容说明、单应用实验报告和旧版整体 patch 收敛为本手册；修改 8 个文件，新增 744 行、删除 1179 行 |
+| `6fc3112` | 在基于当前上游的发布工作树中覆盖验证过的源码和整理后的文档，同时保留上游 README、赞助和 CLA 配置 |
+| `bd2811` | 将发布树写入 `Rengwang/Mac.apk` 的 `main` 分支；该提交基于远端快照，不在本地兼容分支的直接父链上 |
+
+`e5be54e` 删除 `README-COMPAT.md`，以及 `artifacts/` 下的
+`Mac.apk通用兼容补丁说明.md`、`macapk-compat.patch`、
+`哔哩哔哩_Mac启动诊断.md` 和 `酷安16.6.5_官方脱壳运行报告.md`。这些内容仍可从
+`e9040a2`、`6839007`、`a6ba981` 等历史提交追溯。
+
+### 5.7 2026-10-29：活动任务 API 与“每周必看/入站必刷”白屏
+
+用户验收“热门”页时发现，“每周必看”和“入站必刷”只能打开标题栏、返回按钮和
+页面背景，正文一直没有内容。日志显示两者都启动
+`WebGeneralComposeActivity`，随后在 `onCreate` 抛出：
+
+```text
+java.lang.IndexOutOfBoundsException: Index: 0
+  at java.util.Collections$EmptyList.get
+  at Zg.b.b
+  at WebGeneralComposeActivity.onCreate
+```
+
+反编译确认 `Zg.b.b` 调用的是标准 Android API：
+
+```java
+List<ActivityManager.AppTask> tasks = activityManager.getAppTasks();
+String root = tasks.get(0).getTaskInfo().baseActivity.getClassName();
+```
+
+应用用这个结果判断当前页面是否为任务根，再决定返回策略。真实 Android 上，
+只要应用有一个运行中的任务，该列表就至少包含这个任务；Mac.apk 当时却固定
+返回 `Collections.emptyList()`，违反了 API 契约。异常发生在
+`WebGeneralComposeActivity` 调用 Compose `setContent()` 之前，
+`ActivityHost.runTolerant()` 又按既有兼容策略吞掉异常并继续生命周期，所以最终
+不是网络空列表，也不是 Compose 绘制卡住，而是 Activity 已存在、内容树从未创建，
+只显示 `Activity.General.WebView` 主题的 `#FAFAFA` 背景。
+
+`cb0e055` 在通用框架层修复：
+
+- `ActivityHost` 在 Activity 入栈和结束时发布线程安全的栈底到栈顶快照；
+- `ActivityManager.getAppTasks()` 从真实 Activity 栈生成一个 `AppTask`；
+- `RecentTaskInfo` 返回稳定的 task ID、`baseActivity`、`topActivity`、
+  `baseIntent`、`realActivity`、`numActivities`、`isRunning` 和任务描述；
+- `AppTask.getTaskInfo()` 返回隔离副本，调用者修改返回值不会污染内部状态；
+- `finishAndRemoveTask()`、`moveToFront()` 映射回实际宿主任务，并在后台线程
+  调用时切到 Android 主线程；
+- 新增 `debug/ActivityManagerTasksTest.java`，覆盖空栈、栈底/栈顶、数量、运行
+  状态和返回值隔离。
+
+修复不含哔哩哔哩包名、类名或资源 ID 判断。它服务所有通过
+`ActivityManager.getAppTasks()` 读取任务身份的 Android 应用，包括网页容器、
+Flutter、Compose、React Native 和自定义返回导航。2026-10-29 的安装态验收中，
+“每周必看”成功显示第 396 期正文和视频卡片，“入站必刷”也由用户确认正常显示。
+
+## 6. 兼容运行时关键实现
+
+`4706bf2` 共修改 39 个文件：3347 行新增、213 行删除。以下按能力拆分，而不是按
 diff 的文件顺序堆叠。
 
 ### 6.1 通用多 Surface 与视频合成
@@ -393,8 +455,10 @@ MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE=1
 ```
 
 用户显式设置的值最后覆盖默认值，因此诊断时仍可设 `0`。`MACAPK_LOG_LEVEL=4`
-和 `MACAPK_QUIET_CLASSLOAD=1` 也由两条入口共同设置，避免 Dock 启动写过多类加载
-日志而拖慢视频。
+和 `MACAPK_QUIET_CLASSLOAD=1` 也由三条启动路径共同设置，避免 Dock 启动写过多
+类加载日志而拖慢视频。实现入口是 `launcher/AppStubMain.swift` 的 Dock stub
+环境，以及 `launcher/MacApkLauncherApp.swift` 中设置面板直接启动和
+installed-bundle LaunchServices 环境；用户显式环境变量统一在默认值之后应用。
 
 ### 6.8 新增测试与诊断
 
@@ -415,9 +479,34 @@ MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE=1
 | `runtime/java/android/os/MacapkParcelWire.java` | 主机 Binder 私有传输帧 |
 | `runtime/src/surface_metal_layer.h` | 公共 alpha 约束实现 |
 
+同时更新了既有的 `debug/SurfaceTextureRoutingTest.java`，验证
+`SurfaceTexture.setDefaultBufferSize(320, 180)` 会完整传递到 native window，
+并继续验证无关 Surface 不会抢占已经绑定的 video target。
+
 调试开关只为复现和 bisect 保留，不应成为长期产品配置。尤其不要在不理解上层
 契约时直接切换 Surface 或 Choreographer 开关来“消除现象”，否则很容易从图层
 遮挡问题变成帧顺序问题。
+
+### 6.9 ActivityManager 任务快照
+
+`ActivityHost` 是 Mac.apk 单应用进程中的 ActivityThread/Task 所有者。它维护
+一个底到顶的快照，并由 `ActivityManager.getAppTasks()` 转换成标准
+`AppTask`/`RecentTaskInfo`。快照在 `push()` 与 `onActivityFinished()` 后更新，
+因此应用在新建 Activity 的 `onCreate` 里查询时已经能看到正在创建的顶层 Activity
+和此前任务根。
+
+这个实现明确保留当前运行时的单任务边界：
+
+- 一个 Mac.apk 运行进程只承载一个应用任务；
+- task ID 在该进程内稳定为 `1`；
+- 栈为空时不伪造任务，返回空列表；
+- `baseActivity` 是底层未结束 Activity，`topActivity` 是当前顶层；
+- 整个任务删除、移动到前台等操作都转交 `ActivityHost` 或 Cocoa；
+- 读取方拿到的列表和任务信息是快照，不直接暴露可变 Activity 引用。
+
+这解决了标准 API 的“应有至少一项”契约，但还没有实现多任务、分屏、自由窗口
+或跨应用 Recents。后续扩展应保留当前快照边界，再让 `ActivityHost` 真正维护
+任务集合，而不是让 Framework 层猜一个任务。
 
 ## 7. 验证与可重复检查
 
@@ -472,6 +561,37 @@ debug/entitlements_check.sh
 `ViewAttachedDisplayTest`。`SurfaceMetalLayerAlphaTest.mm` 与
 `native_window_lifetime_test.py` 也通过。
 
+2026-10-29 又从整理后的源码执行了完整的 clean build 和安装态前验收：
+
+- `runtime/scripts/build.sh --clean` 与 `scripts/build_launcher.sh` 均成功；
+- 中间验证点的 runtime、framework、Java、JAR 和 native build ID 为
+  `CONVERTER_ID=ff20d6c275f1c044`、`FRAMEWORK_ID=1ed4df263da048a6`、
+  `JAVA_ID=133337705a8f4258`、`JARS_ID=7ccf23276b3a970c`、
+  `NATIVE_ID=773fd23055a186aa`；
+- 重新生成的 API 36 `framework-res.apk` SHA-256 为
+  `aa6582552e614539ca85c0debd76a6283d80e26456895c829e11e755521d7cd4`；
+- `plutil -lint`、`scripts/audit_bundle_deps.sh` 和 64 个应用的 Mach-O 依赖
+  扫描通过，未发现非系统外部依赖；
+- 在 APFS copy-on-write 的隔离应用数据上直接启动新构建，视频帧持续推进，
+  弹幕出现并随时间横向移动；隔离测试没有写入正式应用数据；
+- 全新或未初始化的数据副本会停在 B 站首次运行状态，不能用来判断弹幕运行时
+  是否回归；验收必须从同一个已初始化数据快照做隔离启动，或走正式安装 bundle
+  的完整 LaunchServices 路径。
+
+补齐 `ActivityManager.getAppTasks()` 后，再次执行 Java-only 编译、完整 clean
+build 和 launcher 构建。最终源码对应的五项内容标识为
+`CONVERTER_ID=ff20d6c275f1c044`、`FRAMEWORK_ID=440bb2dbd3c3b4b6`、
+`JAVA_ID=6300f4c686b4553e`、`JARS_ID=05e2ecb996eff2d7`、
+`NATIVE_ID=773fd23055a186aa`。此前看到的 `JARS_ID=3f30e4cc81407f80`
+只是任务 API 接入过程中的中间产物，不是当前基线。以下检查通过：
+
+- 新增的 `ActivityManagerTasksTest`；
+- 此前 9 个不启动完整 runtime 的 Java 测试；
+- `debug/staleness.sh` 全部 FRESH；
+- bundle self-containment 审计；
+- 安装态“每周必看”显示第 396 期正文和视频卡片；
+- 用户安装态验收：“每周必看、入站必刷”均成功显示，弹幕和视频未报告回归。
+
 三个需要真实 Mac.apk runtime 的检查不能在裸 `java -cp android-framework.jar` 中
 替代完整宿主：`DrawableIdentityAndTintTest` 需要 JNI 日志绑定和真实 APK，
 `RemoteServiceProcessTest` 需要实际独立 worker 进程，`WindowDamageLifecycleTest`
@@ -479,8 +599,9 @@ debug/entitlements_check.sh
 回归运行；把裸 JVM 的 `UnsatisfiedLinkError` 或同 PID 结果视为产品失败会产生
 错误结论。
 
-`OwnerFrameBarrierTest` 的一次 flaky 仍是一个风险。它没有阻止发布，但未来要把
-线程调度和帧到达固定成可重复的确定性测试。
+`OwnerFrameBarrierTest` 必须以普通测试 classpath 先编译、再启动测试类；Java
+source-file launcher 会为测试辅助类建立不同 class loader，产生误导性的
+`IllegalAccessError`。按正常编译与运行方式已通过。
 
 ### 7.3 最小回归原则
 
@@ -565,13 +686,28 @@ README/CLA 改动，再重跑全套验证；不要把现有兼容分支 force-pu
 测试和若干独立单元测试。还需要 Flutter、Unity、WebView 登录、相机、传感器、
 后台 service 和不同 Android target SDK 的持续回归。
 
+### 8.10 Activity 任务模型仍只有一个任务
+
+“每周必看/入站必刷”的具体白屏已经由 `ActivityManager.getAppTasks()` 通用任务
+快照修复，但当前 `ActivityHost` 仍把一个 Mac.apk 运行进程建模为一个任务。
+`getAppTasks()` 因此最多返回一项，task ID 固定为 `1`。这不影响已验证页面和
+常见单窗口应用，但不足以支持：
+
+- 同一应用的真实多文档任务或 Recents 卡片；
+- Android 分屏、画中画和自由窗口中的多个任务；
+- 跨应用任务切换、任务快照缩略图和新的 `TaskDescription` 持久化；
+- 通过 `RecentTaskInfo` 观察多个活动任务的应用。
+
+如果后续发现应用依赖多项 `getAppTasks()`，应扩展 `ActivityHost` 内部的任务集合
+和稳定 ID 分配，不应在 `ActivityManager` 里复制当前 Activity 来伪造第二项。
+
 ## 9. 后续升级路线
 
 ### 阶段 0：稳定当前分支
 
 验收标准：
 
-- 固定 `4706bf2` 的 build ID 和 app bundle 校验值；
+- 固定 `cb0e055` 的 build ID 和 app bundle 校验值；
 - `OwnerFrameBarrierTest` 连续 100 次通过；
 - Java/native 测试纳入一条可重复脚本；
 - 记录 Dock、控制面板、Finder 的启动环境完全一致；
@@ -674,6 +810,11 @@ README/CLA 改动，再重跑全套验证；不要把现有兼容分支 force-pu
   IDE 状态和日志；
 - `build/`、`runtime/build/`、`runtime/translator/build/` 和
   `thirdparty/framework-res/` 是可再生本地产物，不应进入提交或发布分支。
+
+源码注释中仍有许多对早期 `docs/*.md` 设计记录的引用。这些文档已从公开工作树
+移除，引用保留的是当时的 AOSP 依据、测量过程和设计理由，不是运行时依赖，也不
+是损坏的链接。不要为了消除链接而批量删除注释；需要追溯时从 Git 历史读取原文，
+新的稳定结论应持续收敛到本手册。
 
 如果以后要恢复旧报告，使用：
 

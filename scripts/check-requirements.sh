@@ -102,12 +102,13 @@ else
     warn_plat "xcodebuild not on PATH -- full Xcode.app is needed for the Metal toolchain (ANGLE build)"
 fi
 
-# Metal toolchain ships separately from Xcode and is needed for ANGLE.
+# Metal toolchain ships separately from Xcode. It is optional for ordinary builds
+# because thirdparty/angle-prebuilt is used, and required only when rebuilding ANGLE.
 if [[ -d "/Applications/Xcode.app/Contents/SharedFrameworks/MetalToolchain.framework" ]] \
    || xcrun -f metal >/dev/null 2>&1; then
     ok "Metal toolchain present (required for ANGLE build)"
 else
-    miss "Metal toolchain NOT downloaded (required for ANGLE)" "xcodebuild -downloadComponent MetalToolchain"
+    warn_plat "Metal toolchain not found (optional; required only for ANGLE rebuild)"
 fi
 
 # --------------------------------------------------------------------

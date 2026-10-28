@@ -56,7 +56,9 @@ rm -rf "$smoke_dir"
 ```
 
 `scripts/check-requirements.sh` checks all of this and prints the install command for
-anything missing. `scripts/check-requirements.sh --install` installs it for you.
+anything missing. `scripts/check-requirements.sh --install` installs it for you. A
+missing Metal toolchain is only a warning for ordinary builds because the committed
+ANGLE binaries are used by default; it becomes required only when rebuilding ANGLE.
 
 ## Build and run
 
@@ -65,9 +67,11 @@ scripts/check-requirements.sh
 scripts/rebuild_and_run.sh
 ```
 
-`rebuild_and_run.sh` builds the runtime, the Java framework and the launcher, installs
-the result as `/Applications/Mac.apk.app` (override with `MACAPK_CANONICAL_APP`), and
-opens it. Pass `--no-promote` to build without touching your installed app.
+In the recorded primary checkout, `rebuild_and_run.sh` builds the runtime, the Java
+framework and the launcher, installs the result as `/Applications/Mac.apk.app`
+(override with `MACAPK_CANONICAL_APP`), and opens it. A checkout recognized as a clone
+builds without touching the installed app unless `--promote` is passed. Use
+`--no-promote` to force a build-only run in either kind of checkout.
 
 Step by step instead:
 
