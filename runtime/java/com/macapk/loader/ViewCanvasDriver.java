@@ -597,6 +597,16 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
     private final java.util.concurrent.atomic.AtomicBoolean framePending =
         new java.util.concurrent.atomic.AtomicBoolean(false);
     private android.os.Handler mLoopHandler;
+    private android.os.Handler mFrameHandler;
+    private android.os.Handler frameHandler() {
+        if (mFrameHandler == null)
+            // The traversal task alone may cross a Choreographer sync barrier
+            // on the owner loop. Surface lifecycle work deliberately stays on
+            // loopHandler() so it keeps AOSP barrier ordering.
+            mFrameHandler = android.os.Handler.macapkCreateFrameHandler(
+                android.os.Looper.getMainLooper());
+        return mFrameHandler;
+    }
     private android.os.Handler loopHandler() {
         if (mLoopHandler == null)
             // OWNER-ONLY (v1.0.1636): doFrame and doSurfaceChanged post through
@@ -626,7 +636,11 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
         if (android.os.Looper.MACAPK_REAL_LOOPER
                 && !android.os.Looper.macapkIsActivityThread()) {
             if (framePending.compareAndSet(false, true)) {
-                loopHandler().post(() -> { framePending.set(false); doFrame(); });
+                boolean posted = frameHandler().post(() -> {
+                    framePending.set(false);
+                    doFrame();
+                });
+                if (!posted) framePending.set(false);
             }
             return;
         }

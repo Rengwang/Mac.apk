@@ -36191,6 +36191,10 @@ struct MacApkNativeWindowRecord {
     jobject surface = nullptr; // retained only while native owners hold references
     MacApkNativeWindow window{};
     size_t references = 1;     // protected by g_macapk_nw_surface_mu
+    // v1.0.1063: the owning SurfaceView's OWN size in pixels (0 = unknown).
+    // On Android a SurfaceView's BufferQueue defaults to the VIEW's size, so
+    // the native window a producer gets answers that, not the app window's.
+    int32_t own_w = 0, own_h = 0;
 };
 static std::mutex g_macapk_nw_surface_mu;
 static std::vector<std::unique_ptr<MacApkNativeWindowRecord>> g_macapk_nw_records;
@@ -36254,14 +36258,132 @@ std::atomic<bool> g_decouple_active{false};
 // Fwd decl: MACAPK_TRACE_VIEWPORT gate, defined with the glViewport tracer below.
 static bool macapk_trace_viewport_on();
 void* g_unity_egl_surface = nullptr;
-static std::atomic<void*> g_experimental_keyed_egl_surface{nullptr};
 
+// EGLSurface -> Android Surface key.  A process may own more than one keyed
+// Surface at a time (video, danmaku, a game HUD), so a single "last surface"
+// slot loses the identity needed by the diagnostics below.  This registry is
+// diagnostic-only and populated only for keyed surfaces.
+static std::mutex g_keyed_egl_surface_mu;
+static std::unordered_map<void*, int32_t> g_keyed_egl_surfaces;
+
+static void macapk_remember_keyed_egl_surface(void* surf, int32_t key) {
+    if (!surf || key <= 0) return;
+    std::lock_guard<std::mutex> lk(g_keyed_egl_surface_mu);
+    g_keyed_egl_surfaces[surf] = key;
+}
+
+static int32_t macapk_keyed_egl_surface_key(void* surf) {
+    if (!surf) return 0;
+    std::lock_guard<std::mutex> lk(g_keyed_egl_surface_mu);
+    auto it = g_keyed_egl_surfaces.find(surf);
+    return it == g_keyed_egl_surfaces.end() ? 0 : it->second;
+}
+
+static void macapk_forget_keyed_egl_surface(void* surf) {
+    if (!surf) return;
+    std::lock_guard<std::mutex> lk(g_keyed_egl_surface_mu);
+    g_keyed_egl_surfaces.erase(surf);
+}
+
+static bool macapk_keyed_present_trace_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("MACAPK_KEYED_PRESENT_TRACE");
+        return e && e[0] == '1';
+    }();
+    return enabled;
+}
+
+struct MacapkPresentKeyStat {
+    uint64_t enter = 0;
+    uint64_t exit = 0;
+    uint64_t rc_false = 0;
+    uint64_t total_ns = 0;
+    uint64_t worst_ns = 0;
+};
+static std::mutex g_present_key_mu;
+static std::unordered_map<int32_t, MacapkPresentKeyStat> g_present_key_stats;
+
+// RAII probe around the WHOLE eglSwapBuffers call, including all early-return
+// paths.  The first line is emitted before the real swap: if Present enters but
+// never exits, the producer is blocked inside eglSwapBuffers rather than having
+// stopped rendering.  A clean exit with no later enter means the guest stopped
+// submitting frames and the problem lies above the BufferQueue.
+struct MacapkKeyedPresentProbe {
+    int32_t key = 0;
+    bool active = false;
+    uint64_t t0 = 0;
+    unsigned rc = 0;
+    bool has_rc = false;
+
+    explicit MacapkKeyedPresentProbe(void* surf) {
+        if (!macapk_keyed_present_trace_enabled()) return;
+        key = macapk_keyed_egl_surface_key(surf);
+        if (key <= 0) return;
+        active = true;
+        t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        std::lock_guard<std::mutex> lk(g_present_key_mu);
+        MacapkPresentKeyStat& st = g_present_key_stats[key];
+        ++st.enter;
+        if (st.enter <= 3 || st.enter % 60 == 0)
+            std::fprintf(stderr, "[present-key] key=%d enter=%llu exit=%llu (before swap)\n",
+                         key, (unsigned long long)st.enter,
+                         (unsigned long long)st.exit);
+    }
+
+    void finish(unsigned value) { rc = value; has_rc = true; }
+
+    ~MacapkKeyedPresentProbe() {
+        if (!active) return;
+        const uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+        std::lock_guard<std::mutex> lk(g_present_key_mu);
+        MacapkPresentKeyStat& st = g_present_key_stats[key];
+        ++st.exit;
+        st.total_ns += dt;
+        if (dt > st.worst_ns) st.worst_ns = dt;
+        if (has_rc && rc == 0) ++st.rc_false;
+        if (st.exit <= 3 || st.exit % 60 == 0) {
+            std::fprintf(stderr,
+                "[present-key] key=%d enter=%llu exit=%llu rc=%s rc_false=%llu "
+                "last_ms=%.3f avg_ms=%.3f max_ms=%.3f\n",
+                key, (unsigned long long)st.enter, (unsigned long long)st.exit,
+                has_rc ? (rc ? "true" : "false") : "early-return",
+                (unsigned long long)st.rc_false, (double)dt / 1e6,
+                st.exit ? (double)st.total_ns / st.exit / 1e6 : 0.0,
+                (double)st.worst_ns / 1e6);
+            std::fflush(stderr);
+        }
+    }
+};
+
+static void* macapk_native_stream_create(void* dpy, void* config, void* win, bool* recognized);
+static int macapk_native_stream_destroy(void* dpy, void* surf);
+extern "C" unsigned __macapk_arm64_eglDestroySurface(void* dpy, void* surf) {
+    int result = macapk_native_stream_destroy(dpy, surf);
+    if (result < 0) {
+        using Fn = unsigned (*)(void*, void*);
+        static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "eglDestroySurface"));
+        result = real ? static_cast<int>(real(dpy, surf)) : 0;
+    }
+    if (result) macapk_forget_keyed_egl_surface(surf);
+    return static_cast<unsigned>(result);
+}
 extern "C" void* __macapk_arm64_egl_create_window_surface_bridge(
         void* dpy, void* config, void* win, const int32_t* attribs) {
+    bool stream = false;
+    void* streamSurface = macapk_native_stream_create(dpy, config, win, &stream);
+    if (stream) return streamSurface;
     void* native = nullptr;
     if (win) {
         MacApkNativeWindow* mnw = reinterpret_cast<MacApkNativeWindow*>(win);
-        if (mnw->magic == kMacApkNWMagic && mnw->layer) native = mnw->layer;
+        if (mnw->magic == kMacApkNWMagic && mnw->layer) {
+            native = mnw->layer;
+            // v1.0.1063 diagnostic: which key is this window? key 0 means the
+            // process-wide shared legacy layer, which only ONE consumer can own.
+            std::fprintf(stderr,
+                "[arm64-shim] eglCreateWindowSurface: win=%p surface_key=%d layer=%p\n",
+                win, mnw->surface_key, native);
+            std::fflush(stderr);
+        }
     }
     if (!native) {
         std::fprintf(stderr,
@@ -36383,6 +36505,77 @@ extern "C" void* __macapk_arm64_egl_create_window_surface_bridge(
         // When native (the CAMetalLayer) is already bound to an active swapchain (or bad alloc),
         // fall back to an offscreen pbuffer surface so secondary consumers (e.g. Chronos overlay engine)
         // do not fail eglCreateWindowSurface and hang the Android main UI thread.
+        //
+        // v1.0.1063 (2026-10-28, danmaku): a pbuffer is INVISIBLE. The whole point of
+        // eglCreateWindowSurface is that the guest's frames reach the screen; a pbuffer
+        // fallback silently renders into a buffer nobody composites, so the producer
+        // keeps swapping at 60 fps and the user sees NOTHING (measured: Bilibili's
+        // Chronos danmaku engine drew 15840 frames into an offscreen pbuffer and the
+        // screen showed zero danmaku). The old fallback existed to keep the guest's
+        // eglCreateWindowSurface from failing -- but on a real Android each SurfaceView
+        // has its OWN BufferQueue, so a second consumer NEVER has to share the first
+        // one's window: it gets its own. Here the shared legacy layer is already bound
+        // to the video engine's swapchain, so the faithful answer is to give this
+        // consumer its OWN CAMetalLayer instead of a buffer with no screen.
+        //
+        // The layer must be per-Surface (keyed) so its geometry/z-order follow the
+        // SurfaceView's rect: a generic mechanism, no package-specific branch.
+        MacApkNativeWindow* mnw = macapk_native_window_for_ptr(win);
+        const int32_t winKey = mnw ? mnw->surface_key : 0;
+        // A keyed surface already HAS its own layer; if its window surface failed,
+        // that layer is busy or the config is unusable -- a pbuffer is still wrong,
+        // but a second attempt on the same layer would fail identically. Keyed
+        // surfaces must therefore never be silently downgraded: log loudly and let
+        // the caller see the failure instead of a black screen.
+        if (winKey > 0) {
+            std::fprintf(stderr,
+                "[arm64-shim] eglCreateWindowSurface: keyed surface %d window surface "
+                "failed -> REFUSING the offscreen-pbuffer downgrade (a pbuffer is "
+                "never composited, so the guest would render into the void); the "
+                "guest sees EGL_NO_SURFACE\n", winKey);
+            std::fflush(stderr);
+            return nullptr;
+        }
+        // A keyless window: the shared legacy layer is taken by another consumer.
+        // Give this consumer its own layer, keyed by a synthetic negative-free id,
+        // so the frames land on screen. The synthetic key is allocated by the
+        // Cocoa side (CocoaEnsureNativeEglLayerForExtraConsumer) and is unique per
+        // guest window, so two keyless consumers never collide either.
+        using EnsureExtraFn = void* (*)(int*, int*, int32_t*);
+        static EnsureExtraFn ensure_extra = reinterpret_cast<EnsureExtraFn>(
+            dlsym(RTLD_DEFAULT, "CocoaEnsureNativeEglLayerForExtraConsumer"));
+        if (ensure_extra) {
+            int ew = 0, eh = 0;
+            int32_t assignedKey = 0;
+            void* extra = ensure_extra(&ew, &eh, &assignedKey);
+            if (extra && ew > 0 && eh > 0) {
+                void* surf2 = real(dpy, config, extra, attribs);
+                if (surf2) {
+                    std::fprintf(stderr,
+                        "[arm64-shim] eglCreateWindowSurface: shared legacy layer was "
+                        "already in use -> this consumer got its OWN native-EGL layer "
+                        "%p %dx%d (key %d) instead of an invisible pbuffer\n",
+                        extra, ew, eh, assignedKey);
+                    std::fflush(stderr);
+                    if (assignedKey > 0)
+                        macapk_remember_keyed_egl_surface(surf2, assignedKey);
+                    // v1.0.1063: do NOT claim the process-wide g_unity_egl_surface
+                    // slot here. That slot belongs to the FIRST (video) engine and
+                    // drives the present pacer, the swap-finish path and the
+                    // decouple readback ("surf == g_unity_egl_surface"). Stealing
+                    // it would silently turn the video engine's pacing off. This
+                    // consumer presents its own layer, so it needs none of that.
+                    // g_unity_egl_display is left alone for the same reason.
+                    return surf2;
+                }
+                std::fprintf(stderr,
+                    "[arm64-shim] eglCreateWindowSurface: dedicated layer %p refused "
+                    "the window surface -> no pbuffer downgrade (it would be "
+                    "invisible)\n", extra);
+                std::fflush(stderr);
+                return nullptr;
+            }
+        }
         int W = 0, H = 0;
         static auto getLayer = reinterpret_cast<void* (*)(int*, int*)>(
             dlsym(RTLD_DEFAULT, "CocoaGetUnityRenderLayer"));
@@ -36404,7 +36597,7 @@ extern "C" void* __macapk_arm64_egl_create_window_surface_bridge(
     }
     if (surf) {
         if (auto* nw = macapk_native_window_for_ptr(win); nw && nw->surface_key > 0)
-            g_experimental_keyed_egl_surface.store(surf, std::memory_order_relaxed);
+            macapk_remember_keyed_egl_surface(surf, nw->surface_key);
         g_unity_egl_display = dpy; g_unity_egl_surface = surf;
         // v1.0.572: the guest engine now owns a window surface on the
         // dedicated layer -- tell the runtime to hide the framework
@@ -37250,11 +37443,31 @@ static void* macapk_egl14_window_resolve(void* dpy, void* surf) {
 }
 
 extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
+    MacapkKeyedPresentProbe keyed_present(surf);
+    // v1.0.1063 diagnostic: EVERY swap, by surface POINTER -- not just keyed
+    // ones. The keyed probe only counts surfaces registered with a key, so a
+    // consumer on a synthetic/extra layer would be invisible to it.
+    if (std::getenv("MACAPK_KEYED_PRESENT_TRACE")) {
+        static std::mutex smu;
+        static std::unordered_map<void*, uint64_t> counts;
+        uint64_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(smu);
+            n = ++counts[surf];
+        }
+        if (n <= 2 || n % 60 == 0) {
+            std::fprintf(stderr,
+                "[swap-any] surface=%p key=%d n=%llu\n",
+                surf, macapk_keyed_egl_surface_key(surf),
+                (unsigned long long)n);
+            std::fflush(stderr);
+        }
+    }
     using SwapFn = unsigned (*)(void*, void*);
     static SwapFn real =
         reinterpret_cast<SwapFn>(dlsym(RTLD_DEFAULT, "eglSwapBuffers"));
     if (std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE") &&
-        surf == g_experimental_keyed_egl_surface.load(std::memory_order_relaxed)) {
+        macapk_keyed_egl_surface_key(surf) > 0) {
         static std::atomic<unsigned> alphaSamples{0};
         unsigned count = alphaSamples.fetch_add(1, std::memory_order_relaxed);
         if (count < 3 || count == 100) {
@@ -37687,6 +37900,7 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
                             if (bf && cur > 0) bf(0x8D40, (unsigned)cur);
                             pubF(slot);
                         }
+                        keyed_present.finish(1);
                         return 1;
                     }
                     // ---- v618 THROTTLED ASYNC PBO readback (default) ----
@@ -37771,6 +37985,7 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
                                 // block under M once the ring hits 50). Yield: keep last frame.
                                 glBindBuffer(0x88EB, (unsigned)savePack);
                                 if (bf && curFbo > 0) bf(0x8D40, (unsigned)curFbo);
+                                keyed_present.finish(1);
                                 return 1;  // EGL_TRUE; no glReadPixels, no glFenceSync => no block
                             }
                         }
@@ -37784,6 +37999,7 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
                         // restore guest GL state
                         glBindBuffer(0x88EB, (unsigned)savePack);
                         if (bf && curFbo > 0) bf(0x8D40, (unsigned)curFbo);
+                        keyed_present.finish(1);
                         return 1;  // EGL_TRUE; skip ANGLE swap (pbuffer swap is a no-op)
                     }
                     // ---- v612 UNCONDITIONAL every-swap ring (MACAPK_DECOUPLE_NO_THROTTLE, A/B) ----
@@ -37831,6 +38047,7 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
                     glBindBuffer(0x88EB, (unsigned)savePack);
                     if (bf && curFbo>0) bf(0x8D40, (unsigned)curFbo);
                     head = (head + 1) % N;
+                    keyed_present.finish(1);
                     return 1;  // EGL_TRUE; skip ANGLE swap (pbuffer swap is a no-op)
                 }
             }
@@ -37849,9 +38066,12 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
         const double t1 = macapk_swap_trace_uptime_s();
         static MacapkSwapTraceBatch s_present = { "guest-present", 0, {0} };
         macapk_swap_trace_add(&s_present, t1 - t0, t1);
+        keyed_present.finish(rc);
         return rc;
     }
-    return real ? real(dpy, surf) : 0;
+    const unsigned rc = real ? real(dpy, surf) : 0;
+    keyed_present.finish(rc);
+    return rc;
 }
 
 // eglMakeCurrent: a transparent forward to ANGLE, as libEGL is on a device.
@@ -37916,8 +38136,17 @@ extern "C" unsigned __macapk_arm64_eglMakeCurrent(void* dpy, void* draw,
         reinterpret_cast<McFn>(dlsym(RTLD_DEFAULT, "eglMakeCurrent"));
     // A Java EGL14 window's handle names the pbuffer behind it now (GitHub #16;
     // see macapk_egl14_window_resolve), as EGL14_eglMakeCurrent translates it.
-    return real ? real(dpy, macapk_egl14_window_resolve(dpy, draw),
-                       macapk_egl14_window_resolve(dpy, read), ctx) : 0;
+    void* resolvedDraw = macapk_egl14_window_resolve(dpy, draw);
+    void* resolvedRead = macapk_egl14_window_resolve(dpy, read);
+    unsigned result = real ? real(dpy, resolvedDraw, resolvedRead, ctx) : 0;
+    if (std::getenv("MACAPK_EGL_TRACE")) {
+        static std::atomic<unsigned> count{0};
+        unsigned n = count.fetch_add(1);
+        if (n < 200 || n % 1000 == 0)
+            std::fprintf(stderr, "[egl-mc] n=%u dpy=%p draw=%p resolved=%p key=%d read=%p ctx=%p result=%u\n",
+                         n, dpy, draw, resolvedDraw, macapk_keyed_egl_surface_key(draw), read, ctx, result);
+    }
+    return result;
 }
 
 // eglQuerySurface: a forward to ANGLE that names a Java EGL14 window's current
@@ -38723,6 +38952,7 @@ extern "C" void __macapk_arm64_glGetQueryiv(int target, int pname, int* params) 
 // its own window surface at all.
 extern "C" unsigned __macapk_arm64_eglInitialize(void* dpy, int32_t* major, int32_t* minor);
 extern "C" unsigned __macapk_arm64_eglTerminate(void* dpy);
+extern "C" unsigned __macapk_arm64_eglGetError(void);
 extern "C" void* __macapk_arm64_eglGetProcAddress(const char* name) {
     using GpaFn = void* (*)(const char*);
     static GpaFn real =
@@ -38743,6 +38973,10 @@ extern "C" void* __macapk_arm64_eglGetProcAddress(const char* name) {
         return reinterpret_cast<void*>(&__macapk_arm64_eglInitialize);
     if (name && std::strcmp(name, "eglTerminate") == 0)
         return reinterpret_cast<void*>(&__macapk_arm64_eglTerminate);
+    if (name && std::strcmp(name, "eglDestroySurface") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglDestroySurface);
+    if (name && std::strcmp(name, "eglGetError") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglGetError);
     if (name && std::strcmp(name, "eglSwapBuffers") == 0) {
         std::fprintf(stderr,
             "[unity-surf] eglGetProcAddress(\"eglSwapBuffers\") -> routed "
@@ -39041,6 +39275,9 @@ extern "C" unsigned __macapk_arm64_eglGetError(void) {
     using Fn = unsigned (*)(void);
     static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "eglGetError"));
     unsigned r = real ? real() : 0x3000;
+    using PendingFn = unsigned (*)();
+    static auto pending = reinterpret_cast<PendingFn>(dlsym(RTLD_DEFAULT, "__macapk_egl14_take_native_error"));
+    if (pending) { unsigned e = pending(); if (e) r = e; }
     if (macapk_egl_trace_enabled())
         std::fprintf(stderr, "[egl-trace] eglGetError -> 0x%x\n", r);
     return r;
@@ -39158,6 +39395,8 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
     // counted, or it tears the display down under them.
     if (!std::strcmp(name, "eglInitialize")) return (void*)&__macapk_arm64_eglInitialize;
     if (!std::strcmp(name, "eglTerminate"))  return (void*)&__macapk_arm64_eglTerminate;
+    if (!std::strcmp(name, "eglDestroySurface")) return (void*)&__macapk_arm64_eglDestroySurface;
+    if (!std::strcmp(name, "eglGetError")) return (void*)&__macapk_arm64_eglGetError;
     // The remaining init-call passthroughs are diagnostic-only (route under
     // MACAPK_EGL_TRACE=1; else the guest gets ANGLE's directly).
     if (macapk_egl_trace_enabled()) {
@@ -60339,15 +60578,26 @@ static void log_methodid_miss(const char* which, const char* n, const char* s) {
 jmethodID macapk_jni_GetMethodID_guard(JNIEnv* env, jclass c,
                                        const char* n, const char* s) {
     if (!c) { log_null_jclass_guard("GetMethodID", n, s); return nullptr; }
+    const bool had_pending = env->ExceptionCheck();
     jmethodID m = g_orig_GetMethodID(env, c, n, s);
-    if (!m) log_methodid_miss("GetMethodID", n, s);
+    if (!m) {
+        log_methodid_miss("GetMethodID", n, s);
+        // A missing optional framework method must not leave NoSuchMethodError
+        // pending on this JNI thread. Only consume the exception created by
+        // this lookup; an exception already present belongs to the caller.
+        if (!had_pending && env->ExceptionCheck()) env->ExceptionClear();
+    }
     return m;
 }
 jmethodID macapk_jni_GetStaticMethodID_guard(JNIEnv* env, jclass c,
                                              const char* n, const char* s) {
     if (!c) { log_null_jclass_guard("GetStaticMethodID", n, s); return nullptr; }
+    const bool had_pending = env->ExceptionCheck();
     jmethodID m = g_orig_GetStaticMethodID(env, c, n, s);
-    if (!m) log_methodid_miss("GetStaticMethodID", n, s);
+    if (!m) {
+        log_methodid_miss("GetStaticMethodID", n, s);
+        if (!had_pending && env->ExceptionCheck()) env->ExceptionClear();
+    }
     return m;
 }
 // v1.0.838: on a MISS, consult the Android-vs-OpenJDK private-field-name
@@ -62602,6 +62852,60 @@ struct AttachGuard {
 };
 }  // namespace
 
+// Reuse the EGL14 SurfaceTexture producer for NDK windows. A Java Surface
+// backed by a SurfaceTexture is an offscreen stream, not a display layer.
+// Experimental until native create/swap/destroy and resize are tested together.
+static void* macapk_native_stream_create(void* dpy, void* config, void* win, bool* recognized) {
+    *recognized = false;
+    const char* enabled = std::getenv("MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE");
+    if (!enabled || std::strcmp(enabled, "1") != 0 || !win) return nullptr;
+    // A stream window needs the native swap/resolve bridge to enqueue frames.
+    // Do not create an invisible pbuffer if that bridge was disabled.
+    const char* nativeBridge = std::getenv("MACAPK_EGL14_NATIVE_WINDOW");
+    if (nativeBridge && std::strcmp(nativeBridge, "0") == 0) return nullptr;
+    AttachGuard ag;
+    if (!ag.env || ag.env->ExceptionCheck()) return nullptr;
+    jobject surface = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+        for (const auto& r : g_macapk_nw_records)
+            if (r && &r->window == win && r->surface && r->window.surface_key == 0) {
+                surface = ag.env->NewLocalRef(r->surface); break;
+            }
+    }
+    if (!surface) return nullptr;
+    jclass c = ag.env->GetObjectClass(surface);
+    jmethodID owner = c ? ag.env->GetMethodID(c, "macapkGetOwnerSurfaceView", "()Landroid/view/SurfaceView;") : nullptr;
+    jmethodID texture = c && owner ? ag.env->GetMethodID(c, "macapkGetSurfaceTexture", "()Landroid/graphics/SurfaceTexture;") : nullptr;
+    jobject view = owner && texture ? ag.env->CallObjectMethod(surface, owner) : nullptr;
+    jobject st = owner && texture && !ag.env->ExceptionCheck() ? ag.env->CallObjectMethod(surface, texture) : nullptr;
+    if (!ag.env->ExceptionCheck() && !view && st) *recognized = true;
+    if (ag.env->ExceptionCheck()) ag.env->ExceptionClear();
+    if (view) ag.env->DeleteLocalRef(view);
+    if (st) ag.env->DeleteLocalRef(st);
+    if (c) ag.env->DeleteLocalRef(c);
+    void* result = nullptr;
+    if (*recognized) {
+        using Create = void* (*)(JNIEnv*, void*, void*, jobject);
+        static auto create = reinterpret_cast<Create>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_create_native"));
+        result = create ? create(ag.env, dpy, config, surface) : nullptr;
+        if (ag.env->ExceptionCheck()) { ag.env->ExceptionDescribe(); ag.env->ExceptionClear(); }
+        std::fprintf(stderr, "[native-stream] SurfaceTexture window=%p egl=%p\n", win, result);
+    }
+    ag.env->DeleteLocalRef(surface);
+    return result;
+}
+static int macapk_native_stream_destroy(void* dpy, void* surf) {
+    using Destroy = int (*)(JNIEnv*, void*, void*);
+    static auto destroy = reinterpret_cast<Destroy>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_destroy_native"));
+    if (!destroy) return -1;
+    AttachGuard ag;
+    if (!ag.env || ag.env->ExceptionCheck()) return -1;
+    int r = destroy(ag.env, dpy, surf);
+    if (ag.env->ExceptionCheck()) { ag.env->ExceptionDescribe(); ag.env->ExceptionClear(); return 0; }
+    return r;
+}
+
 // ---- The native asset index over the installed APK set --------------------
 namespace {
 struct NativeZipEntry {
@@ -64391,7 +64695,33 @@ alignas(16) static uint8_t g_macapk_dummy_ANativeWindow[4096] = {0};
 // THAT rather than a 1080x1920 literal an engine would size its viewport and
 // render targets from. The literal is only a last resort for a query that
 // arrives before any window exists at all.
+// Query a retained keyless Surface for its current stream size. SurfaceTexture
+// can change its default buffer size after ANativeWindow_fromSurface returns.
+// A missing/old framework method keeps the recorded fallback size.
+static int32_t macapk_native_window_current_dimension(void* w, bool width) {
+    AttachGuard ag;
+    if (!ag.env || ag.env->ExceptionCheck()) return 0;
+    jobject surface = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+        for (const auto& r : g_macapk_nw_records)
+            if (r && w == &r->window && r->window.surface_key == 0 && r->surface) {
+                surface = ag.env->NewLocalRef(r->surface); break;
+            }
+    }
+    if (!surface) return 0;
+    jclass cls = ag.env->GetObjectClass(surface);
+    jmethodID mid = cls ? ag.env->GetMethodID(cls, "macapkGetNativeWindowOwnSizePacked", "()J") : nullptr;
+    jlong packed = mid ? ag.env->CallLongMethod(surface, mid) : 0;
+    if (ag.env->ExceptionCheck()) { ag.env->ExceptionClear(); packed = 0; }
+    if (cls) ag.env->DeleteLocalRef(cls);
+    ag.env->DeleteLocalRef(surface);
+    int32_t value = width ? static_cast<int32_t>(static_cast<uint64_t>(packed) >> 32)
+                          : static_cast<int32_t>(packed & 0xffffffffULL);
+    return value > 0 ? value : 0;
+}
 extern "C" int32_t __macapk_arm64_ANativeWindow_getWidth(void* w) {
+    if (int32_t current = macapk_native_window_current_dimension(w, true)) return current;
     if (MacApkNativeWindow* nw = macapk_native_window_for_ptr(w)) return nw->width;
     if (g_macapk_unity_window.magic == kMacApkNWMagic
         && g_macapk_unity_window.width > 0) {
@@ -64400,6 +64730,7 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_getWidth(void* w) {
     return 1080;
 }
 extern "C" int32_t __macapk_arm64_ANativeWindow_getHeight(void* w) {
+    if (int32_t current = macapk_native_window_current_dimension(w, false)) return current;
     if (MacApkNativeWindow* nw = macapk_native_window_for_ptr(w)) return nw->height;
     if (g_macapk_unity_window.magic == kMacApkNWMagic
         && g_macapk_unity_window.height > 0) {
@@ -64419,18 +64750,37 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_setBuffersGeometry(
     // query -> mCore->mDefaultWidth), which Unreal divides touch X/Y by.
     if (width < 0 || height < 0 || (width == 0) != (height == 0)) return -EINVAL;
     MacApkNativeWindow* nw = macapk_native_window_for_ptr(w);
-    if (!nw) return 0;
-    if (format != 0) nw->format = format;
+    if (!nw) return -EINVAL;
+    // Native window geometry treats every zero argument as "restore the base
+    // value". In particular, format 0 must restore RGBA_8888 rather than keep
+    // the previous caller's format.
+    nw->format = format == 0 ? 1 : format;
+    using KeyedGeoFn = int (*)(int, int, int);
+    static KeyedGeoFn set_keyed_geo = reinterpret_cast<KeyedGeoFn>(
+        dlsym(RTLD_DEFAULT, "CocoaSetNativeEglBufferGeometryForSurfaceKey"));
     using GeoFn = void (*)(int, int);
     static GeoFn set_geo = reinterpret_cast<GeoFn>(
         dlsym(RTLD_DEFAULT, "CocoaSetNativeEglBufferGeometry"));
-    if (set_geo) set_geo(width, height);
+    int32_t result = 0;
+    if (nw->surface_key > 0) {
+        // Never fall through to the process-wide legacy layer for a keyed
+        // surface: doing so changes unrelated video/danmaku windows.
+        if (set_keyed_geo) {
+            result = set_keyed_geo(nw->surface_key, width, height);
+        } else {
+            result = -ENOSYS;
+        }
+    } else if (set_geo) {
+        set_geo(width, height);
+    } else {
+        result = -ENOSYS;
+    }
     static std::atomic<int> n{0};
     if (n.fetch_add(1) < 8)
         std::fprintf(stderr, "[arm64-shim] ANativeWindow_setBuffersGeometry(%d x %d, "
-                     "format %d)%s\n", width, height, format,
-                     set_geo ? "" : " -- no Cocoa bridge, ignored");
-    return 0;
+                     "format %d) key=%d%s\n", width, height, format,
+                     nw->surface_key, result == 0 ? "" : " -- Cocoa bridge unavailable");
+    return result;
 }
 extern "C" void __macapk_arm64_ANativeWindow_release(void* w) {
     if (!macapk_keyed_native_windows_enabled()) return;
@@ -64466,6 +64816,30 @@ extern "C" void __macapk_arm64_ANativeWindow_acquire(void* w) {
         }
     }
 }
+
+// The legacy compositor has one shared native-EGL layer, so only that fallback
+// can designate one SurfaceView as its owner and punch the corresponding hole.
+// Keyed surfaces have their own CAMetalLayer and synchronize geometry/z-order
+// independently; registering one of them here also moves the shared layer used
+// by the other Surface consumers and makes the previous video/Canvas disappear.
+static bool macapk_surface_guest_below_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("MACAPK_SV_GUEST_BELOW");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return enabled;
+}
+
+static void macapk_note_shared_window_owner(JNIEnv* env, jobject surface) {
+    if (!env || !surface || !macapk_surface_guest_below_enabled()) return;
+    jclass sc = env->GetObjectClass(surface);
+    jmethodID note = sc ? env->GetMethodID(sc, "macapkNoteNativeWindowConsumer", "()V")
+                        : nullptr;
+    if (note) env->CallVoidMethod(surface, note);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (sc) env->DeleteLocalRef(sc);
+}
+
 // The Java Surface the guest handed to ANativeWindow_fromSurface, kept as a
 // JNI GLOBAL ref so ANativeWindow_toSurface can hand the SAME object back.
 // NDK native_window_jni.h documents toSurface as the exact inverse of
@@ -64480,15 +64854,39 @@ static MacApkNativeWindowRecord* macapk_remember_native_window_surface(jobject s
     MacApkNativeWindowRecord* rec = nullptr;
     const bool keyed = macapk_keyed_native_windows_enabled();
     jint surfaceKey = 0;
+    int32_t ownW = 0, ownH = 0;
     if (keyed && !ag.env->ExceptionCheck()) {
         jclass sc = ag.env->GetObjectClass(surface);
         jmethodID keyMid = sc ? ag.env->GetMethodID(sc, "macapkGetNativeWindowSurfaceKey", "()I")
                               : nullptr;
         if (keyMid) surfaceKey = ag.env->CallIntMethod(surface, keyMid);
         if (ag.env->ExceptionCheck()) { ag.env->ExceptionClear(); surfaceKey = 0; }
+        // v1.0.1063: the owning SurfaceView's OWN size in pixels. On Android a
+        // SurfaceView's BufferQueue defaults to the VIEW's size, so the window
+        // a native producer gets answers THAT, not the app window's size. A
+        // producer sizes its viewport from ANativeWindow_getWidth/Height; if we
+        // answer the window size, it renders larger than the view and the
+        // overflow is clipped away (measured: a 1040x1334 viewport inside a
+        // 1040x780 view -> the overlay rendered nothing on screen).
+        jmethodID ownMid = sc ? ag.env->GetMethodID(sc, "macapkGetNativeWindowOwnSizePacked", "()J")
+                              : nullptr;
+        // This is our optional framework lookup, not a guest JNI lookup.
+        // A stale framework jar can lack the method; consume only our failure.
+        if (!ownMid && ag.env->ExceptionCheck()) ag.env->ExceptionClear();
+        if (ownMid) {
+            jlong packed = ag.env->CallLongMethod(surface, ownMid);
+            if (!ag.env->ExceptionCheck()) {
+                ownW = (int)(packed >> 32);
+                ownH = (int)(packed & 0xffffffffL);
+            } else { ag.env->ExceptionClear(); ownW = ownH = 0; }
+        }
         if (sc) ag.env->DeleteLocalRef(sc);
     }
     if (keyed) {
+        std::fprintf(stderr,
+            "[arm64-shim] ANativeWindow_fromSurface: surface=%p ownerKey=%d\n",
+            (void*)surface, (int)surfaceKey);
+        std::fflush(stderr);
         std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
         for (const auto& r : g_macapk_nw_records) {
             if (r && r->surface && ag.env->IsSameObject(r->surface, surface)) {
@@ -64507,6 +64905,8 @@ static MacApkNativeWindowRecord* macapk_remember_native_window_surface(jobject s
             auto freshRec = std::make_unique<MacApkNativeWindowRecord>();
             freshRec->surface = fresh;
             freshRec->window.surface_key = (int32_t)surfaceKey;
+            freshRec->own_w = ownW;
+            freshRec->own_h = ownH;
             rec = freshRec.get();
             g_macapk_nw_records.push_back(std::move(freshRec));
         }
@@ -64524,30 +64924,10 @@ static MacApkNativeWindowRecord* macapk_remember_native_window_surface(jobject s
         }
         if (old) ag.env->DeleteGlobalRef(old);
     }
-    // Tell the framework which SurfaceView's Surface a native producer now
-    // feeds (Surface.macapkNoteNativeWindowConsumer). AOSP composites that
-    // surface BELOW its window and the SurfaceView punches a hole for it
-    // (android14 SurfaceView.java :512-533, clearSurfaceViewPort :579-597);
-    // our native-EGL layer can only do the same once the framework knows the
-    // owner (cocoa_bridge.mm macapk_guest_layer_z_for). Never touch an app's
-    // pending exception; a Surface without the method (an older framework
-    // jar) is simply not noted, which keeps the legacy above-window slot.
-    // MACAPK_SV_GUEST_BELOW=0 (exactly "0", as the Java side reads it) skips the
-    // whole block: no GetObjectClass / GetMethodID / upcall, the pre-change path.
-    static const bool kGuestBelow = [] {
-        const char* e = std::getenv("MACAPK_SV_GUEST_BELOW");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    if ((keyed || kGuestBelow) && !ag.env->ExceptionCheck()) {
-        jclass sc = ag.env->GetObjectClass(surface);
-        if (kGuestBelow && !ag.env->ExceptionCheck()) {
-            jmethodID note = sc ? ag.env->GetMethodID(sc, "macapkNoteNativeWindowConsumer", "()V")
-                                : nullptr;
-            if (note) ag.env->CallVoidMethod(surface, note);
-        }
-        if (ag.env->ExceptionCheck()) ag.env->ExceptionClear();
-        if (sc) ag.env->DeleteLocalRef(sc);
-    }
+    // Legacy mode has one shared layer. A keyed surface must NOT enter that
+    // ownership state; if its keyed layer cannot be created, the fallback below
+    // performs the registration when it actually returns the shared window.
+    if (!keyed) macapk_note_shared_window_owner(ag.env, surface);
     return rec;
 }
 extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
@@ -64591,6 +64971,11 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
             dlsym(RTLD_DEFAULT, "CocoaEnsureNativeEglLayerForSurfaceKey"));
         layer = get_key_layer ? get_key_layer(nativeSurfaceKey, &w, &h) : nullptr;
         if (layer && w > 0 && h > 0) {
+            // v1.0.1063: the window's DEFAULT size is the SurfaceView's own
+            // size (Android's BufferQueue default), not the app window's. The
+            // layer's drawable stays window-sized; the layer FRAME is the view
+            // rect, so the producer's buffer is scaled into it on composite.
+            if (rec->own_w > 0 && rec->own_h > 0) { w = rec->own_w; h = rec->own_h; }
             {
                 std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
                 if (rec->window.magic != kMacApkNWMagic) {
@@ -64618,6 +65003,11 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
             // A keyless Surface (or a keyed layer whose creation failed) still
             // needs its own acquired handle and Java identity on the fallback
             // layer. Returning the legacy singleton here would lose both.
+            // A keyless SurfaceTexture has its own buffer dimensions even
+            // though this provisional layer belongs to the host window.
+            if (nativeSurfaceKey == 0 && rec->own_w > 0 && rec->own_h > 0) {
+                w = rec->own_w; h = rec->own_h;
+            }
             std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
             if (rec->window.magic != kMacApkNWMagic) {
                 rec->window.width = w;
@@ -64627,6 +65017,8 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
                 rec->window.surface_key = 0;
                 rec->window.magic = kMacApkNWMagic;
             }
+            AttachGuard ag;
+            if (ag.env) macapk_note_shared_window_owner(ag.env, rec->surface);
             return &rec->window;
         }
         g_macapk_unity_window.magic  = kMacApkNWMagic;
@@ -65067,13 +65459,14 @@ extern "C" uint32_t __macapk_shim_eglQuerySurface(
 }
 extern "C" uint32_t __macapk_shim_eglDestroySurface(
         uint32_t dpy_h, uint32_t surface_h, uint32_t, uint32_t) {
-    using Fn = unsigned (*)(void*, void*);
-    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "eglDestroySurface"));
     void* dpy  = __macapk_jni_resolve_handle(dpy_h);
     void* surf = __macapk_jni_resolve_handle(surface_h);
-    if (!dpy || !surf || !real) return 0;
-    unsigned r = real(dpy, surf);
-    if (r) __macapk_jni_release_handle(surface_h);
+    if (!dpy || !surf) return 0;
+    unsigned r = __macapk_arm64_eglDestroySurface(dpy, surf);
+    if (r) {
+        macapk_forget_keyed_egl_surface(surf);
+        __macapk_jni_release_handle(surface_h);
+    }
     return r;
 }
 extern "C" uint32_t __macapk_shim_eglDestroyContext(
@@ -65351,6 +65744,15 @@ thread_local MacApkLooper* t_looper = nullptr;
 std::mutex                 g_loopers_mu;
 std::vector<MacApkLooper*> g_loopers;     // registry for the vsync broadcast
 
+// Isolated experiment: wake fd-backed NDK loopers when vsync makes work ready.
+static bool macapk_native_choreo_pipe_wake_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+
 static bool macapk_native_choreo_trace_enabled() {
     static const bool enabled = [] {
         const char* e = std::getenv("MACAPK_NATIVE_CHOREO_TRACE");
@@ -65611,7 +66013,18 @@ void* macapk_vsync_feeder_thread(void*) {
 
 void macapk_register_vsync_feed(int read_fd, void* callback, void* data,
                                   MacApkLooper* L) {
-    if (!callback || !data || read_fd < 0) return;  // the callback-fd vsync pattern
+    if (!callback || !data || read_fd < 0) return;
+    // The feeder decodes a particular Unity structure and may poll the
+    // registered looper on its own thread. An arbitrary callback fd is not
+    // evidence of Unity vsync: e.g. Chronos registers its task pipe and must
+    // execute that callback on CRON.Main, where its thread-local state lives.
+    // Identify the callback's owning guest image before attaching this Unity
+    // workaround. Ordinary ALooper registrations remain owner-thread driven.
+    Dl_info info{};
+    if (!__macapk_arm64_native_dladdr(callback, &info) || !info.dli_fname) return;
+    const char* name = std::strrchr(info.dli_fname, '/');
+    name = name ? name + 1 : info.dli_fname;
+    if (std::strcmp(name, "libunity.so") != 0) return;
     { std::lock_guard<std::mutex> lk(g_vsync_feed_mu);
       for (const MacApkVsyncFeed& f : g_vsync_feeds) if (f.read_fd == read_fd) return;
       g_vsync_feeds.push_back({read_fd, callback, data}); }
@@ -65766,10 +66179,15 @@ static int macapk_alooper_poll_slice(
             if (!ev) ev = POLLIN;
             pfds.push_back(pollfd{f.fd, ev, 0});
         }
-        // Bound the wait at 100ms so ALooper_wake / fd-removal is seen promptly.
+        const bool choreoPipe = macapk_native_choreo_pipe_wake_enabled() && L->wake_r >= 0;
+        if (choreoPipe) pfds.push_back(pollfd{L->wake_r, POLLIN, 0});
+        // Check queued work before sleeping, including a vsync that raced the fd snapshot.
+        bool readyNow = false;
+        if (choreoPipe) { std::lock_guard<std::mutex> lk(L->mu); readyNow = !L->ready.empty(); }
         int to = (timeout_ms < 0) ? 100
                : (timeout_ms == 0) ? 0
                : (timeout_ms > 100 ? 100 : timeout_ms);
+        if (readyNow) to = 0;
         { static std::atomic<int> pn{0}; int c = pn.fetch_add(1);
           if (c < 8) { uint64_t tid=0; pthread_threadid_np(nullptr,&tid);
             std::fprintf(stderr, "[looper] pollOnce #%d looper=%p tid=%llu "
@@ -65779,7 +66197,11 @@ static int macapk_alooper_poll_slice(
         int r = ::poll(pfds.data(), (nfds_t)pfds.size(), to);
         int ret = -3; // ALOOPER_POLL_TIMEOUT default
         if (r > 0) {
-            for (size_t i = 0; i < pfds.size(); ++i) {
+            if (choreoPipe && pfds.back().revents) {
+                uint8_t buf[128];
+                while (::read(L->wake_r, buf, sizeof(buf)) > 0) {}
+            }
+            for (size_t i = 0; i < fds.size(); ++i) {
                 short re = pfds[i].revents;
                 if (!re) continue;
                 int aev = 0;
@@ -66460,6 +66882,10 @@ extern "C" void __macapk_arm64_choreographer_fire(int64_t /*frameTimeNanos_raw*/
             for (const MacApkChoreoCb& c : L->pending) L->ready.push_back(c);
             L->pending.clear();
             L->ready_ft = frameTimeNanos;
+            if (macapk_native_choreo_pipe_wake_enabled() && !L->fds.empty() && L->wake_w >= 0) {
+                const uint8_t b = 1;
+                (void)::write(L->wake_w, &b, 1); // EAGAIN means an unread wake is already pending.
+            }
             L->cv.notify_all();
         }
     }

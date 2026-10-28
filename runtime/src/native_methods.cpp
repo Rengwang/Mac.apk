@@ -3459,6 +3459,42 @@ extern "C" int __macapk_egl14_window_swap(void* dpy, void* surf) {
     return egl14_native_swap(dpy, surf);
 }
 
+// NDK-created SurfaceTexture windows share the same producer and swap registry
+// as EGL14 windows. The caller supplies its thread's JNIEnv and Surface.
+extern "C" void* __macapk_egl14_window_create_native(JNIEnv* env, void* dpy,
+                                                        void* cfg, jobject surface) {
+    if (!env || !surface || !egl14_window_real() || !egl14_upcalls(env)) return nullptr;
+    jobject jd = boxDisplay(env, dpy), jc = boxConfig(env, cfg);
+    if (!jd || !jc || env->ExceptionCheck()) {
+        if (jd) env->DeleteLocalRef(jd);
+        if (jc) env->DeleteLocalRef(jc);
+        return nullptr;
+    }
+    jlong r = env->CallStaticLongMethod(g_egl14Up.cls, g_egl14Up.create,
+                                       jd, jc, surface, nullptr, 0);
+    env->DeleteLocalRef(jd); env->DeleteLocalRef(jc);
+    if (env->ExceptionCheck()) return nullptr;
+    if (r <= 0) {
+        if (r < -2) t_egl14PendingError = static_cast<int>(-r);
+        return nullptr;
+    }
+    void* handle = reinterpret_cast<void*>(static_cast<intptr_t>(r));
+    egl14_win_add(dpy, handle);
+    return handle;
+}
+extern "C" unsigned __macapk_egl14_take_native_error() {
+    unsigned result = static_cast<unsigned>(t_egl14PendingError);
+    t_egl14PendingError = 0;
+    return result;
+}
+extern "C" int __macapk_egl14_window_destroy_native(JNIEnv* env, void* dpy, void* surf) {
+    Egl14Win w;
+    if (!egl14_win_take(dpy, surf, &w)) return -1;
+    if (!env || !egl14_upcalls(env)) return 0;
+    jboolean result = JNI_FALSE;
+    return egl14_win_destroy(env, w, &result) && result ? 1 : 0;
+}
+
 namespace {
 // Java-callable: install the JNI tracer for the calling thread's
 // JNIEnv. Bound to NativeLog so we don't need a new Java class.

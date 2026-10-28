@@ -953,6 +953,37 @@ struct AppStubMain {
         //    versioned code-cache side of the bundle's android tree.
         setenv("MACAPK_APP_CACHE_DIR", codeDir.path, 1)
         setenv("MACAPK_APP_LABEL", label, 1)
+        // Dock launches bypass MacApkLauncherApp launch(), so they also need
+        // the same production logging defaults that launch() applies. In
+        // particular, the per-class AppClassLoader INFO pair is the hottest
+        // startup/UI logging path: keeping it enabled here made a direct app
+        // launch write megabytes of class-load lines per second and starve
+        // video/UI progress. Keep INFO as the general AOSP floor, suppress
+        // only that call site, and honor explicit per-app overrides.
+        if ProcessInfo.processInfo.environment["MACAPK_LOG_LEVEL"] == nil {
+            setenv("MACAPK_LOG_LEVEL", "4", 1)
+        }
+        if ProcessInfo.processInfo.environment["MACAPK_QUIET_CLASSLOAD"] == nil {
+            setenv("MACAPK_QUIET_CLASSLOAD", "1", 1)
+        }
+        // Production defaults for the compatibility primitives exercised by the
+        // verified Bilibili build. These are framework capabilities rather than
+        // an app-specific workaround: each SurfaceView may own an independent
+        // Metal/EGL layer, alpha-capable layers can composite overlays such as
+        // danmaku, native SurfaceTextures remain usable as offscreen video
+        // streams, and Java Choreographer wakes every registered native looper.
+        // Settings/environment overrides are applied by the caller and may set
+        // any value of "0" to opt out while diagnosing a regression.
+        let productionCompatibilityDefaults = [
+            "MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS",
+            "MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE",
+            "MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA",
+            "MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE",
+        ]
+        for name in productionCompatibilityDefaults
+        where ProcessInfo.processInfo.environment[name] == nil {
+            setenv(name, "1", 1)
+        }
         //
         //    SELF-HEAL THE BUNDLE ICON FIRST. A bundle can legitimately reach
         //    this point with no icon at all: BundleGenerator.generate() runs

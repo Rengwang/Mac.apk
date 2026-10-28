@@ -4266,6 +4266,14 @@ struct LauncherView: View {
             env["MACAPK_LOG_LEVEL"]      = "4"
             env["MACAPK_QUIET_CLASSLOAD"] = "1"
         }
+        // Keep the control-panel launch path byte-for-byte equivalent to a
+        // Dock launch of an installed app. These defaults enable the generic
+        // multi-Surface/EGL composition capabilities validated with Bilibili's
+        // video plus danmaku pipeline; user environment values below still win.
+        env["MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS"] = "1"
+        env["MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE"] = "1"
+        env["MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA"] = "1"
+        env["MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE"] = "1"
         // User-configured environment goes on LAST, so what someone typed
         // into Settings > Default environment or an app's Get Info sheet is
         // what the runtime actually sees. Global first, per-app over it:
@@ -4471,6 +4479,13 @@ struct LauncherView: View {
                 env["MACAPK_TRACE_JNI_HANDLES"] = "1"
             }
         }
+        // Installed bundles are launched through their stubs, which apply the
+        // same defaults. Supplying them here as well keeps LaunchServices'
+        // environment complete and lets an explicit default/app override win.
+        env["MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS"] = "1"
+        env["MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE"] = "1"
+        env["MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA"] = "1"
+        env["MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE"] = "1"
         for (k, v) in model.defaultEnv { env[k] = v }
         if let app {
             for (k, v) in app.env { env[k] = v }

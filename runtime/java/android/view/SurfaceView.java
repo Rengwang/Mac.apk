@@ -106,17 +106,45 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
      *  (AOSP draw() only punches when !isAboveParent()). With no per-surface
      *  layer in the runtime (the default until the native half lands) nothing
      *  reads it, exactly as before. */
-    private volatile boolean mZOrderOnTop;
-    public void setZOrderOnTop(boolean onTop) { mZOrderOnTop = onTop; }
+    private static final int APPLICATION_MEDIA_SUBLAYER = -2;
+    private static final int APPLICATION_MEDIA_OVERLAY_SUBLAYER = -1;
+    private static final int APPLICATION_PANEL_SUBLAYER = 2;
+    private volatile int mSubLayer = APPLICATION_MEDIA_SUBLAYER;
+    public void setZOrderOnTop(boolean onTop) {
+        mSubLayer = onTop ? APPLICATION_PANEL_SUBLAYER : APPLICATION_MEDIA_SUBLAYER;
+        NativeLog.i(TAG, "setZOrderOnTop(" + onTop + ") on " + getClass().getName());
+    }
     /** AOSP setZOrderMediaOverlay (:638) picks MEDIA_OVERLAY vs MEDIA sublayer;
      *  both are below the window, so for this runtime it only clears onTop the
      *  way AOSP's own body does (it resets mRequestedSubLayer below the window). */
-    public void setZOrderMediaOverlay(boolean isMediaOverlay) { mZOrderOnTop = false; }
+    public void setZOrderMediaOverlay(boolean isMediaOverlay) {
+        // AOSP ignores this call while the surface is already above its parent.
+        if (mSubLayer < 0) {
+            mSubLayer = isMediaOverlay
+                ? APPLICATION_MEDIA_OVERLAY_SUBLAYER : APPLICATION_MEDIA_SUBLAYER;
+        }
+        NativeLog.i(TAG, "setZOrderMediaOverlay(" + isMediaOverlay + ") on "
+            + getClass().getName());
+    }
     /** Does this surface sit ABOVE its window (setZOrderOnTop)? Read by
      *  WebView.macapkBackdropFor: a below-window SurfaceView punches a hole
      *  through everything its window drew before it (AOSP draw()), an
      *  above-window one does not. */
-    public final boolean macapkIsZOrderOnTop() { return mZOrderOnTop; }
+    public final boolean macapkIsZOrderOnTop() { return mSubLayer >= 0; }
+
+    /** A successful keyed native-window lookup means this surface has its own
+     *  compositor layer. Unlike the legacy shared ANGLE layer, that layer can be
+     *  positioned at this view's rect even when it is not the window root.
+     *  Set by the native bridge only after CocoaEnsureNativeEglLayerForSurfaceKey
+     *  returns a real layer, so legacy surfaces keep their old sizing rules. */
+    private volatile boolean macapkHasIsolatedNativeSurface;
+
+    /** Framework-internal callback from the keyed ANativeWindow bridge. */
+    public static void macapkNoteIsolatedNativeSurface(int key) {
+        java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
+        SurfaceView v = ref != null ? ref.get() : null;
+        if (v != null) v.macapkHasIsolatedNativeSurface = true;
+    }
 
     // ---- DETECT: a renderer drawing for an activity that is STOPPED ---------
     // On a device a stopped activity's window is hidden and its SurfaceView's
@@ -587,6 +615,9 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
     }
 
     private boolean macapkTryFireHolderCreatedHere(int widthPx, int heightPx) {
+        // The holder frame is already valid when surfaceCreated is delivered.
+        int[] firstSize = macapkHolderSurfaceSize(widthPx, heightPx);
+        holder.frame.set(0, 0, firstSize[0], firstSize[1]);
         if (!holder.fireCreatedTolerant()) return false;
         holderSurfaceCreatedFired = true;
         pendingSurfaceW = 0;
@@ -596,7 +627,6 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         // MACAPK_SV_VIEW_SIZE: the view's laid-out size when it does not fill
         // its window (AOSP updateSurface :985-988); the display size otherwise
         // and with the gate off, as before.
-        int[] firstSize = macapkHolderSurfaceSize(widthPx, heightPx);
         holder.fireChanged(0, firstSize[0], firstSize[1]);
         // v1.0.575: AGDK content-rect delivery. GameActivity registers an
         // OnGlobalLayoutListener on THIS SurfaceView's ViewTreeObserver (in
@@ -1255,8 +1285,17 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
      *  GL corner is the pre-change display size, and it is corrected after its
      *  first frame (BobBall: 3360x1636, then 3360x1560). */
     private int[] macapkHolderSurfaceSize(int displayW, int displayH) {
+        if (sViewSizeGate && holder.macapkFixedSize && macapkHasIsolatedNativeSurface) {
+            android.graphics.Rect fixed = holder.getSurfaceFrame();
+            if (fixed.width() > 0 && fixed.height() > 0) {
+                return new int[] { fixed.width(), fixed.height() };
+            }
+        }
         if (sViewSizeGate && !holder.macapkFixedSize) {
-            boolean gl = !holder.macapkLockedCanvas;                   /*HOLDER-RULE*/
+            // A keyed CAMetalLayer is a per-Surface compositor target. It can
+            // follow this View's rect wherever it is placed, so the old
+            // shared-GL-layer anchor restriction no longer applies.
+            boolean gl = !holder.macapkLockedCanvas && !macapkHasIsolatedNativeSurface;
             int[] v = macapkNonFillingViewSize(displayW, displayH, gl);
             if (v != null) return v;
         }
@@ -1665,15 +1704,36 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             return 0L;
         }
         try {
+            // A stopped Activity still owns attached, "shown" View objects in
+            // this single-task host. AOSP destroys the Activity's window and
+            // therefore its Surface controls, so an old video must not remain
+            // composited over the next Activity (the common deep-link/back-
+            // stack case). Keep this independent of application classes: it is
+            // the same owner-activity state ActivityHost already maintains.
+            if (v.macapkOwnerStoppedUnderTop()) {
+                v.macapkNoteLayerPull(-5L, -1L);
+                return -1L;
+            }
             if (!v.macapkAttached || !v.isShown()) {
                 v.macapkNoteLayerPull(v.macapkAttached ? -3L : -2L, -1L);
                 return -1L;
             }
             int[] d = v.macapkNotedDisplaySize();
             int dW = d != null ? d[0] : 0, dH = d != null ? d[1] : 0;
-            android.graphics.Rect f = v.holder.getSurfaceFrame();
             int x, y, w, h;
-            if (v.holder.macapkFixedSize || (f.width() == dW && f.height() == dH)) {
+            android.graphics.Rect f = v.holder.getSurfaceFrame();
+            if (v.macapkHasIsolatedNativeSurface) {
+                // Buffer size and display geometry are separate Android concepts.
+                // A keyed per-surface layer shows its View rect even when the
+                // producer chose setFixedSize() or the holder briefly reports the
+                // display size during the surfaceCreated handoff.
+                w = v.getWidth();
+                h = v.getHeight();
+                if (w <= 0 || h <= 0) { v.macapkNoteLayerPull(-4L, -1L); return -1L; }
+                int[] o = new int[2];
+                v.macapkWindowOrigin(o);
+                x = o[0]; y = o[1];
+            } else if (v.holder.macapkFixedSize || (f.width() == dW && f.height() == dH)) {
                 if (dW <= 0 || dH <= 0) return -1L;
                 x = 0; y = 0; w = dW; h = dH;
             } else {
@@ -1723,7 +1783,51 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
     public static boolean macapkSurfaceZOrderOnTop(int key) {
         java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
         SurfaceView v = ref != null ? ref.get() : null;
-        return v != null && v.mZOrderOnTop;
+        return v != null && v.mSubLayer >= 0;
+    }
+
+    /** Native pull: AOSP SurfaceView sublayer class. 2 = setZOrderOnTop,
+     *  1 = setZOrderMediaOverlay(true), 0 = the default media sublayer. */
+    public static int macapkSurfaceZOrder(int key) {
+        java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
+        SurfaceView v = ref != null ? ref.get() : null;
+        if (v == null) return 0;
+        if (v.mSubLayer >= 0) return 2;
+        return v.mSubLayer == APPLICATION_MEDIA_OVERLAY_SUBLAYER ? 1 : 0;
+    }
+
+    /** Native pull: producer buffer size in physical pixels. A keyed surface
+     *  can be scaled from this buffer into its separately positioned View rect. */
+    /** Framework-internal: this SurfaceView's OWN size in physical pixels.
+     *  On Android a SurfaceView's BufferQueue defaults to the VIEW's size, so
+     *  ANativeWindow_getWidth/Height answer that -- NOT the window's size. A
+     *  native producer sizes its viewport from it and renders exactly that
+     *  many pixels; if we answer the window size instead, the guest renders
+     *  LARGER than the view and the part outside the view's rect is clipped
+     *  away by the compositor (measured: a 1040x1334 viewport in a 1040x780
+     *  view -> the overlay layer showed nothing). */
+    public static long macapkSurfaceOwnSizePacked(int key) {
+        java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
+        SurfaceView v = ref != null ? ref.get() : null;
+        if (v == null) return 0L;
+        int w = v.getWidth(), h = v.getHeight();
+        if (w <= 0 || h <= 0) return 0L;
+        return ((long) w << 32) | (h & 0xffffffffL);
+    }
+
+    public static long macapkSurfaceBufferSizePacked(int key) {
+        java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
+        SurfaceView v = ref != null ? ref.get() : null;
+        if (v == null || !v.macapkHasIsolatedNativeSurface) return 0L;
+        android.graphics.Rect f = v.holder.getSurfaceFrame();
+        // Without an explicit fixed size, the producer follows the view. The
+        // holder's cached frame can still contain the previous window size
+        // during relayout; publishing it here fights the native swapchain's
+        // new extent and can trigger repeated swapchain recreation.
+        int w = v.holder.macapkFixedSize ? f.width() : v.getWidth();
+        int h = v.holder.macapkFixedSize ? f.height() : v.getHeight();
+        if (w <= 0 || h <= 0) { w = v.getWidth(); h = v.getHeight(); }
+        return w > 0 && h > 0 ? ((long) w << 32) | (h & 0xffffffffL) : 0L;
     }
 
     // ---- the native window owner: below the window + a hole ------------------
@@ -1789,8 +1893,8 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         if (prev != owner) {
             owner.macapkNativeHoleLogged = false;   // each owner line is followed by its own punch line
             NativeLog.i(TAG, "native window owner: " + owner.getClass().getName()
-                + " onTop=" + owner.mZOrderOnTop + " -> its layer composites "
-                + (owner.mZOrderOnTop ? "ABOVE" : "BELOW (hole punched)")
+                + " onTop=" + (owner.mSubLayer >= 0) + " -> its layer composites "
+                + (owner.mSubLayer >= 0 ? "ABOVE" : "BELOW (hole punched)")
                 + " the window (MACAPK_SV_GUEST_BELOW)");
         }
     }
@@ -1813,7 +1917,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         java.lang.ref.WeakReference<SurfaceView> ref = sNativeWindowOwner;
         SurfaceView v = ref != null ? ref.get() : null;
         if (v == null) return sHadNativeWindowOwner ? 1 : 0;
-        return v.mZOrderOnTop ? 2 : 1;
+        return v.mSubLayer >= 0 ? 2 : 1;
     }
 
     // ---- MetalSurfaceCallbacks: reflection-driven autodiscovery ----
@@ -3829,7 +3933,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
                         : Integer.toHexString(System.identityHashCode(root)))
                     + " isRoot=" + (root != null && root == canvas));
             }
-        } else if (sSurfaceLayerGate && macapkSurfaceLayerDrawn && !mZOrderOnTop) {
+        } else if (sSurfaceLayerGate && macapkSurfaceLayerDrawn && mSubLayer < 0) {
             // A lockCanvas surface shown through its own layer BELOW the view
             // tree: the same hole, on AOSP's own condition (android14 draw()
             // :512-521, `if (mDrawFinished && !isAboveParent())` ->
@@ -3837,7 +3941,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             // paints under this view would hide the surface. Only reachable once
             // the runtime has a per-surface layer (macapkPresentThroughSurfaceLayer).
             canvas.punchHole(0f, 0f, getWidth(), getHeight(), 0f, 0f, getAlpha());
-        } else if (macapkNativeWindowDrawFinished && !mZOrderOnTop && macapkIsNativeWindowOwner()) {
+        } else if (macapkNativeWindowDrawFinished && mSubLayer < 0 && macapkIsNativeWindowOwner()) {
             // The native-EGL window layer sits BELOW the window for this view
             // (macapkNativeWindowLayerZ == 1): the same AOSP hole, on the same
             // condition (draw() :512-521). Without it the window's own opaque
@@ -4049,6 +4153,11 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             // this runs off it (SV_UI_THREAD_CALLBACKS, above), behind any posted
             // surfaceCreated, so the order stays created -> changed.
             frame.set(0, 0, w, h);
+            if ("1".equals(System.getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE"))) {
+                NativeLog.i(TAG, "[surface-change-probe] "
+                    + (owner != null ? owner.getClass().getName() : "<no-owner>")
+                    + " format=" + format + " " + w + "x" + h);
+            }
             if (surface != null && surface.macapkGetSurfaceTexture() != null && w > 0 && h > 0) {
                 surface.macapkGetSurfaceTexture().setDefaultBufferSize(w, h);
             }

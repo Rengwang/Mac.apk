@@ -88,9 +88,6 @@ public class Surface implements android.os.Parcelable {
     public Surface() {}
     public Surface(android.graphics.SurfaceTexture surfaceTexture) {
         mSurfaceTexture = surfaceTexture;
-        if (surfaceTexture != null) {
-            surfaceTexture.macapkRegisterVideoTarget();
-        }
     }
     public boolean isValid() { return !mReleased; }
     public void release() {
@@ -144,6 +141,22 @@ public class Surface implements android.os.Parcelable {
     public int macapkGetNativeWindowSurfaceKey() {
         return mOwnerSurfaceView != null
                 ? mOwnerSurfaceView.macapkNativeWindowSurfaceKey() : 0;
+    }
+
+    /** Framework-internal: the owning SurfaceView's OWN size in physical
+     *  pixels, packed as (w << 32) | h; 0 when there is no owner. This is the
+     *  size a native producer must treat as its window's default size -- on
+     *  Android a SurfaceView's BufferQueue defaults to the VIEW's size. */
+    public long macapkGetNativeWindowOwnSizePacked() {
+        if (mOwnerSurfaceView == null) {
+            android.graphics.SurfaceTexture st = mSurfaceTexture;
+            if (st == null) return 0L;
+            int w = st.macapkGetDefaultWidth(), h = st.macapkGetDefaultHeight();
+            return w > 0 && h > 0 ? ((long) w << 32) | (h & 0xffffffffL) : 0L;
+        }
+        int key = mOwnerSurfaceView.macapkNativeWindowSurfaceKey();
+        if (key <= 0) return 0L;
+        return android.view.SurfaceView.macapkSurfaceOwnSizePacked(key);
     }
 
     /** Mac.apk framework-internal, called by the Bionic shim's

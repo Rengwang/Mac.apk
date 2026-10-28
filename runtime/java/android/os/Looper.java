@@ -813,7 +813,7 @@ public final class Looper {
         }
         long n = 0;
         for (;;) {
-            Message msg = q.next();   // blocks
+            Message msg = q.macapkNextForMainLoop();   // blocks
             if (msg == null) break;   // quit()
             n++;
             try {
@@ -882,7 +882,7 @@ public final class Looper {
         for (;;) {
             Message msg;
             boolean dispatched = false;
-            while ((msg = q.macapkPollDue()) != null) {
+            while ((msg = q.macapkPollDueForMainLoop()) != null) {
                 dispatched = true;
                 n++;
                 try {
@@ -898,7 +898,7 @@ public final class Looper {
             }
             if (dispatched) idledThisBlock = false;
             if (q.isQuitting()) break;
-            int timeout = q.nextPollTimeoutMillis();
+            int timeout = q.macapkNextPollTimeoutMillisForMainLoop();
             if (timeout == 0) {
                 // AOSP calls nativePollOnce(ptr, 0) on every pass, so a busy main
                 // queue still services its fds.

@@ -28,6 +28,13 @@ public class ImageView extends View {
 
     private android.graphics.Bitmap   bitmap;
     private android.graphics.drawable.Drawable drawable;
+    // AOSP ImageView.mLevel/mHasLevelSet. setImageLevel() is used by widgets
+    // such as play/pause and danmaku toggles whose LevelListDrawable swaps the
+    // displayed icon. Keep the requested level so it is replayed if the app
+    // replaces the drawable after setting the state (the framework may reload
+    // a themed resource during a configuration or state change).
+    private boolean hasImageLevel;
+    private int imageLevel;
     private ScaleType scaleType = ScaleType.FIT_CENTER;
     // 2026-09-25: the v1.0.448 `macapkImageScalePct` field (fed by a
     // LayoutInflater `case "imageScalePercent"`) was DELETED. That attribute is
@@ -172,6 +179,7 @@ public class ImageView extends View {
                 this.drawable = new android.graphics.drawable.BitmapDrawable(b);
             }
         }
+        applyImageLevel();
         // v1.0.110: AOSP semantics -- swapping the bitmap MUST trigger
         // a redraw. Glide calls into setImageBitmap (via BitmapDrawable
         // unwrap) on the main thread once decode completes; without
@@ -318,6 +326,11 @@ public class ImageView extends View {
         if (d != null && d.isStateful()) {
             try { d.setState(getDrawableState()); } catch (Throwable ignored) {}
         }
+        // AOSP ImageView.updateDrawable replays a level previously supplied to
+        // setImageLevel(). Without this, replacing a resource silently resets a
+        // LevelListDrawable to level 0 even though the owning widget's logical
+        // state (playing, danmaku enabled, etc.) has not changed.
+        applyImageLevel();
         // AOSP ImageView.updateDrawable applies any previously-configured tint
         // to the NEW drawable too (a tint set once via setImageTintList/
         // app:tint survives across setImageResource/setImageDrawable calls,
@@ -489,7 +502,29 @@ public class ImageView extends View {
     }
     public int getImageAlpha() { return 255; }
     public void setImageAlpha(int alpha) {}
-    public void setImageLevel(int level) {}
+    private void applyImageLevel() {
+        if (hasImageLevel && drawable != null) {
+            try { drawable.setLevel(imageLevel); } catch (Throwable ignored) {}
+        }
+    }
+    public void setImageLevel(int level) {
+        imageLevel = level;
+        hasImageLevel = true;
+        if (drawable != null) {
+            int oldWidth = drawable.getIntrinsicWidth();
+            int oldHeight = drawable.getIntrinsicHeight();
+            // Drawable.setLevel returns whether the visual state changed. Even
+            // when it returns false, setting the same level is harmless, and an
+            // explicit invalidate covers level-aware custom drawables that do
+            // not signal invalidation through their callback.
+            drawable.setLevel(level);
+            if (oldWidth != drawable.getIntrinsicWidth()
+                    || oldHeight != drawable.getIntrinsicHeight()) {
+                requestLayout();
+            }
+            invalidate();
+        }
+    }
     public void setColorFilter(android.graphics.ColorFilter cf) { this.colorFilter = cf; }
     public void setColorFilter(int color) { /* tint not wired through Canvas yet */ }
     public void clearColorFilter() { this.colorFilter = null; }

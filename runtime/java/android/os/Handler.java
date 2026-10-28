@@ -167,6 +167,15 @@ public class Handler {
      *  MessageQueue.macapkPollDueSkippingOwnerOnly via msg.target. */
     boolean mMacapkOwnerOnly = false;
 
+    /** MAC.APK: frame-traversal posts may cross a Choreographer sync barrier
+     *  when they are polled by their OWN looper thread. This is deliberately a
+     *  private scheduling marker rather than Message.setAsynchronous(): it must
+     *  not change the AOSP-visible asynchronous flag or make unrelated guest
+     *  work bypass the barrier. ViewCanvasDriver uses a dedicated handler for
+     *  frame traversal; surface lifecycle work stays on the ordinary
+     *  owner-only handler. */
+    boolean mMacapkBarrierExempt = false;
+
     /** MAC.APK: a Handler on `looper` whose posts are owner-only (see
      *  mMacapkOwnerOnly). Used by ViewCanvasDriver.loopHandler and the
      *  SurfaceView overlay `fire` post so a view-tree mutation cannot land on
@@ -174,6 +183,18 @@ public class Handler {
     public static Handler macapkCreateOwnerOnly(Looper looper) {
         Handler h = new Handler(looper);
         h.mMacapkOwnerOnly = true;
+        return h;
+    }
+
+    /** Create the dedicated owner-thread frame handler. Its messages remain
+     *  synchronous to guest code and to the OS-main lifecycle drain, but the
+     *  owning main loop may execute them through a sync barrier. A genuine
+     *  Choreographer barrier otherwise leaves a posted frame behind it forever
+     *  after some Activity transitions. */
+    public static Handler macapkCreateFrameHandler(Looper looper) {
+        Handler h = new Handler(looper);
+        h.mMacapkOwnerOnly = true;
+        h.mMacapkBarrierExempt = true;
         return h;
     }
 

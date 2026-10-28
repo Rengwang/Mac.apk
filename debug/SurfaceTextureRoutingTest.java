@@ -8,7 +8,11 @@ public class SurfaceTextureRoutingTest {
     public static void main(String[] args) throws Exception {
         SurfaceTexture codecTarget = new SurfaceTexture(1);
         SurfaceTexture unrelated = new SurfaceTexture(false);
-        new Surface(codecTarget);
+        codecTarget.setDefaultBufferSize(320, 180);
+        Surface codecSurface = new Surface(codecTarget);
+        long packed = codecSurface.macapkGetNativeWindowOwnSizePacked();
+        if ((int)(packed >>> 32) != 320 || (int)packed != 180)
+            throw new AssertionError("SurfaceTexture native size not preserved");
         new Surface(unrelated); // Supersedes the legacy global destination.
         Method queue = SurfaceTexture.class.getDeclaredMethod("macapkQueueDecodedFrame",
             int[].class, int.class, int.class, int.class);

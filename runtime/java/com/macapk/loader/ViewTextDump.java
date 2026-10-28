@@ -95,6 +95,8 @@ public final class ViewTextDump {
             System.getenv("MACAPK_DUMP_TREE_EVERY") != null
             && !"0".equals(System.getenv("MACAPK_TEXT_DUMP"));
     private static final boolean WEB = !"0".equals(System.getenv("MACAPK_TEXT_DUMP_WEB"));
+    private static final boolean FULL_CLASS =
+            "1".equals(System.getenv("MACAPK_TEXT_DUMP_FULL_CLASS"));
 
     private static final int MAX_NODES = 5000;      // per dump, all windows
     private static final int MAX_VNODES = 2000;     // per provider
@@ -496,6 +498,7 @@ public final class ViewTextDump {
      *  package: "IntroActivity$5". Never empty. */
     static String className(Object o) {
         Class<?> c = o.getClass();
+        if (FULL_CLASS) return sanitizeCls(c.getName());
         String s = c.getSimpleName();
         if (s == null || s.isEmpty()) {
             String n = c.getName();

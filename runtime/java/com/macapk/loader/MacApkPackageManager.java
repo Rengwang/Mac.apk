@@ -4791,6 +4791,16 @@ public final class MacApkPackageManager extends PackageManager {
         return null;
     }
 
+    /** Resolved process name for the manifest component. Used by the service
+     * host because ServiceEntry intentionally keeps only lifecycle fields. */
+    public String macapkProcessName(String className) {
+        if (className == null) return null;
+        Manifest current = manifest();
+        String raw = current == null ? null : current.componentProcesses.get(className);
+        if (raw == null || raw.isEmpty()) return packageName;
+        return raw.charAt(0) == ':' ? packageName + raw : raw;
+    }
+
     @Override public ServiceInfo getServiceInfo(ComponentName component, int flags)
             throws NameNotFoundException {
         // AOSP: throw NameNotFoundException if the component's class is
@@ -4835,6 +4845,7 @@ public final class MacApkPackageManager extends PackageManager {
         info.applicationInfo = makeAppInfo(flags);
         info.name        = entry.name;
         info.packageName = this.packageName;
+        info.processName = macapkProcessName(entry.name);
         info.enabled     = entry.enabled;
         info.exported    = entry.exported;
         if ((flags & GET_META_DATA) != 0 && !entry.metaData.isEmpty()) {

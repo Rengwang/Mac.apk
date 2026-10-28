@@ -30,6 +30,15 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     // no other static initializer of this class can observe them unset.
     private static final String ENV_MACAPK_CLIP_CHILDREN = System.getenv("MACAPK_CLIP_CHILDREN");
     private static final String ENV_MACAPK_SKIP_DRAW = System.getenv("MACAPK_SKIP_DRAW");
+    /** Harness-only child draw probe. Selectors are comma-separated binary
+     * names or simple names, so an obfuscated app view can be identified and
+     * followed through the generic ViewGroup draw path without an APK-specific
+     * runtime patch. Empty/unset is the normal zero-extra-work path. */
+    private static final String ENV_MACAPK_DRAW_TRACE_CLASS =
+            System.getenv("MACAPK_DRAW_TRACE_CLASS");
+    private static final java.util.concurrent.ConcurrentHashMap<String,
+            java.util.concurrent.atomic.AtomicInteger> MACAPK_DRAW_TRACE_SEQ =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private static final String ENV_MACAPK_TRACE_GAP_RELAYOUT = System.getenv("MACAPK_TRACE_GAP_RELAYOUT");
     private static final String ENV_MACAPK_TRACE_RV_LAYOUT = System.getenv("MACAPK_TRACE_RV_LAYOUT");
     private static final String ENV_MACAPK_TRACE_SHADOW = System.getenv("MACAPK_TRACE_SHADOW");
@@ -3808,11 +3817,23 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
         }
         // Resilient draw pass (lead A): one throwing child blanks only itself; the
         // restoreToCount returns the canvas to this child's save point either way.
+        final boolean drawTrace = macapkMatchesDrawTrace(child);
+        final int drawTraceOps0 = drawTrace ? canvas.macapkDrawOps : 0;
+        final long drawTraceText0 = drawTrace ? android.graphics.Canvas.sGlobalText : 0L;
+        final long drawTraceBitmap0 = drawTrace ? android.graphics.Canvas.sGlobalBitmap : 0L;
+        final long drawTracePath0 = drawTrace ? android.graphics.Canvas.sGlobalPath : 0L;
+        final long drawTraceRect0 = drawTrace ? android.graphics.Canvas.sGlobalRect : 0L;
+        final int drawTraceSave0 = drawTrace ? canvas.getSaveCount() : 0;
+        final long drawTraceStart = drawTrace ? System.nanoTime() : 0L;
         try {
             child.draw(canvas);
         } catch (Throwable drawErr) {
             com.macapk.loader.GfxTrace.caught((fromDispatch ? "dispatchDraw:" : "drawChild:")
                     + child.getClass().getName(), drawErr);
+        } finally {
+            if (drawTrace) macapkTraceChildDraw(canvas, child, drawTraceOps0,
+                    drawTraceText0, drawTraceBitmap0, drawTracePath0, drawTraceRect0,
+                    drawTraceSave0, drawTraceStart);
         }
         canvas.restoreToCount(save);
         // AOSP View.draw(Canvas, ViewGroup, long):24999-25004, after restoreTo:
@@ -3827,6 +3848,46 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
             finishAnimatingView(child, childAnim);
         }
         return animMore;
+    }
+
+    private static boolean macapkMatchesDrawTrace(View child) {
+        final String spec = ENV_MACAPK_DRAW_TRACE_CLASS;
+        if (spec == null || spec.isEmpty() || child == null) return false;
+        final String binary = child.getClass().getName();
+        final String simple = child.getClass().getSimpleName();
+        for (String raw : spec.split(",")) {
+            String s = raw.trim();
+            if (!s.isEmpty() && (s.equals(binary) || s.equals(simple))) return true;
+        }
+        return false;
+    }
+
+    private static void macapkTraceChildDraw(android.graphics.Canvas canvas, View child,
+            int ops0, long text0, long bitmap0, long path0, long rect0,
+            int save0, long startNs) {
+        try {
+            final String binary = child.getClass().getName();
+            final java.util.concurrent.atomic.AtomicInteger counter =
+                    MACAPK_DRAW_TRACE_SEQ.computeIfAbsent(binary,
+                            k -> new java.util.concurrent.atomic.AtomicInteger());
+            final int n = counter.incrementAndGet();
+            if (n > 12 && (n & 31) != 0) return;
+            final String bg = child.getBackground() == null ? "null"
+                    : child.getBackground().getClass().getName();
+            com.macapk.loader.NativeLog.i("Mac.apk.DrawTrace",
+                    "n=" + n + " class=" + binary
+                    + " bounds=[" + child.getLeft() + "," + child.getTop() + "-"
+                    + child.getRight() + "," + child.getBottom() + "]"
+                    + " alpha=" + child.getAlpha()
+                    + " bg=" + bg
+                    + " canvasOps=" + (canvas.macapkDrawOps - ops0)
+                    + " text=" + (android.graphics.Canvas.sGlobalText - text0)
+                    + " bitmap=" + (android.graphics.Canvas.sGlobalBitmap - bitmap0)
+                    + " path=" + (android.graphics.Canvas.sGlobalPath - path0)
+                    + " rect=" + (android.graphics.Canvas.sGlobalRect - rect0)
+                    + " save=" + save0 + "->" + canvas.getSaveCount()
+                    + " us=" + ((System.nanoTime() - startNs) / 1000L));
+        } catch (Throwable ignored) {}
     }
 
     /** MACAPK_DRAWCHILD_DISPATCH=0: the pre-change drawChild body, verbatim. It was

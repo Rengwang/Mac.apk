@@ -94,6 +94,7 @@ public final class Parcel {
      *  high-water mark. Every writer funnels through here so no path can
      *  advance the cursor without growing dataSize. */
     private void wrote(int n) {
+        discardObjectOffsets(pos, pos + n);
         pos += n;
         if (pos > size) size = pos;
     }
@@ -307,8 +308,9 @@ public final class Parcel {
         if (o == null) { writeInt(-1); return; }
         int idx = objects.size();
         objects.add(o);
-        noteObjectOffset(pos);
+        int at = pos;
         writeInt(idx);
+        noteObjectOffset(at);
     }
     private Object readObjectRef() {
         // Do NOT fall through to readInt()'s out-of-range 0: index 0 is a valid
@@ -317,12 +319,80 @@ public final class Parcel {
         int idx = readInt();
         return (idx < 0 || idx >= objects.size()) ? null : objects.get(idx);
     }
+    private void discardObjectOffsets(int start, int end) {
+        int out = 0;
+        for (int i = 0; i < objectOffsetCount; i++) {
+            int at = objectOffsets[i];
+            if (at < end && at + 4 > start) continue;
+            objectOffsets[out++] = at;
+        }
+        objectOffsetCount = out;
+    }
     private void noteObjectOffset(int at) {
         if (objectOffsetCount == objectOffsets.length) {
             objectOffsets = java.util.Arrays.copyOf(objectOffsets,
                     objectOffsets.length == 0 ? 8 : objectOffsets.length * 2);
         }
         objectOffsets[objectOffsetCount++] = at;
+    }
+
+    /** Internal transport seam: a Binder endpoint translates local objects into
+     * connection-scoped handles and back. Non-Binder live references cannot be
+     * sent safely across processes and are rejected. */
+    public interface MacapkBinderHandles {
+        long exportBinder(IBinder binder);
+        IBinder importBinder(long handle);
+    }
+    public static final class MacapkTransportData {
+        public final byte[] bytes;
+        public final int[] offsets;
+        public final long[] handles;
+        private MacapkTransportData(byte[] b, int[] o, long[] h) {
+            bytes = b; offsets = o; handles = h;
+        }
+    }
+    public final MacapkTransportData macapkExportForBinder(MacapkBinderHandles codec) {
+        if (codec == null) throw new NullPointerException("codec");
+        byte[] b = java.util.Arrays.copyOf(data, size);
+        int[] offsets = new int[objectOffsetCount];
+        long[] handles = new long[objectOffsetCount];
+        for (int i = 0; i < objectOffsetCount; i++) {
+            int at = objectOffsets[i];
+            if (at < 0 || at > size - 4) throw new IllegalStateException("invalid object offset");
+            int idx = (b[at] & 255) | ((b[at+1] & 255) << 8) | ((b[at+2] & 255) << 16) | ((b[at+3] & 255) << 24);
+            if (idx < 0 || idx >= objects.size() || !(objects.get(idx) instanceof IBinder))
+                throw new IllegalStateException("Parcel contains a non-transportable live reference");
+            offsets[i] = at;
+            handles[i] = codec.exportBinder((IBinder) objects.get(idx));
+            if (handles[i] == 0) throw new IllegalStateException("invalid Binder handle");
+        }
+        return new MacapkTransportData(b, offsets, handles);
+    }
+    public final void macapkImportFromBinder(byte[] bytes, int[] offsets, long[] handles,
+                                             MacapkBinderHandles codec) {
+        if (bytes == null || offsets == null || handles == null || codec == null)
+            throw new NullPointerException();
+        if (offsets.length != handles.length) throw new IllegalArgumentException("object count mismatch");
+        // Validate and resolve before modifying this Parcel, so a bad message
+        // cannot leave it half imported.
+        java.util.ArrayList<IBinder> resolved = new java.util.ArrayList<>(offsets.length);
+        java.util.HashSet<Integer> seen = new java.util.HashSet<>();
+        for (int i = 0; i < offsets.length; i++) {
+            int at = offsets[i];
+            if (at < 0 || at > bytes.length - 4 || (at & 3) != 0 || !seen.add(at) || handles[i] == 0)
+                throw new IllegalArgumentException("invalid Binder object entry");
+            IBinder b = codec.importBinder(handles[i]);
+            if (b == null) throw new IllegalArgumentException("unknown Binder handle");
+            resolved.add(b);
+        }
+        unmarshall(bytes, 0, bytes.length);
+        for (int i = 0; i < offsets.length; i++) {
+            int at = offsets[i]; int idx = objects.size(); objects.add(resolved.get(i));
+            data[at]=(byte)idx; data[at+1]=(byte)(idx>>>8);
+            data[at+2]=(byte)(idx>>>16); data[at+3]=(byte)(idx>>>24);
+            noteObjectOffset(at);
+        }
+        pos = 0;
     }
 
     /** Names of classes we have already warned about, so a per-frame carrier
@@ -1873,6 +1943,7 @@ public final class Parcel {
         if (newSize < 0) return;
         ensure(newSize);
         if (newSize > size) java.util.Arrays.fill(data, size, newSize, (byte) 0);
+        if (newSize < size) discardObjectOffsets(newSize, size);
         if (pos > newSize) pos = newSize;
         size = newSize;
     }
@@ -1946,6 +2017,13 @@ public final class Parcel {
     public final void appendFrom(Parcel parcel, int offset, int length) {
         if (parcel == null || length <= 0) return;
         final int destStart = pos;
+        // A self-copy may overwrite the source offsets as wrote() invalidates
+        // the destination; retain the source's metadata before that happens.
+        final int sourceCount = parcel.objectOffsetCount;
+        final int[] sourceOffsets = parcel == this
+                ? java.util.Arrays.copyOf(parcel.objectOffsets, sourceCount) : parcel.objectOffsets;
+        final java.util.ArrayList<Object> sourceObjects = parcel == this
+                ? new java.util.ArrayList<>(parcel.objects) : parcel.objects;
         ensure(pos + length);
         System.arraycopy(parcel.data, offset, data, pos, length);
         wrote(length);
@@ -1956,11 +2034,11 @@ public final class Parcel {
         // the wrong object -- or none. `objectOffsets` exists for this: a marker
         // is indistinguishable from any other int in the raw bytes, so the only
         // way to find one is to have recorded where it was written.
-        if (parcel.objectOffsetCount == 0) return;
+        if (sourceCount == 0) return;
         final int base = objects.size();
-        objects.addAll(parcel.objects);
-        for (int i = 0; i < parcel.objectOffsetCount; i++) {
-            final int srcOff = parcel.objectOffsets[i];
+        objects.addAll(sourceObjects);
+        for (int i = 0; i < sourceCount; i++) {
+            final int srcOff = sourceOffsets[i];
             if (srcOff < offset || srcOff > offset + length - 4) continue;
             final int at = destStart + (srcOff - offset);
             final int oldIdx = (data[at] & 0xff) | ((data[at + 1] & 0xff) << 8)

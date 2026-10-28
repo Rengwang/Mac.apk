@@ -180,7 +180,15 @@ public final class MessageQueue {
      *       synchronized region (we hold `this` from check through entering
      *       wait()); enqueueMessage/quit also take `this`, so a notify can
      *       never slip between our check and our wait. */
-    Message next() {
+    Message next() { return next(false); }
+
+    /** Main-loop variant of next(). It preserves AOSP barrier ordering for
+     *  ordinary messages and asynchronous work, while allowing only the private
+     *  owner-thread frame marker through a barrier. Unlike Message asynchronous
+     *  flags this cannot make guest messages escape the barrier. */
+    Message macapkNextForMainLoop() { return next(true); }
+
+    private Message next(boolean allowOwnerFrameThroughBarrier) {
         // AOSP-faithful idle bookkeeping: pendingIdleHandlerCount starts at -1
         // and is only computed the first time the queue idles inside a single
         // next() call (so idle handlers fire at most once per blocking point).
@@ -199,7 +207,8 @@ public final class MessageQueue {
                     do {
                         prevMsg = msg;
                         msg = msg.next;
-                    } while (msg != null && !msg.isAsynchronous());
+                    } while (msg != null && !macapkEligibleAfterBarrier(
+                            msg, allowOwnerFrameThroughBarrier));
                 }
                 if (msg != null && now >= msg.when) {
                     // Ready: unlink and return it.
@@ -295,6 +304,41 @@ public final class MessageQueue {
                 msg.next = null;
                 msg.markInUse();
                 return msg;
+            }
+            return null;
+        }
+    }
+
+    /** Owner-thread variant of macapkPollDue for the real main loop. A
+     *  barrier still blocks every ordinary synchronous message, while the
+     *  framework's private frame marker may run so UI traversal cannot wedge
+     *  behind an unfinished Choreographer frame. The OS-main lifecycle drain
+     *  continues to use macapkPollDueSkippingOwnerOnly(), so these messages are
+     *  never dispatched off their owning thread. */
+    Message macapkPollDueForMainLoop() {
+        synchronized (this) {
+            final long now = SystemClock.uptimeMillis();
+            Message prevMsg = null;
+            Message msg = mMessages;
+            boolean behindBarrier = false;
+            while (msg != null) {
+                if (msg.target == null && msg.callback == null) {
+                    behindBarrier = true;
+                    prevMsg = msg;
+                    msg = msg.next;
+                    continue;
+                }
+                if (now < msg.when) return null;
+                if (!behindBarrier || macapkEligibleAfterBarrier(msg, true)) {
+                    mBlocked = false;
+                    if (prevMsg != null) prevMsg.next = msg.next;
+                    else                 mMessages = msg.next;
+                    msg.next = null;
+                    msg.markInUse();
+                    return msg;
+                }
+                prevMsg = msg;
+                msg = msg.next;
             }
             return null;
         }
@@ -423,15 +467,17 @@ public final class MessageQueue {
                 needWake = mBlocked;
             } else {
                 // Insert at tail or middle. Only need to wake when a barrier
-                // sits at the head and this is the earliest async message.
+                // sits at the head and this is the earliest work eligible to
+                // cross it on the owner loop.
                 needWake = mBlocked && p.target == null && p.callback == null
-                           && msg.isAsynchronous();
+                           && macapkEligibleAfterBarrier(msg, true);
                 Message prev;
                 for (;;) {
                     prev = p;
                     p = p.next;
                     if (p == null || when < p.when) break;
-                    if (needWake && p.isAsynchronous()) needWake = false;
+                    if (needWake && macapkEligibleAfterBarrier(p, true))
+                        needWake = false;
                 }
                 msg.next = p;       // invariant: p == prev.next
                 prev.next = msg;
@@ -484,17 +530,47 @@ public final class MessageQueue {
      *  the first async message exactly like next(). Reports 0 while quitting so
      *  the loop notices promptly instead of sleeping on a dead queue. */
     int nextPollTimeoutMillis() {
+        return nextPollTimeoutMillis(false);
+    }
+
+    /** Main-loop variant of nextPollTimeoutMillis(). See
+     *  macapkNextForMainLoop() for the narrowly scoped barrier exemption. */
+    int macapkNextPollTimeoutMillisForMainLoop() {
+        return nextPollTimeoutMillis(true);
+    }
+
+    private int nextPollTimeoutMillis(boolean allowOwnerFrameThroughBarrier) {
         synchronized (this) {
             if (mQuitting) return 0;
             final long now = SystemClock.uptimeMillis();
             Message msg = mMessages;
-            if (msg != null && msg.target == null && msg.callback == null) {
-                do { msg = msg.next; } while (msg != null && !msg.isAsynchronous());
+            boolean behindBarrier = false;
+            while (msg != null) {
+                if (msg.target == null && msg.callback == null) {
+                    behindBarrier = true;
+                    msg = msg.next;
+                    continue;
+                }
+                if (!behindBarrier || macapkEligibleAfterBarrier(
+                        msg, allowOwnerFrameThroughBarrier)) {
+                    if (now >= msg.when) return 0;
+                    return (int) Math.min(msg.when - now, Integer.MAX_VALUE);
+                }
+                msg = msg.next;
             }
-            if (msg == null) return -1;
-            if (now >= msg.when) return 0;
-            return (int) Math.min(msg.when - now, Integer.MAX_VALUE);
+            return -1;
         }
+    }
+
+    /** AOSP async messages and Mac.apk's private owner-frame marker are the
+     *  only work eligible behind a synchronization barrier on the owner loop.
+     *  The marker is checked only when allowOwnerFrameThroughBarrier is true;
+     *  generic AOSP-facing queue inspections keep their original semantics. */
+    private static boolean macapkEligibleAfterBarrier(
+            Message msg, boolean allowOwnerFrameThroughBarrier) {
+        return msg.isAsynchronous()
+                || (allowOwnerFrameThroughBarrier && msg.target != null
+                    && msg.target.mMacapkBarrierExempt);
     }
 
     boolean isQuitting() {

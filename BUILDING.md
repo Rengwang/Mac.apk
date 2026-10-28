@@ -145,6 +145,12 @@ identity and notary settings from an untracked `scripts/.release.env` (start fro
 
 ## Where things are
 
+Before changing a compatibility primitive, read
+[docs/MACAPK_UPGRADE_HANDBOOK.md](docs/MACAPK_UPGRADE_HANDBOOK.md). It records the
+current runtime contract, the full DSH change history, regression evidence, feature
+flags and the staged plan for replacing compatibility approximations with closer AOSP
+semantics.
+
 | Path | What it is |
 |---|---|
 | `runtime/java/` | The Android framework reimplementation (`android.*`, `androidx.*`, ...), the boot loader and the DEX converter |
@@ -154,6 +160,7 @@ identity and notary settings from an untracked `scripts/.release.env` (start fro
 | `thirdparty/` | ANGLE, MoltenVK and Skia prebuilt libraries, patches, provenance and license texts |
 | `scripts/` | Build, install and release scripts |
 | `debug/` | Build helpers, GLES bridge generators and standalone framework regression checks |
+| `docs/MACAPK_UPGRADE_HANDBOOK.md` | Universal-runtime architecture, chronology, tests, risks and roadmap |
 
 The DEX to JVM bytecode converter is also published on its own as
 [dex2jvm](https://github.com/kksimp/dex2jvm).

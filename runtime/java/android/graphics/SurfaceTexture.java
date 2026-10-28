@@ -942,12 +942,10 @@ public class SurfaceTexture {
     // "was this frame's Surface backed by a SurfaceView or by a TextureView's
     // SurfaceTexture" -- there is nothing in the call to distinguish them.
     //
-    // This registry is the resolution: `new Surface(surfaceTexture)` -- the
-    // one real hand-off point on real Android (frameworks/base's TextureView
-    // has no getSurface() at all; an app gets a producer-facing Surface by
-    // constructing one from the SurfaceTexture it already has, most often
-    // inside onSurfaceTextureAvailable) -- registers the SurfaceTexture as
-    // the current candidate target, in Surface.java's own constructor.
+    // This registry is populated at MediaCodec.configure(), where the exact
+    // output Surface is known. Do not populate it from Surface(SurfaceTexture)
+    // itself: that constructor is also used by camera, GL and overlay
+    // producers, and an unrelated Surface must not steal decoded video.
     // CocoaPresentVideoFrame then asks macapkHasActiveVideoTarget()
     // (cheap: one static-field read, so the common SurfaceView-only app pays
     // nothing) before doing any pixel work, and macapkOfferDecodedFrame() if
@@ -966,15 +964,15 @@ public class SurfaceTexture {
     //
     // Weak, so a registration can never keep a SurfaceTexture -- and the
     // View/Bitmaps it drags in -- alive past its real owner's lifecycle.
-    // Volatile: written from whichever thread constructs a Surface (normally
-    // the UI thread), read from cocoa_bridge.mm's caller thread (the app's
+    // Volatile: written from the codec-binding thread, read from
+    // cocoa_bridge.mm's caller thread (the app's
     // decode/render thread, or MediaCodec's own async dispatch thread) --
     // a plain field has no cross-thread visibility guarantee for that.
     private static volatile java.lang.ref.WeakReference<SurfaceTexture> sActiveVideoTarget;
 
     /** Mac.apk framework-internal: register this instance as the current
      *  candidate destination for a decoded-video frame. Called by
-     *  Surface's SurfaceTexture-arg constructor; see the section doc above. */
+     *  MediaCodec.configure() after it binds the output Surface. */
     public void macapkRegisterVideoTarget() {
         sActiveVideoTarget = new java.lang.ref.WeakReference<>(this);
     }

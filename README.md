@@ -1,9 +1,9 @@
 # Mac.apk
 
 > [!IMPORTANT]
-> **Rengwang 兼容性开发分支 · 2026-10-28**
-> 这是完整源码的开发进度快照。视频、资源、窗口与兼容层已有改进，**弹幕仍未修复**，原生 Surface/P0 路径仍在实验。
-> 请先阅读 **[新增内容与未解决问题](docs/compat/STATUS-2026-10-28.md)**、[后续路线](docs/compat/ROADMAP.md)和[验证记录](docs/compat/VALIDATION-2026-10-28.md)。
+> **Rengwang 通用 Android 兼容层开发分支 · 2026-10-29**
+> 这是经过用户验收的完整源码快照：通用视频、多 Surface、透明叠层、资源的主题、交互控件状态、窗口生命周期、Parcel/Binder 和跨应用兼容能力已同步更新。
+> 请先阅读 **[通用运行时升级手册](docs/MACAPK_UPGRADE_HANDBOOK.md)**；完整修改时间线、验证证据、已知风险和后续路线都记录在其中。
 > 下方原版说明中的 Apple 签名、发行版本和兼容性统计属于上游官方发行；本分支尚未提供同等验收或新的公证安装包。
 
 **Run Android apps natively on Apple Silicon Macs. No emulator, no virtual machine, no Linux underneath.**
@@ -101,6 +101,12 @@ reimplementation, the native runtime, the arm64 loader and Bionic shim, the ARM3
 recompiler and the macOS app. [BUILDING.md](BUILDING.md) explains how to build it, and
 [CONTRIBUTING.md](CONTRIBUTING.md) how to send a fix. App reports are just as useful
 as code.
+
+The DSH compatibility branch keeps a maintained record of its architectural changes,
+test evidence, remaining risks and upgrade roadmap in
+[docs/MACAPK_UPGRADE_HANDBOOK.md](docs/MACAPK_UPGRADE_HANDBOOK.md). That handbook is
+the source of truth for the universal-runtime work; old app-specific experiment notes
+and stale patch snapshots have been retired.
 
 ## Developers and publishers
 

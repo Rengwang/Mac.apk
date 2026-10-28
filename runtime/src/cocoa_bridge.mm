@@ -17,6 +17,7 @@
 
 #include <algorithm>           // std::fill -- frame-score scratch reset
 #include <atomic>
+#include <cerrno>              // keyed geometry status/error codes
 #include <cstdio>
 #include <cstdlib>
 #include <jni.h>
@@ -25,6 +26,7 @@
 #include <memory>   // std::shared_ptr -- bounded-nextDrawable control block
 #include <mutex>    // std::mutex      -- bounded-nextDrawable handoff lock
 #include <string>   // std::string     -- ANGLE_DEFAULT_PLATFORM gate compare
+#include <unordered_map>
 #include <vector>
 #include <cmath>    // std::round, std::llround -- see the drawableSize
 #include <crt_externs.h>  // _NSGetArgv -- CocoaExitProcess relaunches our own command line
@@ -497,6 +499,31 @@ static MTKView* g_gl_overlay_attached_view = nil;
 // creation and g_unity_app is no longer consulted; =0 restores the pre-create.
 // The slot keeps its historical name: it is the ONE native-EGL window layer.
 static CAMetalLayer* g_unity_layer = nil;
+
+// Producer threads call -nextDrawable while the Cocoa main thread owns the
+// keyed layer registry. Keep an identity-only mirror here so a diagnostic can
+// name the Android Surface without touching CALayer state off the main thread.
+static std::mutex g_surface_layer_key_mu;
+static std::unordered_map<const void*, int> g_surface_layer_keys;
+
+static void MacapkRememberSurfaceLayerKey(const void* layer, int key) {
+    if (!layer || key <= 0) return;
+    std::lock_guard<std::mutex> lk(g_surface_layer_key_mu);
+    g_surface_layer_keys[layer] = key;
+}
+
+static int MacapkSurfaceKeyForLayer(const void* layer) {
+    if (!layer) return 0;
+    std::lock_guard<std::mutex> lk(g_surface_layer_key_mu);
+    auto it = g_surface_layer_keys.find(layer);
+    return it == g_surface_layer_keys.end() ? 0 : it->second;
+}
+
+static void MacapkForgetSurfaceLayerKey(const void* layer) {
+    if (!layer) return;
+    std::lock_guard<std::mutex> lk(g_surface_layer_key_mu);
+    g_surface_layer_keys.erase(layer);
+}
 static MTKView*      g_unity_host_view = nil;
 static std::atomic<bool> g_unity_app{false};
 
@@ -1302,6 +1329,7 @@ static double macapk_guest_layer_z_now(CALayer* host) {
 
 static id macapk_nextDrawable_inner(id self, SEL _cmd) {
     const bool ours = ((__bridge void*)self == (__bridge void*)g_unity_layer);
+    const int keyed_surface_key = MacapkSurfaceKeyForLayer((__bridge const void*)self);
     if (ours) g_guest_layer_last_present.store(CACurrentMediaTime(),
                                                std::memory_order_relaxed);
     // Only the guest's dedicated layer on the Vulkan path is bounded; everything
@@ -1327,8 +1355,47 @@ static id macapk_nextDrawable_inner(id self, SEL _cmd) {
             static std::mutex   s_mu;
             static NDStat       s_stat[3];      // guest layer, framework angleLayer, spare
             const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            if (keyed_surface_key > 0) {
+                static std::mutex s_key_mu;
+                static std::unordered_map<int, uint64_t> s_entries;
+                uint64_t n = 0;
+                {
+                    std::lock_guard<std::mutex> lk(s_key_mu);
+                    n = ++s_entries[keyed_surface_key];
+                }
+                if (n <= 3 || n % 60 == 0)
+                    std::fprintf(stderr,
+                        "[dequeue-key] key=%d acquire=%llu (before nextDrawable)\n",
+                        keyed_surface_key, (unsigned long long)n);
+            }
             id d = ((id (*)(id, SEL))g_orig_nextDrawable)(self, _cmd);
             const uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+            if (keyed_surface_key > 0) {
+                struct KeyedDqStat { uint64_t n = 0, nil_count = 0, total_ns = 0, worst_ns = 0; };
+                static std::mutex s_key_mu;
+                static std::unordered_map<int, KeyedDqStat> s_stats;
+                bool report = false;
+                KeyedDqStat snap;
+                {
+                    std::lock_guard<std::mutex> lk(s_key_mu);
+                    KeyedDqStat& st = s_stats[keyed_surface_key];
+                    ++st.n;
+                    if (!d) ++st.nil_count;
+                    st.total_ns += dt;
+                    if (dt > st.worst_ns) st.worst_ns = dt;
+                    if (st.n <= 3 || st.n % 60 == 0) { report = true; snap = st; }
+                }
+                if (report) {
+                    std::fprintf(stderr,
+                        "[dequeue-key] key=%d acquires=%llu nil=%llu last_ms=%.3f "
+                        "avg_ms=%.3f max_ms=%.3f\n",
+                        keyed_surface_key, (unsigned long long)snap.n,
+                        (unsigned long long)snap.nil_count, (double)dt / 1e6,
+                        (double)snap.total_ns / snap.n / 1e6,
+                        (double)snap.worst_ns / 1e6);
+                    std::fflush(stderr);
+                }
+            }
             bool report = false; NDStat snap; const char* who = "?";
             {
                 std::lock_guard<std::mutex> lk(s_mu);
@@ -1492,7 +1559,9 @@ static id macapk_nextDrawable_inner(id self, SEL _cmd) {
 // worker, AFTER CocoaInit, and main.cpp re-runs this through
 // CocoaRefreshDrawablePolicy once it has set ANGLE_DEFAULT_PLATFORM.
 static void macapk_eval_drawable_policy() {
-    g_nd_trace = std::getenv("MACAPK_DRAWABLE_TRACE") != nullptr;
+    const char* keyedPresentTrace = std::getenv("MACAPK_KEYED_PRESENT_TRACE");
+    g_nd_trace = std::getenv("MACAPK_DRAWABLE_TRACE") != nullptr ||
+        (keyedPresentTrace && keyedPresentTrace[0] == '1');
     // Bounded acquire on the native-EGL Vulkan path only. Gate on the rendering-path
     // property ANGLE_DEFAULT_PLATFORM==vulkan (main.cpp sets it when the app uses GLES
     // 3.1), NEVER on package name. Crossy/Unity (ANGLE-Metal) never sets it -> no
@@ -8306,6 +8375,43 @@ void CocoaPresentBitmapFrom(int width, int height, MacapkPixelsAcquireFn acquire
 // Bisect: MACAPK_SV_SURFACE_LAYER=0 on the Java side never reaches this.
 static NSMutableDictionary* g_surface_layers = nil;   // NSNumber(key) -> CALayer; main thread only
 
+// v1.0.1063: synthetic key range for a native consumer that has no SurfaceView
+// identity (see CocoaEnsureNativeEglLayerForExtraConsumer). High enough never
+// to collide with a Java-allocated SurfaceView key (those start at 1).
+static constexpr int32_t kMacapkExtraConsumerKeyBase = 0x40000000;
+static std::atomic<int> g_extra_consumer_key_seq{0};
+
+// ANativeWindow_setBuffersGeometry() is per-window in Android: it changes the
+// producer buffer dimensions, while SurfaceControl independently scales that
+// buffer into the SurfaceView's display rect.  The legacy bridge keeps the two
+// dimensions in globals because it owns one shared native-EGL layer.  Keyed
+// surfaces cannot share that state: a write from one Surface would resize the
+// video/danmaku/overlay consumer of another Surface.  Keep the requested
+// dimensions in an explicit per-key table and make 0x0 a removal, matching
+// native_window_set_buffers_user_dimensions().
+static std::mutex g_surface_nw_buffer_mu;
+static std::unordered_map<int, CGSize> g_surface_nw_buffer_sizes;
+
+static bool MacapkCopyRequestedSurfaceBufferSize(int key, int* outW, int* outH) {
+    if (outW) *outW = 0;
+    if (outH) *outH = 0;
+    if (key <= 0) return false;
+    std::lock_guard<std::mutex> lock(g_surface_nw_buffer_mu);
+    auto it = g_surface_nw_buffer_sizes.find(key);
+    if (it == g_surface_nw_buffer_sizes.end()) return false;
+    const int w = (int)it->second.width;
+    const int h = (int)it->second.height;
+    if (outW) *outW = w;
+    if (outH) *outH = h;
+    return w > 0 && h > 0;
+}
+
+static void MacapkForgetRequestedSurfaceBufferSize(int key) {
+    if (key <= 0) return;
+    std::lock_guard<std::mutex> lock(g_surface_nw_buffer_mu);
+    g_surface_nw_buffer_sizes.erase(key);
+}
+
 // Native EGL needs a CAMetalLayer (not the ordinary CALayer used by
 // lockCanvas).  Keep these layers in the same keyed registry so the existing
 // SurfaceView geometry pull moves video/danmaku surfaces with their views.
@@ -8320,6 +8426,8 @@ struct MacapkSurfacePulls {
     jclass    cls  = nullptr;
     jmethodID rect = nullptr;
     jmethodID top  = nullptr;
+    jmethodID zOrder = nullptr;
+    jmethodID bufferSize = nullptr;
     jmethodID alpha = nullptr;
     jmethodID viewAlpha = nullptr;
 };
@@ -8336,6 +8444,10 @@ static const MacapkSurfacePulls& MacapkSurfacePullMethods(JNIEnv* env) {
             if (!s.rect) env->ExceptionClear();
             s.top = env->GetStaticMethodID(c, "macapkSurfaceZOrderOnTop", "(I)Z");
             if (!s.top) env->ExceptionClear();
+            s.zOrder = env->GetStaticMethodID(c, "macapkSurfaceZOrder", "(I)I");
+            if (!s.zOrder) env->ExceptionClear();
+            s.bufferSize = env->GetStaticMethodID(c, "macapkSurfaceBufferSizePacked", "(I)J");
+            if (!s.bufferSize) env->ExceptionClear();
             s.alpha = env->GetStaticMethodID(c, "macapkSurfaceFormatHasAlpha", "(I)Z");
             if (!s.alpha) env->ExceptionClear();
             s.viewAlpha = env->GetStaticMethodID(c, "macapkSurfaceLayerAlpha", "(I)F");
@@ -8366,6 +8478,22 @@ static bool MacapkQuerySurfaceOnTop(JNIEnv* env, int key) {
     return top == JNI_TRUE;
 }
 
+static int MacapkQuerySurfaceZOrder(JNIEnv* env, int key) {
+    const MacapkSurfacePulls& p = MacapkSurfacePullMethods(env);
+    if (!env || !p.cls || !p.zOrder) return MacapkQuerySurfaceOnTop(env, key) ? 2 : 0;
+    jint order = env->CallStaticIntMethod(p.cls, p.zOrder, static_cast<jint>(key));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return 0; }
+    return order == 2 ? 2 : order == 1 ? 1 : 0;
+}
+
+static jlong MacapkQuerySurfaceBufferSizePacked(JNIEnv* env, int key) {
+    const MacapkSurfacePulls& p = MacapkSurfacePullMethods(env);
+    if (!env || !p.cls || !p.bufferSize) return 0;
+    jlong packed = env->CallStaticLongMethod(p.cls, p.bufferSize, static_cast<jint>(key));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return 0; }
+    return packed;
+}
+
 static bool MacapkQuerySurfaceHasAlpha(JNIEnv* env, int key) {
     const MacapkSurfacePulls& p = MacapkSurfacePullMethods(env);
     if (!env || !p.cls || !p.alpha) return false;
@@ -8384,6 +8512,31 @@ static float MacapkQuerySurfaceViewAlpha(JNIEnv* env, int key) {
 
 static JNIEnv* MacapkMainThreadEnv();
 static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* layer);
+
+/** Tell Java that this key owns a real per-surface CAMetalLayer. The native
+ *  bridge cannot infer it from Surface identity alone: the legacy fallback also
+ *  hands out an ANativeWindow, but shares one display-sized layer. */
+static void MacapkNoteIsolatedNativeSurface(JNIEnv* env, int key) {
+    if (!env || key <= 0) return;
+    static jclass cls = nullptr;
+    static jmethodID mid = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        jclass local = env->FindClass("android/view/SurfaceView");
+        if (local) {
+            mid = env->GetStaticMethodID(local, "macapkNoteIsolatedNativeSurface", "(I)V");
+            if (mid) cls = (jclass) env->NewGlobalRef(local);
+            else env->ExceptionClear();
+            env->DeleteLocalRef(local);
+        } else {
+            env->ExceptionClear();
+        }
+    }
+    if (!cls || !mid) return;
+    env->CallStaticVoidMethod(cls, mid, static_cast<jint>(key));
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
 
 extern "C" void* CocoaEnsureNativeEglLayerForSurfaceKey(int key, int* outW, int* outH) {
     if (outW) *outW = 0;
@@ -8410,6 +8563,7 @@ extern "C" void* CocoaEnsureNativeEglLayerForSurfaceKey(int key, int* outW, int*
             layer.device = host.device;
             layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
             layer.framebufferOnly = NO;
+            layer.contentsGravity = kCAGravityResize;
             // A SurfaceView may render a transparent overlay, such as danmaku.
             // This is necessary for blending, but not sufficient unless its
             // producer also requests an alpha-capable EGL config and clears it.
@@ -8422,6 +8576,7 @@ extern "C" void* CocoaEnsureNativeEglLayerForSurfaceKey(int key, int* outW, int*
                                @"position": [NSNull null], @"hidden": [NSNull null],
                                @"zPosition": [NSNull null], @"opacity": [NSNull null] };
             g_surface_layers[nk] = layer;
+            MacapkRememberSurfaceLayerKey((__bridge const void*)layer, key);
             [host.layer addSublayer:layer];
             h->layer = layer;
             std::fprintf(stderr,
@@ -8430,6 +8585,7 @@ extern "C" void* CocoaEnsureNativeEglLayerForSurfaceKey(int key, int* outW, int*
         }
         if (h->layer) {
             JNIEnv* env = MacapkMainThreadEnv();
+            MacapkNoteIsolatedNativeSurface(env, key);
             (void)MacapkApplySurfaceLayerGeometry(env, nk, h->layer);
             h->w = (int)h->layer.drawableSize.width;
             h->h = (int)h->layer.drawableSize.height;
@@ -8451,6 +8607,108 @@ extern "C" void* CocoaEnsureNativeEglLayerForSurfaceKey(int key, int* outW, int*
     return (__bridge void*)h->layer;
 }
 
+// v1.0.1063 (2026-10-28): a dedicated native-EGL layer for a guest consumer
+// that has NO SurfaceView identity of its own (its Java Surface arrived without
+// an owner, so macapkGetNativeWindowSurfaceKey() answered 0 and the window
+// landed on the process-wide shared legacy layer).
+//
+// On a real Android this situation does not exist: every SurfaceView owns its
+// own BufferQueue, and a second SurfaceView never shares the first one's queue.
+// Here the legacy shared layer can carry only ONE swapchain, so the second
+// consumer used to be pushed onto an OFFSCREEN PBUFFER -- where it renders at
+// 60 fps and the user sees nothing (measured: Bilibili's Chronos danmaku
+// engine, 15840 frames drawn, zero danmaku on screen).
+//
+// So: when the shared layer is already bound, this consumer gets its OWN
+// CAMetalLayer, stacked ABOVE the video plane, sized to the window. It has no
+// SurfaceView rect to follow, so its geometry is the window's -- which is what
+// a full-window second SurfaceView looks like on Android. Generic mechanism:
+// no package, class or title is inspected.
+//
+// The key is allocated here (a high, synthetic range) so the keyed-surface
+// bookkeeping -- present tracing, alpha probing, buffer geometry -- treats it
+// like any other per-surface layer without needing a Java SurfaceView.
+extern "C" void* CocoaEnsureNativeEglLayerForExtraConsumer(int* outW, int* outH,
+                                                             int32_t* outKey) {
+    if (outW) *outW = 0;
+    if (outH) *outH = 0;
+    if (outKey) *outKey = 0;
+
+    struct Handoff { std::mutex mu; std::condition_variable cv; bool done = false;
+                     CAMetalLayer* layer = nil; int w = 0; int h = 0; int32_t key = 0; };
+    auto h = std::make_shared<Handoff>();
+    auto create = ^{
+        MTKView* host = g_active_render_view ? g_active_render_view : g_last_gl_metal_view;
+        std::lock_guard<std::mutex> lock(h->mu);
+        if (!host) { h->done = true; h->cv.notify_all(); return; }
+        if (!g_surface_layers) g_surface_layers = [[NSMutableDictionary alloc] init];
+        // Reuse the layer of an extra consumer we already made, if any.
+        int32_t key = 0;
+        for (NSNumber* nk in [g_surface_layers allKeys]) {
+            if (nk.intValue >= kMacapkExtraConsumerKeyBase) { key = nk.intValue; break; }
+        }
+        if (key == 0)
+            key = kMacapkExtraConsumerKeyBase + (++g_extra_consumer_key_seq);
+        NSNumber* nk = [NSNumber numberWithInt:key];
+        CAMetalLayer* layer = nil;
+        CALayer* old = g_surface_layers[nk];
+        if (old && [old isKindOfClass:[CAMetalLayer class]])
+            layer = (CAMetalLayer*)old;
+        if (!layer) {
+            CGFloat scale = host.window ? host.window.backingScaleFactor : 2.0;
+            if (scale <= 0) scale = 2.0;
+            layer = [MacApkSurfaceMetalLayer layer];
+            layer.device = host.device;
+            layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            layer.framebufferOnly = NO;
+            layer.contentsGravity = kCAGravityResize;
+            // A transparent overlay consumer (danmaku) MUST be able to blend;
+            // an opaque layer would black out whatever is underneath it.
+            layer.opaque = NO;
+            layer.contentsScale = scale;
+            layer.frame = host.bounds;
+            layer.drawableSize = CGSizeMake(std::round(host.bounds.size.width * scale),
+                                            std::round(host.bounds.size.height * scale));
+            layer.actions = @{ @"contents": [NSNull null], @"bounds": [NSNull null],
+                               @"position": [NSNull null], @"hidden": [NSNull null],
+                               @"zPosition": [NSNull null], @"opacity": [NSNull null] };
+            g_surface_layers[nk] = layer;
+            MacapkRememberSurfaceLayerKey((__bridge const void*)layer, key);
+            [host.layer addSublayer:layer];
+            // Above the video plane but below the canvas overlay's own
+            // z-slot: the guest's overlay content must be able to paint over
+            // it, exactly as an above-window SurfaceView does on Android.
+            layer.zPosition = (g_canvas_overlay_layer ? g_canvas_overlay_layer.zPosition : 0.0) + 0.10;
+            std::fprintf(stderr,
+                "[I] cocoa_v2: extra-consumer native-EGL layer %d created %dx%d "
+                "(the shared legacy layer was already in use; its own layer "
+                "instead of an invisible pbuffer)\n",
+                key, (int)layer.drawableSize.width, (int)layer.drawableSize.height);
+        }
+        if (layer) {
+            h->layer = layer;
+            h->w = (int)layer.drawableSize.width;
+            h->h = (int)layer.drawableSize.height;
+            h->key = key;
+        }
+        h->done = true;
+        h->cv.notify_all();
+    };
+    if ([NSThread isMainThread]) {
+        create();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), create);
+        std::unique_lock<std::mutex> lk(h->mu);
+        if (!h->cv.wait_for(lk, std::chrono::milliseconds(2000), [&] { return h->done; }))
+            return nullptr;
+    }
+    if (!h->layer) return nullptr;
+    if (outW) *outW = h->w;
+    if (outH) *outH = h->h;
+    if (outKey) *outKey = h->key;
+    return (__bridge void*)h->layer;
+}
+
 /** Place one surface layer for this frame. Returns false when it must not be
  *  shown (hidden, gone, or no host yet). Main thread only. */
 static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* layer) {
@@ -8463,15 +8721,44 @@ static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* 
     }
     const int key = nk.intValue;
     if ([layer isKindOfClass:[CAMetalLayer class]]) {
-        BOOL opaque = MacapkQuerySurfaceHasAlpha(env, key) ? NO : YES;
+        // An EXTRA-consumer layer has no Java SurfaceView, so the alpha query
+        // cannot answer. Such a consumer is a TRANSPARENT overlay by nature
+        // (a danmaku/comment layer painted over the video), so it must stay
+        // blendable: an opaque layer would black out the video underneath it.
+        const bool extra = key >= kMacapkExtraConsumerKeyBase;
+        BOOL opaque = extra ? NO : (MacapkQuerySurfaceHasAlpha(env, key) ? NO : YES);
         if ([layer isKindOfClass:[MacApkSurfaceMetalLayer class]])
             [(MacApkSurfaceMetalLayer*)layer macapkSetRequiresAlpha:!opaque];
         if (layer.opaque != opaque) layer.opaque = opaque;
-        float alpha = MacapkQuerySurfaceViewAlpha(env, key);
+        float alpha = extra ? 1.0f : MacapkQuerySurfaceViewAlpha(env, key);
         if (layer.opacity != alpha) layer.opacity = alpha;
     }
     jlong packed = MacapkQuerySurfaceRectPacked(env, key);
     if (packed == 0) {
+        // v1.0.1063: an EXTRA-consumer layer has no Java SurfaceView at all (the
+        // guest handed us a Surface with no owner), so the Java-side rect query
+        // answers 0. That is NOT "the surface is gone": the layer exists, owns
+        // a live swapchain and must stay on screen. Only a layer that DOES have
+        // a SurfaceView is torn down when its view disappears.
+        if (key >= kMacapkExtraConsumerKeyBase) {
+            // Keep it pinned to the window: a full-window second SurfaceView.
+            CGFloat scale = host.window ? host.window.backingScaleFactor : 2.0;
+            if (scale <= 0) scale = 2.0;
+            CGRect want = host.bounds;
+            if (!CGRectEqualToRect(layer.frame, want)) layer.frame = want;
+            if ([layer isKindOfClass:[CAMetalLayer class]]) {
+                CAMetalLayer* metal = (CAMetalLayer*)layer;
+                CGSize wanted = CGSizeMake(std::round(want.size.width * scale),
+                                            std::round(want.size.height * scale));
+                if (!CGSizeEqualToSize(metal.drawableSize, wanted)) metal.drawableSize = wanted;
+            }
+            if (layer.contentsScale != host.layer.contentsScale)
+                layer.contentsScale = host.layer.contentsScale;
+            if (layer.hidden) layer.hidden = NO;
+            return true;
+        }
+        MacapkForgetRequestedSurfaceBufferSize(key);
+        MacapkForgetSurfaceLayerKey((__bridge const void*)layer);
         [layer removeFromSuperlayer];
         [g_surface_layers removeObjectForKey:nk];
         return false;
@@ -8495,7 +8782,37 @@ static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* 
     want.size.width  = wpx / scale;
     want.size.height = hpx / scale;
     if (!CGRectEqualToRect(layer.frame, want)) layer.frame = want;
-    const CGFloat z = overlay.zPosition + (MacapkQuerySurfaceOnTop(env, key) ? 0.1 : -0.25);
+    // A keyed CAMetalLayer has one producer buffer and one separate display
+    // rect. Keep drawableSize at the producer's physical buffer size; the layer
+    // frame above performs the SurfaceControl-style scale into the View rect.
+    int zOrder = 0;
+    if ([layer isKindOfClass:[CAMetalLayer class]]) {
+        CAMetalLayer* metal = (CAMetalLayer*)layer;
+        int bw = 0, bh = 0;
+        if (!MacapkCopyRequestedSurfaceBufferSize(key, &bw, &bh)) {
+            jlong buffer = MacapkQuerySurfaceBufferSizePacked(env, key);
+            bw = buffer != 0 ? (int) (buffer >> 32) : wpx;
+            bh = buffer != 0 ? (int) (buffer & 0xffffffffL) : hpx;
+        }
+        if (bw <= 0 || bh <= 0) { bw = wpx; bh = hpx; }
+        CGSize wanted = CGSizeMake(bw, bh);
+        if (!CGSizeEqualToSize(metal.drawableSize, wanted)) metal.drawableSize = wanted;
+    }
+    // v1.0.1063: an EXTRA-consumer layer has no Java SurfaceView, so its z-order
+    // cannot be queried. It is an overlay consumer by nature: it must sit ABOVE
+    // the video plane and BELOW the canvas overlay, exactly as an above-window
+    // SurfaceView does on Android. (The generic formula below would fall into
+    // the -0.25 "below the video" slot for an unknown key.)
+    const bool isExtraConsumer = key >= kMacapkExtraConsumerKeyBase;
+    zOrder = isExtraConsumer ? 2 : MacapkQuerySurfaceZOrder(env, key);
+    // v1.0.1063 diagnostic A/B (MACAPK_EXPERIMENTAL_SURFACE_Z_BUMP): lift every
+    // per-surface layer ABOVE the canvas overlay, to test whether a layer that
+    // renders but never shows is merely hidden by the view tree's z-order.
+    const char* zBump = std::getenv("MACAPK_EXPERIMENTAL_SURFACE_Z_BUMP");
+    if (zBump && std::strcmp(zBump, "1") == 0)
+        zOrder = 2;
+    const CGFloat z = overlay.zPosition
+        + (zOrder == 2 ? 0.1 : zOrder == 1 ? -0.15 : -0.25);
     // Diagnostic A/B only: put keyed Metal surfaces below the video plane to
     // determine whether their alpha/compositing is obscuring decoded video.
     const char* belowVideo = std::getenv("MACAPK_EXPERIMENTAL_SURFACE_BELOW_VIDEO");
@@ -8511,16 +8828,83 @@ static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* 
         unsigned n = samples[key]++;
         if (n < 3 || n % 120 == 0) {
             std::fprintf(stderr,
-                "[surface-layer-probe] key=%d sample=%u alpha=%.3f opaque=%d top=%d "
+                "[surface-layer-probe] key=%d sample=%u alpha=%.3f opaque=%d top=%d order=%d "
                 "frame=%.0f,%.0f,%.0fx%.0f drawable=%.0fx%.0f z=%.2f\n",
                 key, n, layer.opacity, (int)layer.opaque,
-                (int)MacapkQuerySurfaceOnTop(env, key), layer.frame.origin.x,
+                (int)MacapkQuerySurfaceOnTop(env, key), zOrder, layer.frame.origin.x,
                 layer.frame.origin.y, layer.frame.size.width, layer.frame.size.height,
                 ((CAMetalLayer*)layer).drawableSize.width,
                 ((CAMetalLayer*)layer).drawableSize.height, layer.zPosition);
         }
     }
     return true;
+}
+
+// Per-window counterpart of CocoaSetNativeEglBufferGeometry.  Called by the
+// arm64 ANativeWindow bridge with the Surface's key.  Update the table and the
+// existing CAMetalLayer on the main thread; 0x0 removes the override and falls
+// back to the SurfaceView's own producer size.  The display rect remains owned
+// by macapkSurfaceRectPacked(), so a small producer buffer is scaled into the
+// View instead of moving or shrinking the View itself.
+extern "C" int CocoaSetNativeEglBufferGeometryForSurfaceKey(int key, int w, int h) {
+    if (key <= 0 || w < 0 || h < 0 || ((w == 0) != (h == 0))) return -EINVAL;
+    // Buffer state belongs to the caller and is updated before any main-thread
+    // handoff, so the render thread observes the request even if the UI thread
+    // is busy. Layer mutation remains main-thread-only.
+    {
+        std::lock_guard<std::mutex> lock(g_surface_nw_buffer_mu);
+        if (w == 0 && h == 0)
+            g_surface_nw_buffer_sizes.erase(key);
+        else
+            g_surface_nw_buffer_sizes[key] = CGSizeMake(w, h);
+    }
+    void (^apply)(void) = ^{
+        static std::atomic<int> traceCount{0};
+        int trace = traceCount.fetch_add(1, std::memory_order_relaxed);
+        if (trace < 12)
+            std::fprintf(stderr,
+                "[I] cocoa_v2: keyed native-EGL surface %d buffer %dx%d (%s)\n",
+                key, w, h, w > 0 && h > 0
+                    ? "scaled into the SurfaceView rect" : "the SurfaceView's own size");
+        if (!g_surface_layers) return;
+        NSNumber* nk = [NSNumber numberWithInt:key];
+        CALayer* layer = g_surface_layers[nk];
+        if (!layer) return;
+        JNIEnv* env = MacapkMainThreadEnv();
+        (void)MacapkApplySurfaceLayerGeometry(env, nk, layer);
+    };
+    // Android's ANativeWindow_setBuffersGeometry is synchronous: the caller may
+    // create the EGL surface immediately afterwards, and that surface must bind
+    // the swapchain to the new drawable size.  An async main-queue update leaves
+    // a first-frame race that recreates the old-sized swapchain. Use a bounded
+    // async handoff rather than dispatch_sync: the UI thread can be waiting on
+    // this render thread during surfaceCreated, which would deadlock outright.
+    if ([NSThread isMainThread]) {
+        apply();
+        return 0;
+    }
+    struct Handoff { std::mutex mu; std::condition_variable cv; bool done = false; };
+    auto handoff = std::make_shared<Handoff>();
+    void (^finish)(void) = ^{
+        apply();
+        {
+            std::lock_guard<std::mutex> lock(handoff->mu);
+            handoff->done = true;
+        }
+        handoff->cv.notify_all();
+    };
+    dispatch_async(dispatch_get_main_queue(), finish);
+    std::unique_lock<std::mutex> lock(handoff->mu);
+    if (!handoff->cv.wait_for(lock, std::chrono::milliseconds(2000),
+                              [&] { return handoff->done; })) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr,
+                "[W] cocoa_v2: keyed surface %d geometry timed out waiting for main; "
+                "buffer request retained without layer update\n", key);
+        return -ETIMEDOUT;
+    }
+    return 0;
 }
 
 /** Per drawInMTKView tick: put the native-EGL window layer (g_unity_layer) on
@@ -8608,6 +8992,35 @@ void CocoaPresentSurfaceBitmapFrom(int surface_key, int width, int height,
             MacapkPixelWindow win(acquire, release, ctx);
             const uint32_t* pixels = win.pixels();
             if (!pixels) { std::free(copy); return; }
+            // v1.0.1063 diagnostic: how much of this frame is actually visible?
+            // A producer can render at 60 fps and still put NOTHING on screen if
+            // every pixel's alpha is 0 (the pixels are there, the layer is
+            // transparent). Count the non-transparent pixels BEFORE the
+            // premultiply so the number is the producer's own alpha channel.
+            if (std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE")) {
+                static std::atomic<int> alphaProbeSeq{0};
+                int seq = alphaProbeSeq.fetch_add(1);
+                if (seq < 4 || seq % 60 == 0) {
+                    size_t total = static_cast<size_t>(width) * height;
+                    size_t opaque = 0, nonzero = 0;
+                    size_t step = total / 4096 ? total / 4096 : 1;
+                    size_t sampled = 0;
+                    for (size_t i = 0; i < total; i += step) {
+                        uint32_t a = (pixels[i] >> 24) & 0xff;
+                        uint32_t rgb = pixels[i] & 0xffffff;
+                        if (a) ++nonzero;
+                        if (a >= 0x40) ++opaque;
+                        ++sampled;
+                    }
+                    std::fprintf(stderr,
+                        "[surface-alpha-coverage] key=%d seq=%d %dx%d "
+                        "alpha>=40: %zu/%zu (%.2f%%) alpha>0: %zu/%zu (%.2f%%)\n",
+                        surface_key, seq, width, height,
+                        opaque, sampled, sampled ? 100.0 * opaque / sampled : 0.0,
+                        nonzero, sampled, sampled ? 100.0 * nonzero / sampled : 0.0);
+                    std::fflush(stderr);
+                }
+            }
             macapk_premultiply_argb(static_cast<uint32_t*>(copy), pixels,
                                     static_cast<size_t>(width) * height);
             win.close();
