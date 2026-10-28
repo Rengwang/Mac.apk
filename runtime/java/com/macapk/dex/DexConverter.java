@@ -375,6 +375,9 @@ public final class DexConverter {
     /** Count of methods replaced by the oversize stub, for the convert report. */
     static final java.util.concurrent.atomic.AtomicInteger oversizeStubs =
         new java.util.concurrent.atomic.AtomicInteger();
+    /** Count of nop/DexVMP methods replaced by a loud throwing stub. */
+    static final java.util.concurrent.atomic.AtomicInteger emptyStubs =
+        new java.util.concurrent.atomic.AtomicInteger();
 
     static byte[] convertOne(DexClass cls, DexType.ClassHierarchy hierarchy,
                              InitRepointPlan plan, SuperInterfacePlan superIfaces,
@@ -422,7 +425,12 @@ public final class DexConverter {
                     CodeWriter body = mw.code();
                     if (body != null) {
                         int len = body.measuredLength();
-                        if (len > 65535) over = len;
+                        // DexVMP/nop bodies translate to ZERO JVM code units;
+                        // ClassFileWriter then throws CodeLengthExceeded(0) at
+                        // serialization time and, before this, the whole class
+                        // was dropped. A zero length is just as inexpressible
+                        // as >65535: stub only this method, keep the class.
+                        if (len > 65535 || len == 0) over = len;
                     }
                 } catch (CodeWriter.CodeLengthExceeded e) {
                     over = e.length;        // belt and braces
@@ -445,6 +453,12 @@ public final class DexConverter {
                 }
             } else {
                 Translator.translate(m, mw, hierarchy, plan, superIfaces, allowOutlining);
+                CodeWriter empty = mw.code();
+                if (empty != null && empty.measuredLength() == 0) {
+                    mw.resetCode();
+                    Translator.emitEmptyBody(mw, cls, m);
+                    emptyStubs.incrementAndGet();
+                }
             }
             // The bytecode is written; nothing reads this body again, and the
             // memo would otherwise keep the insns AND the decoded line-number

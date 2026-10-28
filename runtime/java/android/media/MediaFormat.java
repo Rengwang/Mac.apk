@@ -20,6 +20,12 @@ public final class MediaFormat {
     public static final String KEY_DURATION = "durationUs";
     public static final String KEY_WIDTH = "width";
     public static final String KEY_HEIGHT = "height";
+    public static final String KEY_STRIDE = "stride";
+    public static final String KEY_SLICE_HEIGHT = "slice-height";
+    public static final String KEY_CROP_LEFT = "crop-left";
+    public static final String KEY_CROP_TOP = "crop-top";
+    public static final String KEY_CROP_RIGHT = "crop-right";
+    public static final String KEY_CROP_BOTTOM = "crop-bottom";
     public static final String KEY_MAX_WIDTH = "max-width";
     public static final String KEY_MAX_HEIGHT = "max-height";
     public static final String KEY_MAX_INPUT_SIZE = "max-input-size";
@@ -255,25 +261,28 @@ public final class MediaFormat {
         return v == null ? defaultValue : v.toString();
     }
     public int getInteger(String name) {
-        return ((Integer) mMap.get(name)).intValue();
+        Object v = mMap.get(name);
+        return v instanceof Number ? ((Number) v).intValue() : 0;
     }
     public int getInteger(String name, int defaultValue) {
         Object v = mMap.get(name);
-        return v instanceof Integer ? ((Integer) v).intValue() : defaultValue;
+        return v instanceof Number ? ((Number) v).intValue() : defaultValue;
     }
     public long getLong(String name) {
-        return ((Long) mMap.get(name)).longValue();
+        Object v = mMap.get(name);
+        return v instanceof Number ? ((Number) v).longValue() : 0L;
     }
     public long getLong(String name, long defaultValue) {
         Object v = mMap.get(name);
-        return v instanceof Long ? ((Long) v).longValue() : defaultValue;
+        return v instanceof Number ? ((Number) v).longValue() : defaultValue;
     }
     public float getFloat(String name) {
-        return ((Float) mMap.get(name)).floatValue();
+        Object v = mMap.get(name);
+        return v instanceof Number ? ((Number) v).floatValue() : 0.0f;
     }
     public float getFloat(String name, float defaultValue) {
         Object v = mMap.get(name);
-        return v instanceof Float ? ((Float) v).floatValue() : defaultValue;
+        return v instanceof Number ? ((Number) v).floatValue() : defaultValue;
     }
     public ByteBuffer getByteBuffer(String name) {
         return (ByteBuffer) mMap.get(name);

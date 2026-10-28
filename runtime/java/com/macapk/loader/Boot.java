@@ -40,6 +40,39 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 
 public final class Boot {
+
+    static {
+        macapkConfigureSystemProxy();
+    }
+
+    /** MacApkCompat: most Chinese apps (and several SDKs) treat ANY visible
+     *  http.proxyHost / non-DIRECT ProxySelector as "user is debugging",
+     *  refuse to load data and show 请关闭HTTP代理. macOS' system proxy is
+     *  host-wide; a compatibility runtime should not leak it into the guest
+     *  unless the user explicitly asks for it. Opt back in with
+     *  MACAPK_KEEP_SYSTEM_PROXY=1. */
+    private static void macapkConfigureSystemProxy() {
+        try {
+            if ("1".equals(System.getenv("MACAPK_KEEP_SYSTEM_PROXY"))) return;
+            String[] keys = {
+                "http.proxyHost", "http.proxyPort",
+                "https.proxyHost", "https.proxyPort",
+                "socksProxyHost", "socksProxyPort",
+                "java.net.useSystemProxies"
+            };
+            for (String k : keys) System.clearProperty(k);
+            java.net.ProxySelector.setDefault(new java.net.ProxySelector() {
+                @Override public java.util.List<java.net.Proxy> select(java.net.URI uri) {
+                    return java.util.Collections.singletonList(java.net.Proxy.NO_PROXY);
+                }
+                @Override public void connectFailed(java.net.URI uri,
+                                                    java.net.SocketAddress sa,
+                                                    java.io.IOException ioe) {
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+    }
     private static final String TAG = "Mac.apk.Boot";
 
     /** MACAPK_ACTIVITYTHREAD_LAUNCH -- route Application construction through
@@ -1300,6 +1333,16 @@ public final class Boot {
         // on the uncaught reports can carry the "Process: <name>" clause that
         // RuntimeInit.logUncaught prints.
         sProcessName = manifest.packageName;
+        // ...and the java.base overlay's /proc/<pid>/cmdline emulation reads it
+        // from a system property, because a bootstrap-loader class cannot see
+        // Boot or android.*. This is the value a device's kernel would expose
+        // in argv[0] for this process (RuntimeInit sets it from the manifest's
+        // android:process, defaulting to the package name). Set BEFORE the
+        // Application is constructed, so even an early init task that asks
+        // "which process am I?" gets the real name. See
+        // runtime/java_base_patch/java/io/FileReader.java's macapkIsCmdline.
+        try { System.setProperty("macapk.process.name", manifest.packageName); }
+        catch (Throwable ignored) { }
 
         // Components the manifest puts in a DIFFERENT process than the app's
         // default one. AOSP resolves android:process by prefixing a leading

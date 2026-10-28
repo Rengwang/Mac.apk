@@ -435,6 +435,9 @@ public final class MediaCodec {
             // Surfaces). Done at configure time because that is the moment
             // the codec-output-to-surface association exists on real Android.
             if (mHasSurface) {
+                if (surface.macapkGetSurfaceTexture() != null && surface.macapkGetOwnerSurfaceView() == null) {
+                    surface.macapkGetSurfaceTexture().macapkRegisterVideoTarget();
+                }
                 android.view.SurfaceView.macapkRegisterVideoSink(surface);
             }
         } else {
@@ -550,6 +553,9 @@ public final class MediaCodec {
         mSurface = surface;
         mHasSurface = (surface != null && surface.isValid());
         if (mHasSurface) {
+            if (surface.macapkGetSurfaceTexture() != null && surface.macapkGetOwnerSurfaceView() == null) {
+                surface.macapkGetSurfaceTexture().macapkRegisterVideoTarget();
+            }
             android.view.SurfaceView.macapkRegisterVideoSink(surface);
         }
     }
@@ -704,9 +710,15 @@ public final class MediaCodec {
         int depth = 2;
         private long lastPts = Long.MIN_VALUE;
 
+        public int size() {
+            return held.size();
+        }
+
         long[] poll(java.util.function.Supplier<long[]> src, java.util.function.LongConsumer release) {
             long[] f;
-            while (eos == null && (f = src.get()) != null) {
+            // Backpressure: only pull more frames if held queue has not reached required depth.
+            // Do NOT drain the native outQ completely into held on every call.
+            while (eos == null && held.size() <= depth && (f = src.get()) != null) {
                 if (f[0] == 0) { eos = f; break; }               // EOS marker: drain everything
                 if (f[1] < lastPts) {
                     // Arrived after a later frame already went out: a component
@@ -716,6 +728,13 @@ public final class MediaCodec {
                     continue;
                 }
                 held.add(f);
+            }
+            // Strict safety cap: never let held accumulate unbounded unrendered frames
+            while (held.size() > 8) {
+                long[] dropped = held.poll();
+                if (dropped != null && dropped[0] != 0) {
+                    release.accept(dropped[0]);
+                }
             }
             if (!held.isEmpty() && (held.size() > depth || eos != null)) {
                 long[] out = held.poll();
@@ -752,13 +771,19 @@ public final class MediaCodec {
     }
     private void releaseDec() {
         synchronized (mAsyncLock) {
+            mStarted = false;
+            mAsyncLock.notifyAll();
             if (mDec != 0) { com.macapk.loader.NativeMedia.nativeDecClose(mDec); mDec = 0; }
             if (mVidDec != 0) {
                 releasePendingVideoFrames();
+                drainTimedFrames(true);
                 if (isVp8()) com.macapk.loader.NativeMedia.nativeVp8Close(mVidDec);
                 else if (isVp9()) com.macapk.loader.NativeMedia.nativeVp9Close(mVidDec);
                 else com.macapk.loader.NativeMedia.nativeVidClose(mVidDec);
                 mVidDec = 0;
+            }
+            if (mSurface != null && mSurface.macapkGetSurfaceTexture() != null) {
+                android.graphics.SurfaceTexture.macapkUnregisterVideoTarget(mSurface.macapkGetSurfaceTexture());
             }
             mOutQ.clear();
         }
@@ -1127,10 +1152,67 @@ public final class MediaCodec {
         private int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
     }
 
+    private int timedQueueSize() {
+        synchronized (mTimedLock) {
+            return mTimed.size();
+        }
+    }
+
+    private long mWatermarkNextNs;
+    private void checkWatermarks(int reorderCount, int timedCount) {
+        if (!PRESENT_TRACE) return;
+        long now = System.nanoTime();
+        if (now >= mWatermarkNextNs) {
+            mWatermarkNextNs = now + 2_000_000_000L;
+            com.macapk.loader.NativeLog.i("MediaCodec",
+                "[codec-watermark] outFree=" + mOutFree.size() +
+                " inFree=" + mInFree.size() +
+                " reorder=" + reorderCount +
+                " timed=" + timedCount);
+        }
+    }
+
     public int dequeueInputBuffer(long timeoutUs) {
+        final long startedNs = System.nanoTime();
         synchronized (mAsyncLock) {
-            if (!mStarted || mInFree.isEmpty()) return INFO_TRY_AGAIN_LATER;
-            return mInFree.poll();
+          while (mStarted) {
+            // AOSP backpressure: if output buffer slots are exhausted or downstream
+            // queues (native outQ/inFlight, reorder, timed) are backlogged, throttle input rather than free-running
+            boolean ready = !mInFree.isEmpty();
+            if (ready && mVidDec != 0) {
+                int nativeDepth = com.macapk.loader.NativeMedia.nativeVidQueueDepth(mVidDec);
+                int timedCount = timedQueueSize();
+                int reorderCount = mReorder.size();
+                checkWatermarks(reorderCount, timedCount);
+                if (mOutFree.isEmpty() || nativeDepth >= 4 || reorderCount >= 6 || timedCount >= 6) {
+                    ready = false;
+                }
+            }
+            if (ready) return mInFree.poll();
+            if (!waitForBufferLocked(timeoutUs, startedNs)) break;
+          }
+          return INFO_TRY_AGAIN_LATER;
+        }
+    }
+
+    // Native decoder callbacks do not signal this Java monitor. Poll with a
+    // bounded sleep that releases the lock so output consumption can progress.
+    // timeoutUs == 0 is non-blocking; negative means wait indefinitely.
+    private boolean waitForBufferLocked(long timeoutUs, long startedNs) {
+        if (timeoutUs == 0) return false;
+        long waitNs = 2_000_000L;
+        if (timeoutUs > 0) {
+            long remaining = java.util.concurrent.TimeUnit.MICROSECONDS.toNanos(timeoutUs)
+                - (System.nanoTime() - startedNs);
+            if (remaining <= 0) return false;
+            waitNs = Math.min(waitNs, remaining);
+        }
+        try {
+            mAsyncLock.wait(waitNs / 1_000_000L, (int)(waitNs % 1_000_000L));
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
     public void queueInputBuffer(int index, int offset, int size, long presentationTimeUs, int flags) {
@@ -1173,8 +1255,14 @@ public final class MediaCodec {
         queueInputBuffer(index, offset, 0, presentationTimeUs, flags);
     }
     public int dequeueOutputBuffer(BufferInfo info, long timeoutUs) {
+        final long startedNs = System.nanoTime();
         synchronized (mAsyncLock) {
-            return tryDequeueOutputLocked(info);
+            int result;
+            do {
+                result = tryDequeueOutputLocked(info);
+                if (result != INFO_TRY_AGAIN_LATER || !mStarted) return result;
+            } while (waitForBufferLocked(timeoutUs, startedNs));
+            return INFO_TRY_AGAIN_LATER;
         }
     }
     // Shared output-selection logic for the synchronous dequeueOutputBuffer()
@@ -1251,7 +1339,8 @@ public final class MediaCodec {
                     if (PRESENT_TRACE && !render) mTraceAppDrops++;
                     if (render && mHasSurface) {
                         if (PRESENT_TRACE) tracePresent();
-                        com.macapk.loader.NativeMedia.nativeVidRender(pb, mVidWidth, mVidHeight);
+                        com.macapk.loader.NativeMedia.nativeVidRenderToSurface(pb, mVidWidth, mVidHeight,
+                            mSurface != null ? mSurface.macapkGetSurfaceTexture() : null);
                         com.macapk.loader.MediaStats.codecRendered(mStat);
                     }
                     com.macapk.loader.NativeMedia.nativeVidReleaseFrame(pb);
@@ -1292,8 +1381,14 @@ public final class MediaCodec {
         long due = renderTimestampNs;
         if (due < now || due - now > 1_000_000_000L) due = now;   // late, or "not within a second": now
         synchronized (mTimedLock) {
+            while (mTimed.size() >= 8) {
+                long[] old = mTimed.pollFirst();
+                if (old != null && old[0] != 0) {
+                    com.macapk.loader.NativeMedia.nativeVidReleaseFrame(old[0]);
+                }
+            }
             mTimed.addLast(new long[]{ pb, due });
-            if (mTimedThread == null) {
+            if (mTimedThread == null || !mTimedThread.isAlive()) {
                 mTimedQuit = false;
                 mTimedThread = new Thread(this::timedPresentLoop, "MediaCodec:VideoPresent");
                 mTimedThread.setDaemon(true);
@@ -1391,7 +1486,8 @@ public final class MediaCodec {
                 // release) waits for an in-flight present instead of freeing
                 // the buffer underneath it.
                 try {
-                    com.macapk.loader.NativeMedia.nativeVidRender(show[0], mVidWidth, mVidHeight);
+                    com.macapk.loader.NativeMedia.nativeVidRenderToSurface(show[0], mVidWidth, mVidHeight,
+                        mSurface != null ? mSurface.macapkGetSurfaceTexture() : null);
                     com.macapk.loader.MediaStats.codecRendered(mStat);
                 } catch (Throwable ignored) {}
                 com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);
@@ -1414,6 +1510,12 @@ public final class MediaCodec {
             MediaFormat f = MediaFormat.createVideoFormat(mVidMime, mVidWidth, mVidHeight);
             f.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 mHasSurface ? MediaFormat.COLOR_FormatSurface : MediaFormat.COLOR_FormatYUV420Flexible);
+            f.setInteger(MediaFormat.KEY_STRIDE, mVidWidth);
+            f.setInteger(MediaFormat.KEY_SLICE_HEIGHT, mVidHeight);
+            f.setInteger(MediaFormat.KEY_CROP_LEFT, 0);
+            f.setInteger(MediaFormat.KEY_CROP_TOP, 0);
+            f.setInteger(MediaFormat.KEY_CROP_RIGHT, mVidWidth > 0 ? mVidWidth - 1 : 0);
+            f.setInteger(MediaFormat.KEY_CROP_BOTTOM, mVidHeight > 0 ? mVidHeight - 1 : 0);
             if (!mHasSurface) {
                 // Describes NativeVideoImage's OWN derived conversion, not
                 // VideoToolbox's internal decode colourimetry -- meaningless

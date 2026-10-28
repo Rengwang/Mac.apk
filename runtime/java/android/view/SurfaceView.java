@@ -1504,6 +1504,38 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         return k;
     }
 
+    /**
+     * Native-window identity for this SurfaceView.  The native bridge must not
+     * collapse two Android Surface objects onto one CAMetalLayer: Bilibili's
+     * video and danmaku views are separate consumers.  Keep the key stable for
+     * the lifetime of this view and expose it only to framework internals.
+     */
+    public final int macapkNativeWindowSurfaceKey() {
+        return macapkSurfaceKey();
+    }
+
+    /** Whether a native producer's holder requested a pixel format with alpha. */
+    public static boolean macapkSurfaceFormatHasAlpha(int key) {
+        java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
+        SurfaceView v = ref != null ? ref.get() : null;
+        return v != null && android.graphics.PixelFormat.formatHasAlpha(v.holder.macapkRequestedFormat);
+    }
+
+    /** Effective view alpha for a native surface, including parent fades. */
+    public static float macapkSurfaceLayerAlpha(int key) {
+        java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
+        SurfaceView v = ref != null ? ref.get() : null;
+        if (v == null) return 0f;
+        float alpha = v.getAlpha();
+        ViewParent parent = v.getParent();
+        while (parent instanceof View) {
+            View ancestor = (View) parent;
+            alpha *= ancestor.getAlpha();
+            parent = ancestor.getParent();
+        }
+        return Math.max(0f, Math.min(1f, alpha));
+    }
+
     /** 0 = not probed, 1 = the runtime has a per-surface layer, -1 = it does not. */
     private static volatile int sSurfaceLayerState;
     private static volatile java.lang.invoke.MethodHandle sSurfaceLayerMH;
@@ -1554,6 +1586,20 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             try { postInvalidate(); } catch (Throwable ignored) { }
         }
         return true;
+    }
+
+    public void macapkPresentFrame(int[] pixels, int pw, int ph) {
+        if (pixels == null || pw <= 0 || ph <= 0) return;
+        if (macapkPresentThroughSurfaceLayer(pixels, pw, ph)) return;
+        int[] placed = macapkPlaceInDisplay(pixels, pw, ph);
+        if (placed != null) {
+            pixels = placed;
+            pw = macapkCompositeW;
+            ph = macapkCompositeH;
+        }
+        try {
+            com.macapk.loader.NativeCocoa.presentBitmap(pixels, pw, ph);
+        } catch (Throwable ignored) {}
     }
 
     /** Route (2)'s frame, reused across frames (drawing thread only). */
@@ -3837,6 +3883,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         }
         private final java.util.ArrayList<Callback> callbacks = new java.util.ArrayList<>();
         private final android.view.Surface surface = new android.view.Surface();
+        private volatile int macapkRequestedFormat = android.graphics.PixelFormat.OPAQUE;
         private final android.graphics.Rect frame = new android.graphics.Rect();
         // Persistent backing bitmap. lockCanvas() returns a Canvas
         // wrapping this; unlockCanvasAndPost() is a no-op for now (no
@@ -3874,7 +3921,12 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         @Override public boolean isCreating()            { return false; }
         @Override public android.view.Surface getSurface() { return surface; }
         @Override public android.graphics.Rect getSurfaceFrame() { return frame; }
-        @Override public void setFormat(int f)            {}
+        @Override public void setFormat(int f) {
+            macapkRequestedFormat = f;
+            if ("1".equals(System.getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE")))
+                NativeLog.i(TAG, "[surface-format-probe] " + owner.getClass().getName()
+                    + " format=" + f + " alpha=" + android.graphics.PixelFormat.formatHasAlpha(f));
+        }
         @Override public void setKeepScreenOn(boolean s)  {}
         @Override public void setFixedSize(int w, int h)  { frame.set(0, 0, w, h); macapkFixedSize = true; }
         @Override public void setSizeFromLayout()         { macapkFixedSize = false; }
@@ -3997,6 +4049,9 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             // this runs off it (SV_UI_THREAD_CALLBACKS, above), behind any posted
             // surfaceCreated, so the order stays created -> changed.
             frame.set(0, 0, w, h);
+            if (surface != null && surface.macapkGetSurfaceTexture() != null && w > 0 && h > 0) {
+                surface.macapkGetSurfaceTexture().setDefaultBufferSize(w, h);
+            }
             if (macapkCallbackOffUiThread()) {
                 macapkPostToUiThread(() -> {
                     try {

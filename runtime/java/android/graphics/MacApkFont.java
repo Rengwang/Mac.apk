@@ -121,7 +121,11 @@ public final class MacApkFont {
                 break;
             }
             try {
-                return Font.createFont(Font.TRUETYPE_FONT, f);
+                Font created = Font.createFont(Font.TRUETYPE_FONT, f);
+                if ("1".equals(System.getenv("MACAPK_TRACE_PUA")) && created.getFontName().equals("bilibili")) {
+                    com.macapk.loader.NativeLog.i("Mac.apk.PUA", "create bytes=" + bytes.length + " hash=" + java.util.Arrays.hashCode(bytes) + " stack=" + java.util.Arrays.toString(Thread.currentThread().getStackTrace()));
+                }
+                return created;
             } catch (java.awt.FontFormatException | java.io.IOException storeCopyRejected) {
                 // After the retry this is decided by the legacy path on the
                 // SAME bytes: if that also rejects them they are most likely
@@ -534,7 +538,7 @@ public final class MacApkFont {
      *  the kerning-enabled cut is built once per face. Weak keys: a Font derived
      *  per-call (size/style) must not be pinned forever. */
     private static final java.util.Map<Font, Font> sKerned =
-        java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Font, Font>());
+        java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<Font, Font>());
 
     /** The same face with OpenType kerning enabled.
      *
@@ -566,7 +570,7 @@ public final class MacApkFont {
 
     /** The same cut with standard ligatures on as well (see ligaFor). */
     private static final java.util.Map<Font, Font> sKernedLiga =
-        java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Font, Font>());
+        java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<Font, Font>());
 
     // --- Standard ligatures (v1.0.2240) -----------------------------------
     //
@@ -994,6 +998,9 @@ public final class MacApkFont {
         if (bytes == null || bytes.length == 0) return null;
         try {
             Font f = createFontFromBytes(bytes);
+            if ("1".equals(System.getenv("MACAPK_TRACE_PUA")) && f.getFontName().equals("bilibili")) {
+                com.macapk.loader.NativeLog.i("Mac.apk.PUA", "loaded bytes=" + bytes.length + " hash=" + java.util.Arrays.hashCode(bytes) + " stack=" + java.util.Arrays.toString(Thread.currentThread().getStackTrace()));
+            }
             rememberExtents(f, bytes);
             int[] st = readOs2Style(bytes);
             // usWeightClass >= 600 is the SemiBold/Bold boundary minikin treats

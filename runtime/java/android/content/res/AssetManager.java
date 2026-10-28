@@ -307,6 +307,33 @@ public final class AssetManager implements AutoCloseable {
     /** True when nothing at all is mounted (the historical `apk == null`). */
     private boolean macapkNoMounts() { return mApkAssets.length == 0; }
 
+    /** The 1-based cookie AOSP would hand out for the APK at `apkPath`
+     *  (ApkAssetsCookieToJavaCookie), or 0 -- AOSP's "no particular APK" --
+     *  when that APK is not mounted here.
+     *
+     *  ResourceIndex identifies a file's owner by its index in the installed
+     *  set; the AssetManager mounts framework-res FIRST, so the two numbering
+     *  spaces differ by the framework prepend and the member number must
+     *  never be handed out as a cookie. Callers that pass a cookie back into
+     *  openXmlResourceParser/openNonAsset (magicasakura's ThemeUtils does, for
+     *  every themed color selector) get the wrong APK otherwise: cookie 1 is
+     *  framework-res, not the base APK, and the lookup misses. */
+    public int macapkCookieOfApk(String apkPath) {
+        if (apkPath == null || mApkAssetPaths == null) return 0;
+        String canon = apkPath;
+        try { canon = new java.io.File(apkPath).getCanonicalPath(); }
+        catch (Throwable ignored) { }
+        for (int i = 0; i < mApkAssetPaths.length; i++) {
+            String p = mApkAssetPaths[i];
+            if (p == null) continue;
+            if (p.equals(apkPath) || p.equals(canon)) return i + 1;
+            try {
+                if (new java.io.File(p).getCanonicalPath().equals(canon)) return i + 1;
+            } catch (Throwable ignored) { }
+        }
+        return 0;
+    }
+
     public InputStream open(String name) throws IOException {
         return open(name, ACCESS_STREAMING);
     }
@@ -379,14 +406,20 @@ public final class AssetManager implements AutoCloseable {
     }
 
     public android.content.res.XmlResourceParser openXmlResourceParser(int cookie, String fileName) {
-        if (macapkNoMounts() || fileName == null) return null;
+        if (macapkNoMounts() || fileName == null) {
+            macapkXmlMiss(cookie, fileName, "no mounts");
+            return null;
+        }
         try {
             // AOSP resolves fileName against the APK root. Accept an
             // assets/-relative name too, since that costs one getEntry and a
             // caller that passes one would otherwise get the old null.
             Found f = macapkFind(cookie, fileName);
             if (f == null) f = macapkFind(cookie, "assets/" + fileName);
-            if (f == null) return null;
+            if (f == null) {
+                macapkXmlMiss(cookie, fileName, "no such entry");
+                return null;
+            }
             ZipEntry e = f.entry;
 
             String key = f.zip.getName() + "!" + e.getName();
@@ -422,8 +455,33 @@ public final class AssetManager implements AutoCloseable {
             // best-effort improvement into a new crash class.
             System.err.println("[AssetManager] openXmlResourceParser('" + fileName
                                + "') failed: " + t);
+            macapkXmlMiss(cookie, fileName, "parse failed: " + t);
             return null;
         }
+    }
+
+    /** Why one openXmlResourceParser call answered null.
+     *
+     *  A null here is a FATAL contract break for a caller that trusts AOSP's
+     *  @NonNull -- measured: Bilibili's skinning framework
+     *  (magicasakura ThemeUtils -> Al0.a.a) does
+     *      XmlResourceParser p = am.openXmlResourceParser(tv.assetCookie, tv.string);
+     *      p.next();                       // NPE "<local15>" is null
+     *  which aborts the Fragment that builds the home page, leaving the app on
+     *  its splash. Without this line the app-side stack names only its own
+     *  frames, so the container never learns WHICH resource path and cookie
+     *  missed. Capped: a broken lookup in a draw loop must not flood the log. */
+    private static final java.util.concurrent.atomic.AtomicInteger sXmlMisses =
+        new java.util.concurrent.atomic.AtomicInteger();
+    private void macapkXmlMiss(int cookie, String fileName, String why) {
+        if (sXmlMisses.incrementAndGet() > 20) return;
+        try {
+            Class<?> log = Class.forName("com.macapk.loader.NativeLog");
+            log.getMethod("w", String.class, String.class).invoke(null,
+                "Mac.apk.AssetManager",
+                "openXmlResourceParser -> null: cookie=" + cookie + " file=" + fileName
+                + " mounts=" + mApkAssets.length + " (" + why + ")");
+        } catch (Throwable ignored) { }
     }
 
     /** Open an asset as an AssetFileDescriptor. AndEngine uses this for

@@ -232,6 +232,70 @@ public class StateListDrawable extends Drawable implements Drawable.Callback {
                 ? entries.get(currentIndex).drawable : null;
     }
 
+    // ---- the AOSP container constant state ------------------------------------
+    // AOSP declares `public class StateListDrawable extends DrawableContainer`
+    // and inherits DrawableContainer.getConstantState(), which answers its
+    // StateListState -- a DrawableContainerState over the selector's rows.
+    // This class predates the container here and extends Drawable directly, so
+    // until now it inherited the BASE answer: a childless state that was not
+    // even a container state. Every framework that walks a selector through its
+    // constant state was therefore broken, and Bilibili's MagicSakura is the
+    // measured case (2026-10-26/27 logs, 21 occurrences):
+    //
+    //     com.bilibili.magicasakura.utils.ThemeUtils.containsNinePatch(BL:28)
+    //         -> (DrawableContainerState) drawable.getConstantState()
+    //         -> ClassCastException: MacapkSelfConstantState cannot be cast
+    //            to DrawableContainerState
+    //
+    // thrown from TintTextView.setBackgroundResource, i.e. from PromoToast and
+    // from the skinning framework itself, on a plain <selector> background.
+    //
+    // The source is LIVE, not a snapshot: AOSP's state IS the container's child
+    // array, so a row added after the first getConstantState() is visible to a
+    // later walk (a skin framework that resolves the background once and tints
+    // it after the state list is built relies on that). The instance is cached
+    // the way AOSP caches mStateListState.
+    //
+    // MACAPK_SLD_CONTAINER_STATE=0 falls back to the base (childless) state for
+    // a one-binary bisect: the CLASS CAST still succeeds (the base state is a
+    // DrawableContainerState too, see Drawable.MacapkSelfConstantState), only
+    // the children go away -- which is the ThemePatcher workaround Bilibili
+    // needed before this fix.
+    static final boolean SLD_CONTAINER_STATE =
+        !"0".equals(System.getenv("MACAPK_SLD_CONTAINER_STATE"));
+    private DrawableContainer.DrawableContainerState mConstantState;
+
+    @Override public ConstantState getConstantState() {
+        if (!SLD_CONTAINER_STATE) return super.getConstantState();
+        if (mConstantState == null) {
+            mConstantState = new DrawableContainer.DrawableContainerState(
+                new MacapkStateChildSource());
+        }
+        return mConstantState;
+    }
+
+    /** AOSP StateListState's child half: this selector's rows, read live. */
+    private final class MacapkStateChildSource
+            implements DrawableContainer.DrawableContainerState.MacapkChildSource {
+        @Override public int getChildCount() { return entries.size(); }
+        @Override public Drawable getChild(int index) {
+            return (index >= 0 && index < entries.size()) ? entries.get(index).drawable : null;
+        }
+        /** AOSP's StateListDrawableState.addState is `addChild` plus the state
+         *  spec; a bare addChild on the state leaves a row with no spec (a
+         *  state-set slot that never matches) even on a device. Append it with
+         *  the EMPTY spec -- the row a selector uses for its default -- so the
+         *  selector and its state list stay in step instead of silently
+         *  diverging. */
+        @Override public int addChild(Drawable dr) {
+            if (dr == null) return -1;
+            final int index = entries.size();
+            addState(new int[0], dr);
+            return index;
+        }
+        @Override public Drawable macapkNewDrawable() { return StateListDrawable.this; }
+    }
+
     @Override public void draw(Canvas canvas) {
         Drawable d = current();
         if (FORWARD) {

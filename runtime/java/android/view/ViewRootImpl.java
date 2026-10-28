@@ -49,7 +49,70 @@ public final class ViewRootImpl {
     private final AtomicBoolean mLayoutRequested = new AtomicBoolean(true);
     private View mView;
 
+    // Damage-aware partial redraw authority (S1 half, consumed by ViewCanvasDriver)
+    public static final int DAMAGE_NONE = 0;
+    public static final int DAMAGE_PARTIAL = 1;
+    public static final int DAMAGE_FULL = 2;
+
+    private int mDamageKind = DAMAGE_FULL; // Starts full so the first frame paints everything
+    private int mDamageLeft = Integer.MAX_VALUE;
+    private int mDamageTop = Integer.MAX_VALUE;
+    private int mDamageRight = Integer.MIN_VALUE;
+    private int mDamageBottom = Integer.MIN_VALUE;
+
     private ViewRootImpl() {}
+
+    public synchronized void scheduleDamageFull() {
+        mDamageKind = DAMAGE_FULL;
+        scheduleTraversal();
+    }
+
+    public synchronized void scheduleDamage(int l, int t, int r, int b) {
+        if (mDamageKind == DAMAGE_FULL) {
+            scheduleTraversal();
+            return;
+        }
+        if (r <= l || b <= t) {
+            return;
+        }
+        if (mDamageKind == DAMAGE_NONE) {
+            mDamageKind = DAMAGE_PARTIAL;
+            mDamageLeft = l;
+            mDamageTop = t;
+            mDamageRight = r;
+            mDamageBottom = b;
+        } else {
+            mDamageLeft = Math.min(mDamageLeft, l);
+            mDamageTop = Math.min(mDamageTop, t);
+            mDamageRight = Math.max(mDamageRight, r);
+            mDamageBottom = Math.max(mDamageBottom, b);
+        }
+        scheduleTraversal();
+    }
+
+    /** Reflectively queried by ViewCanvasDriver.lookupConsumeDamage() -> S1 */
+    public synchronized int macapkConsumeDamage(int[] out4) {
+        if (mLayoutRequested.get()) {
+            mDamageKind = DAMAGE_FULL;
+        }
+        int kind = mDamageKind;
+        if (kind == DAMAGE_PARTIAL) {
+            if (mDamageRight <= mDamageLeft || mDamageBottom <= mDamageTop) {
+                kind = DAMAGE_NONE;
+            } else if (out4 != null && out4.length >= 4) {
+                out4[0] = mDamageLeft;
+                out4[1] = mDamageTop;
+                out4[2] = mDamageRight;
+                out4[3] = mDamageBottom;
+            }
+        }
+        mDamageKind = DAMAGE_NONE;
+        mDamageLeft = Integer.MAX_VALUE;
+        mDamageTop = Integer.MAX_VALUE;
+        mDamageRight = Integer.MIN_VALUE;
+        mDamageBottom = Integer.MIN_VALUE;
+        return kind;
+    }
 
     /** Set/replace the window's root view (a new content view needs a full
      *  measure+layout traversal). */
@@ -57,6 +120,7 @@ public final class ViewRootImpl {
         mView = root;
         mTraversalScheduled.set(true);
         mLayoutRequested.set(true);
+        scheduleDamageFull();
     }
     public View getView() { return mView; }
 
@@ -70,7 +134,7 @@ public final class ViewRootImpl {
      *  scheduleTraversals. */
     public void requestLayoutTraversal() {
         mLayoutRequested.set(true);
-        mTraversalScheduled.set(true);
+        scheduleDamageFull();
     }
 
     public boolean isTraversalScheduled() { return mTraversalScheduled.get(); }
@@ -87,7 +151,7 @@ public final class ViewRootImpl {
     public boolean consumeLayoutRequested() { return mLayoutRequested.getAndSet(false); }
 
     /** Convenience for the single-window case: schedule a DRAW (invalidate). */
-    public static void schedule() { if (INVAL_CENSUS) census(); getInstance().scheduleTraversal(); }
+    public static void schedule() { if (INVAL_CENSUS) census(); getInstance().scheduleDamageFull(); }
     // MACAPK_TRACE_INVALIDATE=1 (diagnostic): WHO keeps the window dirty. Every
     // schedule() is attributed to its framework entry (View.invalidate,
     // Drawable.invalidateSelf ...) and the first APP frame that called it, and every

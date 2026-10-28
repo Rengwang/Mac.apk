@@ -43,6 +43,12 @@ public class Application extends ContextWrapper
     private File   filesDir;
     private File   cacheDir;
     private AssetManager assets;
+    /** First non-null Resources/AssetManager seen by macapkInit(). Wrapper
+     *  Applications (Tinker/AppCompat-style) can later null this.resources
+     *  through their own resource patching; the process still needs a stable
+     *  app Resources for Activities and AppCompat, so keep the original. */
+    private Resources macapkPrimaryResources;
+    private AssetManager macapkPrimaryAssets;
     private Resources    resources;
     // The installed base.apk (v1.0.1585: <root>/data/app/~~<nonce>/<pkg>-<nonce>/
     // base.apk; its split_*.apk siblings are the rest of the app, derived by
@@ -165,9 +171,9 @@ public class Application extends ContextWrapper
         AppBaseContext(Application app) { this.app = app; }
         // The 8 abstract getters + close kin, served from the app's fields.
         @Override public String getPackageName()            { return app.packageName; }
-        @Override public Resources getResources()           { return app.resources; }
-        @Override public Resources getResourcesDirect()     { return app.resources; }
-        @Override public AssetManager getAssets()           { return app.assets; }
+        @Override public Resources getResources()           { return app.resources != null ? app.resources : app.macapkPrimaryResources; }
+        @Override public Resources getResourcesDirect()     { return app.resources != null ? app.resources : app.macapkPrimaryResources; }
+        @Override public AssetManager getAssets()           { return app.assets != null ? app.assets : app.macapkPrimaryAssets; }
         @Override public Context getApplicationContext()    { return app; }
         @Override public ClassLoader getClassLoader() {
             return app.classLoader != null ? app.classLoader
@@ -250,6 +256,8 @@ public class Application extends ContextWrapper
         this.cacheDir = cacheDir;
         this.assets = assets;
         this.resources = resources;
+        if (assets != null) this.macapkPrimaryAssets = assets;
+        if (resources != null) this.macapkPrimaryResources = resources;
     }
 
     /** Second-pass init for the install-style metadata that
@@ -764,8 +772,13 @@ public class Application extends ContextWrapper
     }
 
     @Override public String getPackageName()     { return packageName; }
-    @Override public Resources getResources()    { return resources; }
-    @Override public AssetManager getAssets()    { return assets; }
+    /** Process-wide stable Resources for Context implementations whose own
+     *  base chain answers null (MacApkCompat). */
+    public Resources macapkResources() { return resources != null ? resources : macapkPrimaryResources; }
+    public AssetManager macapkAssets() { return assets != null ? assets : macapkPrimaryAssets; }
+
+    @Override public Resources getResources()    { return resources != null ? resources : macapkPrimaryResources; }
+    @Override public AssetManager getAssets()    { return assets != null ? assets : macapkPrimaryAssets; }
     @Override public Context getApplicationContext() { return this; }
 
     // cocos2d-x 2.0/2.1's Cocos2dxActivity.setPackageName (called from the

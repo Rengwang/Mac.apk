@@ -83,14 +83,90 @@ public class FileReader extends InputStreamReader {
         return "/proc/self/smaps".equals(name) || "/proc/self/maps".equals(name);
     }
 
+    // ---- Mac.apk /proc/<pid>/cmdline (added 2026-10-27) ---------------------
+    // Linux gives every process a /proc/<pid>/cmdline holding its argv,
+    // NUL-separated: for an Android app process that is exactly its process
+    // name. It is the portable pre-API-28 way to ask "which process am I?"
+    // and it is what modern apps fall back to whenever
+    // android.app.Application.getProcessName() is unavailable:
+    //
+    //   MEASURED (Bilibili 9.16.1): com.bilibili.droid.ProcessUtils.processName()
+    //   is `return processName(Process.myPid())`, which opens
+    //   new FileReader("/proc/" + pid + "/cmdline"). macOS has no /proc, so the
+    //   open throws, the method returns null, and its caller
+    //   (r10.w.execute: `StringsKt.endsWith(processName(), "safemode")`) dies:
+    //
+    //     FATAL EXCEPTION: gripper-root-single-1
+    //     java.lang.NullPointerException: Cannot invoke "String.endsWith(String)"
+    //         because "<local4>" is null
+    //         at kotlin.text.StringsKt__StringsJVMKt.endsWith(BL:3)
+    //         at r10.w.execute(BL:68)
+    //
+    //   Bilibili's own startup watchdog counts that as a failed boot and
+    //   System.exit(10)s into SafeModeActivity, which reads to the user as
+    //   "black screen, then it restarts". The same idiom is standard in WeChat,
+    //   Douyin and every push SDK, so this is a framework gap, not an app bug.
+    //
+    // The name comes from the macapk.process.name system property, which Boot
+    // sets from the parsed manifest at the same point it records
+    // Boot.sProcessName (the value AOSP's RuntimeInit would put in cmdline).
+    //
+    // WHICH PIDS: self, thread-self, and OUR OWN pid only. A device can read any
+    // process's cmdline; we cannot (there is no guest process table here -- every
+    // manifest process of an app is hosted in this one runtime process), and
+    // inventing an answer for a stranger's pid would be worse than the honest
+    // FileNotFoundException a device never gives: an app that asks "is that other
+    // process mine?" would be told "yes". android.os.Process.myPid() is
+    // ProcessHandle.current().pid(), so the own-pid test is the same number the
+    // app passes in.
+    private static boolean macapkIsCmdline(String name) {
+        if (name == null || !name.startsWith("/proc/") || !name.endsWith("/cmdline")) return false;
+        final int end = name.length() - 8;              // "/cmdline".length()
+        if (end <= 6) return false;                     // "/proc/" + "/cmdline" with no pid
+        final String mid = name.substring(6, end);      // the <pid> field
+        if ("self".equals(mid) || "thread-self".equals(mid)) return true;
+        for (int i = 0; i < mid.length(); i++) {
+            final char c = mid.charAt(i);
+            if (c < '0' || c > '9') return false;
+        }
+        try {
+            return Long.parseLong(mid) == ProcessHandle.current().pid();
+        } catch (Throwable notOursOrTooBig) {
+            return false;
+        }
+    }
+
+    /** The process name, as Boot recorded it; a neutral fallback keeps the file
+     *  readable (never null, never empty) for a read that races process setup. */
+    private static String macapkProcessName() {
+        final String p = System.getProperty("macapk.process.name");
+        return (p == null || p.isEmpty()) ? "android.process" : p;
+    }
+
+    /** argv as the kernel lays it out: UTF-8 name followed by one NUL. Java
+     *  callers do `readLine()` + `trim()`, and String.trim() drops the NUL, so
+     *  the same body serves both the correct Linux shape and the trimmed form
+     *  an app compares against (Bilibili's own processName() trims). */
+    private static byte[] macapkProcCmdline() {
+        final byte[] raw = macapkProcessName().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        final byte[] body = new byte[raw.length + 1];
+        System.arraycopy(raw, 0, body, 0, raw.length);
+        body[raw.length] = 0;
+        return body;
+    }
+
     private static InputStream macapkOpen(String fileName) throws FileNotFoundException {
+        if (macapkIsCmdline(fileName)) return new ByteArrayInputStream(macapkProcCmdline());
         if (macapkIsProc(fileName)) return new ByteArrayInputStream(PROC_BODY);
         return new FileInputStream(fileName);
     }
 
     private static InputStream macapkOpen(File file) throws FileNotFoundException {
-        if (file != null && macapkIsProc(file.getPath()))
-            return new ByteArrayInputStream(PROC_BODY);
+        if (file != null) {
+            final String p = file.getPath();
+            if (macapkIsCmdline(p)) return new ByteArrayInputStream(macapkProcCmdline());
+            if (macapkIsProc(p)) return new ByteArrayInputStream(PROC_BODY);
+        }
         return new FileInputStream(file);
     }
 }

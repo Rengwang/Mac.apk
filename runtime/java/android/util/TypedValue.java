@@ -96,7 +96,26 @@ public class TypedValue {
     // type, so any androidx code that reads it (e.g.
     // ResourceManagerInternal.createCacheKey) NoSuchFieldErrors and
     // the entire BottomNavigationView <init> path aborts.
-    public int assetCookie = 1;
+    //
+    // DEFAULT 0 (2026-10-27). AOSP leaves this unset (0 = "no cookie") until a
+    // value table fills it in; it was initialised to 1 here, which is a VALID
+    // cookie meaning "the first asset path". Every fresh TypedValue therefore
+    // claimed to come from the FIRST mount -- and our AssetManager mounts the
+    // framework table there, with the app's own APK after it -- so a caller
+    // that trusted the value looked its resource up in the WRONG apk.
+    // MEASURED (Bilibili 9.16.1): its skinning framework does
+    //     Resources.getValue(id, tv, true);
+    //     XmlResourceParser p = am.openXmlResourceParser(tv.assetCookie, tv.string);
+    // for `res/color/selector_tab_item.xml`; cookie 1 resolved to the framework
+    // table, the entry was not there, our AOSP-shaped null came back, and
+    // p.next() threw NullPointerException in the Fragment that builds the home
+    // page -- the app sat on its splash forever. With the AOSP default the same
+    // call passes 0 ("no cookie" = search every mount last-first, which is what
+    // ResourcesImpl.getValue + openNonAsset do on a device) and finds the app's
+    // own apk. Nothing in this tree READS the field (only apps do), so the
+    // default is the whole contract. See
+    // AssetManager.macapkXmlMiss for the diagnostic that found it.
+    public int assetCookie = 0;
     public int resourceId;
     public int density;
     public int changingConfigurations = -1;

@@ -147,9 +147,11 @@ public class TextureView extends View {
 
     @Override
     public void onDetachedFromWindow() {
+        boolean destroy = true;
         if (mSurfaceTexture != null && mListener != null && mAvailable) {
-            try { mListener.onSurfaceTextureDestroyed(mSurfaceTexture); }
-            catch (Throwable ignored) {}
+            try {
+                destroy = mListener.onSurfaceTextureDestroyed(mSurfaceTexture);
+            } catch (Throwable ignored) {}
         }
         if (mSurfaceTexture != null) {
             // Undo the video-target registration Surface's constructor made
@@ -159,9 +161,16 @@ public class TextureView extends View {
             // just latches into a Bitmap nobody draws -- but pointless work
             // and a misleading log if anyone traces it).
             mSurfaceTexture.macapkUnregisterVideoTargetIfSelf();
+            if (destroy) {
+                mSurfaceTexture.release();
+                mSurfaceTexture = null;
+            }
         }
         if (mSurface != null) {
             try { mSurface.release(); } catch (Throwable ignored) {}
+            // The listener may retain the consumer texture, but this producer
+            // wrapper was released and must be recreated on the next attach.
+            mSurface = null;
         }
         mAvailable = false;
         super.onDetachedFromWindow();
@@ -186,10 +195,12 @@ public class TextureView extends View {
     private void ensureSurfaceTexture() {
         if (mSurfaceTexture == null) {
             mSurfaceTexture = new SurfaceTexture();
-            mSurface = new Surface(mSurfaceTexture);
             // AOSP registers TextureView's own frame listener at texture
             // creation (mUpdateListener); a producer frame then invalidates.
             mSurfaceTexture.setOnFrameAvailableListener(mUpdateListener);
+        }
+        if (mSurface == null || !mSurface.isValid()) {
+            mSurface = new Surface(mSurfaceTexture);
         }
     }
 
@@ -224,6 +235,17 @@ public class TextureView extends View {
     public SurfaceTexture getSurfaceTexture() { return mSurfaceTexture; }
 
     public void setSurfaceTexture(SurfaceTexture surfaceTexture) {
+        if (surfaceTexture == null) {
+            throw new NullPointerException("surfaceTexture must not be null");
+        }
+        if (surfaceTexture == mSurfaceTexture) return;
+        if (surfaceTexture.isReleased()) {
+            throw new IllegalArgumentException("Cannot set a released SurfaceTexture");
+        }
+        if (mSurfaceTexture != null) {
+            mSurfaceTexture.macapkUnregisterVideoTargetIfSelf();
+            mSurfaceTexture.release();
+        }
         mSurfaceTexture = surfaceTexture;
         mSurface = (surfaceTexture != null) ? new Surface(surfaceTexture) : null;
         if (surfaceTexture != null) {

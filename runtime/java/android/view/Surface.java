@@ -88,17 +88,17 @@ public class Surface implements android.os.Parcelable {
     public Surface() {}
     public Surface(android.graphics.SurfaceTexture surfaceTexture) {
         mSurfaceTexture = surfaceTexture;
-        // See the file header ("THE VIDEO-DECODE HAND-OFF POINT"). Harmless
-        // when this Surface is never handed to a video decoder (a camera
-        // preview, or a custom GL consumer): it only means a video frame is
-        // never offered, since nothing calls macapkOfferDecodedFrame without
-        // one actually decoding.
         if (surfaceTexture != null) {
             surfaceTexture.macapkRegisterVideoTarget();
         }
     }
     public boolean isValid() { return !mReleased; }
-    public void release() { mReleased = true; }
+    public void release() {
+        mReleased = true;
+        if (mSurfaceTexture != null) {
+            mSurfaceTexture.macapkUnregisterVideoTargetIfSelf();
+        }
+    }
 
     /** The SurfaceTexture this Surface produces into, or null when it was not
      *  constructed from one. Mac.apk framework-internal (macapk prefix, same
@@ -109,6 +109,18 @@ public class Surface implements android.os.Parcelable {
         return mSurfaceTexture;
     }
 
+    /** EGL10 software-backed window stream for a SurfaceHolder surface. */
+    public synchronized android.graphics.SurfaceTexture macapkEnsureEglStream() {
+        checkNotReleased();
+        if (mSurfaceTexture == null && mOwnerSurfaceView != null) {
+            mSurfaceTexture = new android.graphics.SurfaceTexture(false);
+            mSurfaceTexture.macapkSetOwnerSurfaceView(mOwnerSurfaceView);
+            int w = mOwnerSurfaceView.getWidth(), h = mOwnerSurfaceView.getHeight();
+            if (w > 0 && h > 0) mSurfaceTexture.setDefaultBufferSize(w, h);
+        }
+        return mSurfaceTexture;
+    }
+
     /** Mac.apk framework-internal (same convention as macapkGetSurfaceTexture
      *  above): the SurfaceView this Surface belongs to, or null when it is not
      *  a SurfaceHolder-vended Surface. Set once by SurfaceHolderImpl's
@@ -116,9 +128,22 @@ public class Surface implements android.os.Parcelable {
      *  the view as the active video sink. */
     public void macapkSetOwnerSurfaceView(SurfaceView owner) {
         mOwnerSurfaceView = owner;
+        if (mSurfaceTexture != null && owner != null) {
+            mSurfaceTexture.macapkSetOwnerSurfaceView(owner);
+            int w = owner.getWidth(), h = owner.getHeight();
+            if (w > 0 && h > 0) {
+                mSurfaceTexture.setDefaultBufferSize(w, h);
+            }
+        }
     }
     public SurfaceView macapkGetOwnerSurfaceView() {
         return mOwnerSurfaceView;
+    }
+
+    /** Framework-internal stable key used by the native ANativeWindow bridge. */
+    public int macapkGetNativeWindowSurfaceKey() {
+        return mOwnerSurfaceView != null
+                ? mOwnerSurfaceView.macapkNativeWindowSurfaceKey() : 0;
     }
 
     /** Mac.apk framework-internal, called by the Bionic shim's

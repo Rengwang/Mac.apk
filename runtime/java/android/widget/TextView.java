@@ -1567,6 +1567,7 @@ public class TextView extends View
         }
     }
     public void setTextSize(float size) { setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, size); }
+    public void setTextSize(int size) { setTextSize((float) size); }
     public void setTextSize(int unit, float size) {
         // AOSP TextView.setTextSize(int,float) remembers the UNIT as well as the
         // resolved pixel size (mTextSizeUnit), because getTextSizeUnit() reports

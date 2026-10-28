@@ -684,13 +684,27 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         if (mViewHandler == null) mViewHandler = new android.os.Handler();
         return mViewHandler;
     }
-    // android.view.Display getter (API 17+). Flappy Bird's
-    // AndEngine setup queries display metrics during onCreate;
-    // absent, NoSuchMethodError aborts the activity. Return null
-    // -- callers null-check and fall back to context.getResources()
-    // .getDisplayMetrics(). This is the AOSP behaviour for a View
-    // that's not yet attached to a window.
-    public android.view.Display getDisplay() { return null; }
+    /** AOSP View.getDisplay(): a detached view has no display; an attached
+     *  view exposes its window's display, including during onAttachedToWindow.
+     *  Mac.apk currently has one logical display, supplied by the Context's
+     *  DisplayManager. Returning null after attach prevented renderers from
+     *  receiving that display's density and listening for metric changes. */
+    public android.view.Display getDisplay() {
+        if (!macapkAttached || context == null) return null;
+        try {
+            android.view.Display display = context.getDisplay();
+            if (display != null) return display;
+        } catch (UnsupportedOperationException unsupported) {
+            // A non-display-associated Context can throw here even though the
+            // view now belongs to our window. Resolve its single logical
+            // display through the existing service rather than inventing one.
+        }
+        Object manager = context.getSystemService(Context.DISPLAY_SERVICE);
+        return manager instanceof android.hardware.display.DisplayManager
+            ? ((android.hardware.display.DisplayManager) manager)
+                .getDisplay(android.view.Display.DEFAULT_DISPLAY)
+            : null;
+    }
 
     public int  getId()             { return id; }
     public void setId(int id)       { this.id = id; }
@@ -1396,12 +1410,20 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     private float scaleX = 1f, scaleY = 1f;
     private float rotation = 0f;
     private float pivotX = Float.NaN, pivotY = Float.NaN;
+    private void macapkInvalidateTransformChange() {
+        // Property animations move the OLD pixels as well as painting the new
+        // bounds. Until old/new transformed bounds and shadow damage are tracked,
+        // use a full frame for geometry changes; ordinary content invalidations
+        // can still use the partial-damage path.
+        if (android.os.Looper.MACAPK_REAL_LOOPER) ViewRootImpl.schedule();
+        invalidate();
+    }
     public float getRotation()   { return rotation; }
-    public void  setRotation(float r) { if (rotation != r) { rotation = r; invalidate(); } }
+    public void  setRotation(float r) { if (rotation != r) { rotation = r; macapkInvalidateTransformChange(); } }
     public float getScaleX()     { return scaleX; }
     public float getScaleY()     { return scaleY; }
-    public void  setScaleX(float s) { if (scaleX != s) { scaleX = sanitizeFloatPropertyValue(s, "scaleX"); invalidate(); } }
-    public void  setScaleY(float s) { if (scaleY != s) { scaleY = sanitizeFloatPropertyValue(s, "scaleY"); invalidate(); } }
+    public void  setScaleX(float s) { if (scaleX != s) { scaleX = sanitizeFloatPropertyValue(s, "scaleX"); macapkInvalidateTransformChange(); } }
+    public void  setScaleY(float s) { if (scaleY != s) { scaleY = sanitizeFloatPropertyValue(s, "scaleY"); macapkInvalidateTransformChange(); } }
     /** AOSP sanitizeFloatPropertyValue (View.java:17452-17484) and the latch
      *  that arms it (:5370, inside View(Context)):
      *      sThrowOnInvalidFloatProperties = targetSdkVersion >= Build.VERSION_CODES.P;
@@ -1520,8 +1542,8 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     }
     public float getTranslationX() { return transX; }
     public float getTranslationY() { return transY; }
-    public void  setTranslationX(float t) { if (transX != t) { transX = t; invalidate(); } }
-    public void  setTranslationY(float t) { if (transY != t) { transY = t; invalidate(); } }
+    public void  setTranslationX(float t) { if (transX != t) { transX = t; macapkInvalidateTransformChange(); } }
+    public void  setTranslationY(float t) { if (transY != t) { transY = t; macapkInvalidateTransformChange(); } }
     // Tier 3 M12: real elevation / translationZ storage (were no-op stubs).
     // getZ() = elevation + translationZ (AOSP View.getZ). A non-zero Z makes
     // ViewGroup.dispatchDraw cast an outline-shaped soft shadow UNDER the view
@@ -1533,11 +1555,11 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     // shadow re-renders; invalidate() is itself flag-gated.
     private float mElevation = 0f, mTranslationZ = 0f;
     public float getElevation() { return mElevation; }
-    public void  setElevation(float e) { if (mElevation != e) { mElevation = sanitizeFloatPropertyValue(e, "elevation"); invalidate(); } }
+    public void  setElevation(float e) { if (mElevation != e) { mElevation = sanitizeFloatPropertyValue(e, "elevation"); macapkInvalidateTransformChange(); } }
     public float getPivotX() { return Float.isNaN(pivotX) ? (right - left) / 2f : pivotX; }
     public float getPivotY() { return Float.isNaN(pivotY) ? (bottom - top) / 2f : pivotY; }
-    public void  setPivotX(float p) { pivotX = p; invalidate(); }
-    public void  setPivotY(float p) { pivotY = p; invalidate(); }
+    public void  setPivotX(float p) { pivotX = p; macapkInvalidateTransformChange(); }
+    public void  setPivotY(float p) { pivotY = p; macapkInvalidateTransformChange(); }
     public float getX()          { return left + transX; }
     public float getY()          { return top + transY; }
     public void  setX(float x)   { setTranslationX(x - left); }
@@ -4381,8 +4403,16 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public void drawableHotspotChanged(float x, float y) {}
 
     // Misc API surface needed for various androidx components
-    public void postInvalidate(int left, int top, int right, int bottom) { invalidate(); }
-    public void postInvalidateDelayed(long delayMs) { invalidate(); }
+    public void postInvalidate(int left, int top, int right, int bottom) {
+        if (android.os.Looper.getMainLooper().isCurrentThread()) {
+            invalidate(left, top, right, bottom);
+        } else {
+            post(() -> invalidate(left, top, right, bottom));
+        }
+    }
+    public void postInvalidateDelayed(long delayMs) {
+        postDelayed(this::invalidate, delayMs);
+    }
     public void postInvalidateOnAnimation() { invalidate(); }
     public void requestFitSystemWindows() {}
     public boolean fitSystemWindows(android.graphics.Rect insets) { return false; }
@@ -5260,7 +5290,47 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     // Tier 3 M6: invalidate() schedules a draw traversal on the next frame
     // (AOSP View.invalidate -> ViewRootImpl.invalidate -> scheduleTraversals).
     // Gated: flag-off stays a no-op (the driver redraws every frame anyway).
-    public void invalidate()     { macapkTraceComposeInsert("invalidate"); try { if (com.macapk.loader.ComposeViewFallback.SHEET_PROBE_ON && com.macapk.loader.ComposeViewFallback.macapkIsComposeHost(this)) com.macapk.loader.ComposeViewFallback.sAcvInval.incrementAndGet(); } catch (Throwable ignored) {} if (android.os.Looper.MACAPK_REAL_LOOPER) ViewRootImpl.schedule(); macapkInvalidateParent(); }
+    public void invalidate()     { macapkTraceComposeInsert("invalidate"); try { if (com.macapk.loader.ComposeViewFallback.SHEET_PROBE_ON && com.macapk.loader.ComposeViewFallback.macapkIsComposeHost(this)) com.macapk.loader.ComposeViewFallback.sAcvInval.incrementAndGet(); } catch (Throwable ignored) {} if (android.os.Looper.MACAPK_REAL_LOOPER) macapkReportDamage(0, 0, getWidth(), getHeight()); macapkInvalidateParent(); }
+
+    /** Report damage to ViewRootImpl in window/canvas device coordinates (S1 half) */
+    public void macapkReportDamage(int l, int t, int r, int b) {
+        if (!android.os.Looper.MACAPK_REAL_LOOPER) return;
+        if (!macapkAttached || (getVisibility() != VISIBLE && getAnimation() == null)) return;
+        int w = getWidth(), h = getHeight();
+        if (w <= 0 || h <= 0) {
+            ViewRootImpl.schedule();
+            return;
+        }
+        l = Math.max(0, l);
+        t = Math.max(0, t);
+        r = Math.min(w, r);
+        b = Math.min(h, b);
+        if (r <= l || b <= t) return;
+
+        View root = getRootView();
+        int rootLeft = root != null ? root.getLeft() : 0;
+        int rootTop = root != null ? root.getTop() : 0;
+        int statusBarH = 0;
+        try {
+            statusBarH = com.macapk.loader.StatusBarDriver.heightPx(root);
+        } catch (Throwable ignored) {}
+
+        // Even an untransformed child can live below a scaled/rotated parent.
+        // Mapping only its origin then adding local width/height under-reports
+        // damage. Map all four corners through the complete ancestor chain.
+        android.graphics.RectF rf = new android.graphics.RectF(l, t, r, b);
+        macapkMapRectFromViewToWindow(rf);
+        int cl = (int)Math.floor(rf.left) - rootLeft;
+        int ct = (int)Math.floor(rf.top) - rootTop + statusBarH;
+        int cr = (int)Math.ceil(rf.right) - rootLeft;
+        int cb = (int)Math.ceil(rf.bottom) - rootTop + statusBarH;
+        // Expand by 1px for subpixel/antialiasing filtering safety
+        cl = Math.max(0, cl - 1);
+        ct = Math.max(0, ct - 1);
+        cr = cr + 1;
+        cb = cb + 1;
+        ViewRootImpl.getInstance().scheduleDamage(cl, ct, cr, cb);
+    }
     /** MACAPK_INVALIDATE_PARENT (default ON, =0 the old schedule-only invalidate):
      *  AOSP View.invalidateInternal (android14 View.java:20733-20780) reports the
      *  damage to the parent, `p.invalidateChild(this, damage)`, whose
@@ -5437,9 +5507,31 @@ public class View implements android.graphics.drawable.Drawable.Callback,
             com.macapk.loader.NativeLog.i("Mac.apk.ComposeAttach", sb.toString());
         }
     }
-    public void invalidate(Rect dirty) { invalidate(); }
-    public void invalidate(int l, int t, int r, int b) { invalidate(); }
-    public void postInvalidate() { invalidate(); }
+    public void invalidate(Rect dirty) {
+        if (dirty != null) {
+            invalidate(dirty.left, dirty.top, dirty.right, dirty.bottom);
+        } else {
+            invalidate();
+        }
+    }
+    public void invalidate(int l, int t, int r, int b) {
+        macapkTraceComposeInsert("invalidate");
+        try {
+            if (com.macapk.loader.ComposeViewFallback.SHEET_PROBE_ON && com.macapk.loader.ComposeViewFallback.macapkIsComposeHost(this))
+                com.macapk.loader.ComposeViewFallback.sAcvInval.incrementAndGet();
+        } catch (Throwable ignored) {}
+        if (android.os.Looper.MACAPK_REAL_LOOPER) {
+            macapkReportDamage(l, t, r, b);
+        }
+        macapkInvalidateParent();
+    }
+    public void postInvalidate() {
+        if (android.os.Looper.getMainLooper().isCurrentThread()) {
+            invalidate();
+        } else {
+            post(this::invalidate);
+        }
+    }
 
     // Standard View.draw / onDraw entry points. Real Android's
     // ViewRoot calls View.draw which then calls onDraw with the
@@ -7378,6 +7470,16 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         if (!android.os.Looper.MACAPK_REAL_LOOPER) return;
         mDrawableStateDirty = true;
         drawableStateChanged();
+        // AOSP View.refreshDrawableState (android14 View.java:23683-23691):
+        //     ViewParent parent = mParent;
+        //     if (parent != null) parent.childDrawableStateChanged(this);
+        // This is how a group with addStatesFromChildren (TextInputLayout and
+        // its inputFrame) learns that its EditText became focused, so the box
+        // stroke and the floating label switch to the focused colors.
+        ViewParent p = parent;
+        if (p != null) {
+            try { p.childDrawableStateChanged(this); } catch (Throwable ignored) {}
+        }
     }
 
     protected int[] onCreateDrawableState(int extraSpace) {
@@ -8332,13 +8434,27 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         // until StackOverflowError inside the widget's constructor
         // (measured: AntennaPod LinearProgressIndicator x50, campaign log
         // 2026-08-01 -- every instance became a FrameLayout placeholder).
+        if (d != null) {
+            final Rect bounds = d.getBounds();
+            if (bounds != null && !bounds.isEmpty()) {
+                macapkInvalidateNonVirtual(bounds.left, bounds.top, bounds.right, bounds.bottom);
+                return;
+            }
+        }
         macapkInvalidateNonVirtual();
     }
     /** The non-virtual core of invalidate(): schedule a redraw pass. Both
      *  invalidate() and invalidateDrawable() land here; only invalidate()
      *  is subclass-overridable, matching AOSP's dispatch shape. */
     private void macapkInvalidateNonVirtual() {
-        if (android.os.Looper.MACAPK_REAL_LOOPER) ViewRootImpl.schedule();
+        if (android.os.Looper.MACAPK_REAL_LOOPER) {
+            macapkReportDamage(0, 0, getWidth(), getHeight());
+        }
+    }
+    private void macapkInvalidateNonVirtual(int l, int t, int r, int b) {
+        if (android.os.Looper.MACAPK_REAL_LOOPER) {
+            macapkReportDamage(l, t, r, b);
+        }
     }
     // Pending drawable animation ticks, keyed by the DRAWABLE that scheduled
     // them. AOSP gets this for free: it posts to the Choreographer with `who`
@@ -9418,8 +9534,8 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public void onScreenStateChanged(int screenState) { }
     public void onVisibilityAggregated(boolean isVisible) { }
     public void onWindowSystemUiVisibilityChanged(int visible) { }
-    public void postInvalidateDelayed(long delayMilliseconds, int left, int top, int right, int bottom) { postInvalidateDelayed(delayMilliseconds); }
-    public void postInvalidateOnAnimation(int left, int top, int right, int bottom) { postInvalidateOnAnimation(); }
+    public void postInvalidateDelayed(long delayMilliseconds, int left, int top, int right, int bottom) { postDelayed(() -> invalidate(left, top, right, bottom), delayMilliseconds); }
+    public void postInvalidateOnAnimation(int left, int top, int right, int bottom) { postOnAnimation(() -> invalidate(left, top, right, bottom)); }
     public void releasePointerCapture() { }
     public void requestPointerCapture() { }
     public void setAccessibilityTraversalBefore(int beforeId) {

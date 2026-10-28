@@ -184,6 +184,19 @@ if [ -d "$RT_DIR/net_spi" ]; then
     fi
 fi
 
+# Shipped key-bind profiles travel INSIDE macapk-loader.jar as classpath
+# resources (runtime/scripts/build.sh does exactly the same copy). This block
+# was MISSING here, so every jar staged through this fast path silently LOST
+# com/macapk/loader/keybinds/* -- measured 2026-10-27: `jar tf` on the staged
+# loader jar lacked HCR.json/index.txt while the deployed one had them, i.e. the
+# fast path shipped a jar that behaved differently from a full build. Same
+# keep-in-sync rule as the --patch-module and net_spi blocks above.
+if [ -d "$RT_DIR/java/com/macapk/loader/keybinds" ]; then
+    mkdir -p "$TMP/com/macapk/loader/keybinds"
+    cp -f "$RT_DIR"/java/com/macapk/loader/keybinds/* \
+          "$TMP/com/macapk/loader/keybinds/"
+fi
+
 echo "[java-only] Packaging macapk-loader.jar..."
 ( cd "$TMP" && "$JAR" --create --file "$LIB/macapk-loader.jar" com/macapk )
 

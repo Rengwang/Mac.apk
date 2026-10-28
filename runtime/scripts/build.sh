@@ -690,7 +690,8 @@ sync_payload_into() {  # $1 = a launcher bundle's Contents dir
         "$LIB/android-framework.jar:lib/android-framework.jar" \
         "$LIB/macapk-loader.jar:lib/macapk-loader.jar" \
         "$LIB/bcprov-jdk18on-1.79.jar:lib/bcprov-jdk18on-1.79.jar" \
-        "$BUILD/build-id.txt:build-id.txt"; do
+        "$BUILD/build-id.txt:build-id.txt" \
+        "$BUILD/build-id.txt:Resources/build-id.txt"; do
         src="${pair%%:*}"
         dst="$c/${pair#*:}"
         [[ -f "$src" ]] || continue

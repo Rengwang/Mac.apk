@@ -15,6 +15,7 @@ import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.content.pm.Signature;
 
+import java.io.File;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -144,6 +145,27 @@ public final class MacApkPackageManager extends PackageManager {
         this.applicationMetaDataTypes = java.util.Collections.emptyMap();
         this.services         = services  != null ? services  : Collections.emptyMap();
         this.providers        = providers != null ? providers : Collections.emptyMap();
+    }
+
+
+    /** Per-app signature override, used when an APK was re-signed by the
+     *  unpack/repack pipeline but an SDK/native library still compares the
+     *  signer against the ORIGINAL publisher certificate. The file is DER
+     *  (X.509), stored outside the bundle:
+     *  ~/Library/Application Support/Mac.apk/signature-overrides/&lt;pkg&gt;.bin
+     *  Returning the original signer keeps GET_SIGNATURES /
+     *  GET_SIGNING_CERTIFICATES compatible without patching each .so. */
+    private static Signature[] macapkSignatureOverride(String pkg) {
+        try {
+            File f = new File(System.getProperty("user.home"),
+                "Library/Application Support/Mac.apk/signature-overrides/" + pkg + ".bin");
+            if (!f.isFile()) return null;
+            byte[] der = java.nio.file.Files.readAllBytes(f.toPath());
+            if (der == null || der.length == 0) return null;
+            return new Signature[]{ new Signature(der) };
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     @Override public PackageInfo getPackageInfo(String packageName, int flags)
@@ -539,6 +561,16 @@ public final class MacApkPackageManager extends PackageManager {
     private synchronized Signature[] readApkSignatures() {
         if (signaturesLoaded) return cachedSignatures;
         signaturesLoaded = true;
+        // MacApkCompat: the self PackageInfo path (getPackageInfo -> here) is
+        // what a re-signed app's own anti-tamper code reads. If the repack
+        // pipeline recorded the ORIGINAL publisher cert, answer with it before
+        // touching the (new) APK signing block.
+        Signature[] override = macapkSignatureOverride(packageName);
+        if (override != null) {
+            cachedSignatures = override;
+            cachedSchemeVersion = 2;
+            return override;
+        }
         if (apkPath == null) return null;
         Signature[] sigs = readSignaturesFromPath(apkPath);
         // A split bundle (.apkm / .xapk / .apks) is a ZIP-of-APKs: the outer file
@@ -1800,6 +1832,13 @@ public final class MacApkPackageManager extends PackageManager {
             // splits are the siblings; an archive parse of one file cannot
             // know them. Additive, null for a package without any.
             fillSplitFields(ai, info, apk);
+        }
+        Signature[] macapkOverride = macapkSignatureOverride(row.pkg);
+        if (macapkOverride != null) {
+            if ((flags & GET_SIGNATURES) != 0) info.signatures = macapkOverride;
+            if ((flags & GET_SIGNING_CERTIFICATES) != 0) {
+                info.signingInfo = new android.content.pm.SigningInfo(macapkOverride);
+            }
         }
         return info;
     }

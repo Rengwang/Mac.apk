@@ -1,5 +1,11 @@
 # Mac.apk
 
+> [!IMPORTANT]
+> **Rengwang 兼容性开发分支 · 2026-10-28**
+> 这是完整源码的开发进度快照。视频、资源、窗口与兼容层已有改进，**弹幕仍未修复**，原生 Surface/P0 路径仍在实验。
+> 请先阅读 **[新增内容与未解决问题](docs/compat/STATUS-2026-10-28.md)**、[后续路线](docs/compat/ROADMAP.md)和[验证记录](docs/compat/VALIDATION-2026-10-28.md)。
+> 下方原版说明中的 Apple 签名、发行版本和兼容性统计属于上游官方发行；本分支尚未提供同等验收或新的公证安装包。
+
 **Run Android apps natively on Apple Silicon Macs. No emulator, no virtual machine, no Linux underneath.**
 
 [![Latest release](https://img.shields.io/github/v/release/kksimp/Mac.apk?label=latest&color=6c5ce7)](../../releases/latest)

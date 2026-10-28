@@ -378,12 +378,82 @@ public final class ClassFileWriter {
      * interface keeps its fields as they are (and has no instance fields).
      */
     public int unfinalFieldsWrittenByInitializerHelpers() {
-        if (initializerHelperPuts.isEmpty() || effectiveMajorVersion() < 53) return 0;
+        if (effectiveMajorVersion() < 53) return 0;
         if ((access & ACC_INTERFACE) != 0) return 0;
+        // A method whose name carries "__clinit_" IS an initializer helper by
+        // construction -- whatever produced it. Two producers exist:
+        //   1. Translator's splitters/outliners, which name a chunk they peel
+        //      out of <clinit>/<init> `...__clinit_` / `...__init_`; those
+        //      writes are ALSO recorded in initializerHelperPuts below.
+        //   2. The APP's own member-injection preprocessor. MEASURED victim
+        //      (Bilibili 9.16.1, 2026-10-27): its "spy" mixin glue class
+        //      com.bilibili.lib.spy.generated.android_content_ContentProvider
+        //      ships the boxed form as a REAL DEX method
+        //      `com_bilibili_lib_ui_life_MixinContentProvider__clinit_`, called
+        //      from <clinit>, and it writes the class's static final
+        //      `..._MixinContentProvider_Companion`. Translator only records a
+        //      put when the DEX method is literally <clinit> (Translator.java
+        //      F_STATIC_PUT), so that field kept ACC_FINAL and every
+        //      <clinit> of the class threw
+        //          IllegalAccessError: Update to static final field ... attempted
+        //          from a different method (...__clinit_) than the initializer
+        //          method <clinit>
+        //      at RESOLUTION (before any app code runs), which the app's crash
+        //      guard counted until it entered safe mode: 42 "Could not
+        //      initialize class ...ContentProvider" + 309 follow-on
+        //      NoClassDefFoundError in one launch, versus ZERO on the same app
+        //      when the fields were emitted non-final.
+        //
+        // So: a class that HAS such a helper gets its own finals unfinaled --
+        // STATIC ones for a `__clinit_` helper, INSTANCE ones for an `__init_`
+        // helper. That is the same trade the recorded-put path already makes,
+        // one step coarser, and it is safe in this direction:
+        //   - ACC_FINAL is not read by field RESOLUTION, only by the
+        //     putstatic/putfield check above and by reflection's
+        //     Modifier.isFinal(); no caller's bytecode changes meaning.
+        //   - ConstantValue attributes are untouched, and nothing recompiles
+        //     against these classes: the app's code is already converted and
+        //     the framework compiles from source.
+        //
+        // THE INSTANCE HALF (added 2026-10-27). The same mixin preprocessor
+        // boxes the instance initialiser of a generated class into ordinary
+        // methods named `...__init_`, and those write the class's final
+        // `by lazy` delegates. Translator only records a put for a DEX method
+        // that IS <init>, so every one of them kept ACC_FINAL and JVMS 6.5
+        // putfield refused it at RESOLUTION:
+        //
+        //   MEASURED (Bilibili 9.16.1, the "agree" click on its first-run
+        //   dialog):
+        //     IllegalAccessError: Update to non-static final field
+        //       com.bilibili.lib.spy.generated.androidx_fragment_app_Fragment
+        //       .com_bilibili_lib_ui_mixin_MixinLogFragment_hostName$delegate
+        //       attempted from a different method
+        //       (com_bilibili_lib_ui_mixin_MixinLogFragment__init_) than the
+        //       initializer method <init>
+        //   The Fragment therefore never initialised and the dialog never
+        //   closed -- "clicking Agree does nothing". The same class converted
+        //   by the pre-2026-10-27 build had those fields non-final and worked,
+        //   which is what pinned the regression to this method.
+        //
+        // Interfaces stay excluded for the reason at the top of this javadoc
+        // (JVMS 4.5 makes every interface field public static final).
+        boolean hasClinitHelper = false;
+        boolean hasInitHelper = false;
+        for (MethodWriter m : methods) {
+            final String mn = m.name();
+            if (mn == null) continue;
+            if (mn.indexOf("__clinit_") >= 0) hasClinitHelper = true;
+            if (mn.indexOf("__init_") >= 0) hasInitHelper = true;
+            if (hasClinitHelper && hasInitHelper) break;
+        }
+        if (initializerHelperPuts.isEmpty() && !hasClinitHelper && !hasInitHelper) return 0;
         int n = 0;
         for (FieldWriter f : fields) {
             if ((f.access & ACC_FINAL) == 0) continue;
-            if (!initializerHelperPuts.contains(f.name + ":" + f.desc)) continue;
+            final boolean isStatic = (f.access & ACC_STATIC) != 0;
+            final boolean recorded = initializerHelperPuts.contains(f.name + ":" + f.desc);
+            final boolean helperOwnsIt = isStatic ? hasClinitHelper : hasInitHelper;
+            if (!recorded && !helperOwnsIt) continue;
             f.access &= ~ACC_FINAL;
             n++;
         }

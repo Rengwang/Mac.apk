@@ -94,10 +94,15 @@ public final class NativeMedia {
      *  nativeVidReleaseFrame (never both, never neither) or native memory
      *  leaks/dangles. */
     public static native long[] nativeVidPoll(long h);
+    /** Current depth of unconsumed frames in the decoder queue (ready + in-flight). */
+    public static native int nativeVidQueueDepth(long h);
     /** MediaCodec.releaseOutputBuffer(index, render=true): composites the
      *  polled frame onto the app's video layer. Does not itself free the
      *  frame -- call nativeVidReleaseFrame afterward regardless. */
     public static native void nativeVidRender(long pixbufHandle, int width, int height);
+    /** Explicit codec destination; unrelated Surface construction cannot redirect it. */
+    public static native void nativeVidRenderToSurface(long pixbufHandle, int width, int height,
+                                                      android.graphics.SurfaceTexture target);
     /** Frees a polled frame's native memory. Required exactly once per
      *  nativeVidPoll result, whether or not it was rendered. */
     public static native void nativeVidReleaseFrame(long pixbufHandle);

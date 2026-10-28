@@ -2299,6 +2299,7 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
         // window dirty, so a settled tree finally goes idle and frames skip.
         if (android.os.Looper.MACAPK_REAL_LOOPER) {
             android.view.ViewRootImpl.getInstance().consumeTraversalScheduled();
+            android.view.ViewRootImpl.getInstance().consumeLayoutRequested();
             // FRAMESPEED S2: the rect follows the flag -- damage this traversal
             // raised is discarded with the traversal it scheduled (08-30 hazard 6).
             if (FRAMESPEED_DAMAGE && CONSUME_DAMAGE != null) macapkConsumeDamage(dmgRect);

@@ -47,13 +47,13 @@ public class InsetsController implements WindowInsetsController {
         mVisibleTypes |= types;
         Window.macapkSetBarVisible(types, true);
         macapkRouteIme(types, true);
-        notifyControllable(types);
+
     }
     @Override public void hide(int types) {
         mVisibleTypes &= ~types;
         Window.macapkSetBarVisible(types, false);
         macapkRouteIme(types, false);
-        notifyControllable(types);
+
     }
 
     /** AOSP's InsetsController routes the ime() type to InputMethodManager --
@@ -120,9 +120,7 @@ public class InsetsController implements WindowInsetsController {
         mListeners.remove(l);
     }
 
-    private void notifyControllable(int typeMask) {
-        for (OnControllableInsetsChangedListener l : new ArrayList<>(mListeners)) {
-            try { l.onControllableInsetsChanged(this, typeMask); } catch (Throwable ignored) {}
-        }
-    }
+    // Controllability describes ownership, not visibility. show/hide never
+    // change our fixed system-bar ownership. Emitting here made listeners that
+    // enforce immersive mode feed show/hide back into themselves indefinitely.
 }

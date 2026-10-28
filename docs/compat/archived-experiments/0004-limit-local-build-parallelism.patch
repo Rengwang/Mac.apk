@@ -1,0 +1,29 @@
+diff --git a/runtime/scripts/build.sh b/runtime/scripts/build.sh
+--- a/runtime/scripts/build.sh
++++ b/runtime/scripts/build.sh
+@@ -367,13 +367,13 @@
+ cmake -DCMAKE_BUILD_TYPE="$MACAPK_BUILD_TYPE" "$RT_DIR"
+ 
+ echo "[build] Building native launcher..."
+-cmake --build . --target macapk-runtime -- -j
++cmake --build . --target macapk-runtime -- -j2
+ 
+ echo "[build] Building APK stub dylib..."
+-cmake --build . --target macapk-app-stub -- -j
++cmake --build . --target macapk-app-stub -- -j2
+ 
+ echo "[build] Building Skia Metal bridge..."
+-cmake --build . --target macapk-skia-metal -- -j
++cmake --build . --target macapk-skia-metal -- -j2
+ ditto libmacapk-skia-metal.dylib "$BIN/libmacapk-skia-metal.dylib"
+ codesign --force --sign - "$BIN/libmacapk-skia-metal.dylib"
+ 
+@@ -511,7 +511,7 @@
+     echo "[build] Building translator (ARM32 -> arm64-darwin) + bionic shim..."
+     mkdir -p "$TRANSLATOR_BUILD"
+     ( cd "$TRANSLATOR_BUILD" && cmake -DCMAKE_BUILD_TYPE=Release "$TRANSLATOR_DIR" >/dev/null \
+-        && cmake --build . -- -j )
++        && cmake --build . -- -j2 )
+     if [[ -x "$TRANSLATOR_BUILD/macapk-translator" ]]; then
+         ditto "$TRANSLATOR_BUILD/macapk-translator" "$BIN/macapk-translator"
+     fi

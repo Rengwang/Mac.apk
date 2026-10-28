@@ -159,6 +159,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <chrono>
 #include <map>
@@ -177,6 +178,7 @@ extern "C" int   macapk_vd_present_to_layer(void* presenter, void* caMetalLayer,
 // CVPixelBufferRef, passed as void* so this header stays Metal/CoreVideo-free
 // on that side) onto it. See that file for the Z-order rationale.
 extern "C" void CocoaPresentVideoFrame(void* pixbuf, int width, int height);
+extern "C" void CocoaPresentVideoFrameToSurface(void* pixbuf, int width, int height, jobject target);
 // runtime/src/video_caps_probe.mm (JNI-free so its offline gate can build it alone).
 extern "C" int macapk_vtcaps_probe(const char* mime, int* out, int cap);
 
@@ -311,30 +313,193 @@ std::vector<uint8_t> AnnexBToAvcc(const uint8_t* data, size_t len) {
 // start-code-prefixed). We accept either csd containing more than one NAL
 // (some encoders emit SPS-ext, NAL type 13, alongside the SPS) and filter by
 // type rather than assuming exactly one NAL per buffer.
+// Hex dump of up to `maxBytes` bytes. A failing format-description build is
+// RARE (once per codec open) and otherwise unfalsifiable: the only way to tell
+// "the app sent avcC" from "the app sent a truncated Annex-B blob" is to look
+// at the bytes. Gated to the failure path only, so it never spams.
+static std::string HexDump(const uint8_t* d, size_t n, size_t maxBytes) {
+    std::string out;
+    size_t lim = n < maxBytes ? n : maxBytes;
+    char buf[8];
+    for (size_t i = 0; i < lim; i++) {
+        std::snprintf(buf, sizeof(buf), "%02x ", d[i]);
+        out += buf;
+    }
+    if (n > lim) out += "...";
+    return out;
+}
+
+// Parses an AVCDecoderConfigurationRecord (ISO/IEC 14496-15 5.2.4.1, the
+// "avcC" box payload) into bare parameter-set NALs.
+//
+// WHY THIS EXISTS. AOSP's ACodec::MakeAVCCodecSpecificData accepts csd-0 in
+// EITHER form: a start-code-prefixed Annex-B blob, or an avcC record. Apps
+// that carry MP4/FLV sources (ijkplayer with is_avc:1, and therefore Bilibili)
+// hand us the avcC -- 43 bytes, no start codes at all. We only ever handled
+// the Annex-B form, so SplitAnnexB found nothing usable,
+// CMVideoFormatDescriptionCreateFromH264ParameterSets was never reached, and
+// macapk_vtb_open returned null. MediaCodec.start() then threw
+// "VideoToolbox: failed to open decoder for video/avc" and ijkplayer silently
+// fell back to its ffplay SOFTWARE decoder -- whose output never reaches the
+// video plane, which is exactly the reported "audio plays, picture is black".
+//
+// Returns the NALUnitHeaderLength the record declares (1/2/4 bytes).
+static bool ParseAvcC(const uint8_t* d, size_t n,
+                      std::vector<const uint8_t*>& ptrs,
+                      std::vector<size_t>& sizes,
+                      int* outNalLenField) {
+    if (!d || n < 7) return false;
+    if (d[0] != 1) return false;                 // configurationVersion must be 1
+    size_t i = 5;
+    int numSps = d[5] & 0x1F;
+    if (outNalLenField) *outNalLenField = (d[4] & 0x03) + 1;
+    i = 6;
+    for (int k = 0; k < numSps; k++) {
+        if (i + 2 > n) return false;
+        size_t len = (size_t(d[i]) << 8) | d[i + 1];
+        i += 2;
+        if (len == 0 || i + len > n) return false;
+        // Only SPS (7) / SPS-ext (13) belong in the SPS slot; anything else
+        // would make CoreMedia reject the whole description.
+        if ((d[i] & 0x1F) == 7 || (d[i] & 0x1F) == 13) {
+            ptrs.push_back(d + i); sizes.push_back(len);
+        }
+        i += len;
+    }
+    if (i >= n) return false;
+    int numPps = d[i] & 0xFF;
+    i += 1;
+    for (int k = 0; k < numPps; k++) {
+        if (i + 2 > n) return false;
+        size_t len = (size_t(d[i]) << 8) | d[i + 1];
+        i += 2;
+        if (len == 0 || i + len > n) return false;
+        if ((d[i] & 0x1F) == 8) {
+            ptrs.push_back(d + i); sizes.push_back(len);
+        }
+        i += len;
+    }
+    return !ptrs.empty();
+}
+
+// Parses an HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 8.3.3.1, "hvcC").
+// Same motivation as ParseAvcC: ACodec accepts it, we did not. Parameter sets
+// here are grouped in ARRAYS (one per NAL type), not one flat SPS/PPS list.
+static bool ParseHvcC(const uint8_t* d, size_t n,
+                      std::vector<const uint8_t*>& ptrs,
+                      std::vector<size_t>& sizes,
+                      int* outNalLenField) {
+    if (!d || n < 23) return false;
+    if (d[0] != 1) return false;                 // configurationVersion
+    if (outNalLenField) *outNalLenField = (d[21] & 0x03) + 1;
+    size_t i = 22;
+    int numArrays = d[i] & 0xFF;                 // 3 bits reserved + 5 bits count? no: 1 byte count
+    i += 1;
+    for (int a = 0; a < numArrays; a++) {
+        if (i + 3 > n) return false;
+        int nalType = d[i] & 0x3F;               // array_completeness(1) + reserved(1) + type(6)
+        i += 1;
+        int cnt = (int(d[i]) << 8) | d[i + 1];
+        i += 2;
+        for (int k = 0; k < cnt; k++) {
+            if (i + 2 > n) return false;
+            size_t len = (size_t(d[i]) << 8) | d[i + 1];
+            i += 2;
+            if (len == 0 || i + len > n) return false;
+            if (nalType == 32 || nalType == 33 || nalType == 34
+                || nalType == 39 || nalType == 40) {
+                ptrs.push_back(d + i); sizes.push_back(len);
+            }
+            i += len;
+        }
+    }
+    return !ptrs.empty();
+}
+
 bool BuildFormatDescriptionH264(const uint8_t* csd0, int csd0Len,
                                 const uint8_t* csd1, int csd1Len,
                                 CMVideoFormatDescriptionRef* outDesc) {
-    auto spsNals = SplitAnnexB(csd0, csd0Len > 0 ? (size_t)csd0Len : 0);
-    auto ppsNals = SplitAnnexB(csd1, csd1Len > 0 ? (size_t)csd1Len : 0);
+    const size_t l0 = csd0Len > 0 ? (size_t)csd0Len : 0;
+    const size_t l1 = csd1Len > 0 ? (size_t)csd1Len : 0;
     std::vector<const uint8_t*> ptrs;
     std::vector<size_t> sizes;
-    for (const auto& n : spsNals) {
-        int t = H264NalType(n);
-        if (t == 7 || t == 13) { ptrs.push_back(n.ptr); sizes.push_back(n.len); }
+    int nalLenField = 4;
+
+    // Form 1: Annex-B (start-code-prefixed).
+    //
+    // TWO legal layouts exist and BOTH must be accepted:
+    //   (a) csd-0 = SPS, csd-1 = PPS   -- the AOSP CSD table's picture, and
+    //       what MediaExtractor-produced formats carry;
+    //   (b) csd-0 = SPS **and** PPS concatenated, csd-1 absent -- what
+    //       ijkplayer hands us for MP4/FLV sources (Bilibili's player).
+    //       Observed in the wild: csd0Len=43, csd1Len=0, bytes
+    //       `00 00 00 01 27 64 ... 00 00 00 01 28 ee 02 bc b0`.
+    // The previous code only pulled SPS (type 7/13) out of csd-0 and PPS
+    // (type 8) out of csd-1, so layout (b) yielded ONE parameter set,
+    // CMVideoFormatDescriptionCreateFromH264ParameterSets was never reached,
+    // macapk_vtb_open returned null, MediaCodec.start() threw
+    // "VideoToolbox: failed to open decoder for video/avc", and ijkplayer
+    // silently fell back to its ffplay SOFTWARE decoder -- whose output never
+    // reaches the video plane. That is the reported "audio plays, picture is
+    // black" (BV17ZXsBNERo, and in all likelihood BV1AspE6EEuU too).
+    std::vector<const uint8_t*> spsPtrs, ppsPtrs;
+    std::vector<size_t> spsSizes, ppsSizes;
+    {
+        auto a0 = SplitAnnexB(csd0, l0);
+        auto a1 = SplitAnnexB(csd1, l1);
+        for (const auto& nals : {a0, a1}) {
+            for (const auto& n : nals) {
+                int t = H264NalType(n);
+                if (t == 7 || t == 13) { spsPtrs.push_back(n.ptr); spsSizes.push_back(n.len); }
+                else if (t == 8)       { ppsPtrs.push_back(n.ptr); ppsSizes.push_back(n.len); }
+            }
+        }
     }
-    for (const auto& n : ppsNals) {
-        if (H264NalType(n) == 8) { ptrs.push_back(n.ptr); sizes.push_back(n.len); }
+    // CoreMedia expects SPS before PPS; emit them in that order regardless of
+    // which buffer each came from.
+    for (size_t k = 0; k < spsPtrs.size(); k++) { ptrs.push_back(spsPtrs[k]); sizes.push_back(spsSizes[k]); }
+    for (size_t k = 0; k < ppsPtrs.size(); k++) { ptrs.push_back(ppsPtrs[k]); sizes.push_back(ppsSizes[k]); }
+    bool viaAvcC = false;
+    // Form 2: avcC (AVCDecoderConfigurationRecord). No start codes at all, so
+    // SplitAnnexB above found 0 -- ACodec accepts this form and so must we.
+    if (spsPtrs.empty() || ppsPtrs.empty()) {
+        std::vector<const uint8_t*> p2;
+        std::vector<size_t> s2;
+        int nl2 = 4;
+        bool ok2 = l0 > 0 && ParseAvcC(csd0, l0, p2, s2, &nl2);
+        if (!ok2) {
+            p2.clear(); s2.clear(); nl2 = 4;
+            ok2 = l1 > 0 && ParseAvcC(csd1, l1, p2, s2, &nl2);
+        }
+        bool hasSps = false, hasPps = false;
+        for (const uint8_t* nal : p2) {
+            hasSps |= (nal[0] & 0x1f) == 7;
+            hasPps |= (nal[0] & 0x1f) == 8;
+        }
+        if (ok2 && hasSps && hasPps) {
+            ptrs = p2; sizes = s2; nalLenField = nl2; viaAvcC = true;
+        }
     }
-    if (ptrs.size() < 2) {
+    if (!viaAvcC && (spsPtrs.empty() || ppsPtrs.empty())) {
         std::fprintf(stderr,
             "[video-toolbox] H264: csd-0/csd-1 did not yield SPS+PPS (found %zu "
             "usable parameter-set NALs; csd0Len=%d csd1Len=%d)\n",
             ptrs.size(), csd0Len, csd1Len);
+        if (l0 > 0) std::fprintf(stderr, "[video-toolbox] H264: csd-0 = %s\n",
+                                 HexDump(csd0, l0, 48).c_str());
+        if (l1 > 0) std::fprintf(stderr, "[video-toolbox] H264: csd-1 = %s\n",
+                                 HexDump(csd1, l1, 48).c_str());
         return false;
+    }
+    if (viaAvcC) {
+        std::fprintf(stderr,
+            "[video-toolbox] H264: built format description from avcC "
+            "(%zu param-set NALs, NALUnitHeaderLength=%d)\n",
+            ptrs.size(), nalLenField);
     }
     OSStatus s = CMVideoFormatDescriptionCreateFromH264ParameterSets(
         kCFAllocatorDefault, ptrs.size(), ptrs.data(), sizes.data(),
-        /*NALUnitHeaderLength=*/4, outDesc);
+        4, outDesc);
     if (s != noErr) {
         std::fprintf(stderr,
             "[video-toolbox] CMVideoFormatDescriptionCreateFromH264ParameterSets "
@@ -351,10 +516,11 @@ bool BuildFormatDescriptionH264(const uint8_t* csd0, int csd0Len,
 // prefix SEI / 40 suffix SEI), requiring at least one of each of VPS/SPS/PPS.
 bool BuildFormatDescriptionHEVC(const uint8_t* csd0, int csd0Len,
                                 CMVideoFormatDescriptionRef* outDesc) {
-    auto nals = SplitAnnexB(csd0, csd0Len > 0 ? (size_t)csd0Len : 0);
+    const size_t l0h = csd0Len > 0 ? (size_t)csd0Len : 0;
     std::vector<const uint8_t*> ptrs;
     std::vector<size_t> sizes;
     bool haveVps = false, haveSps = false, havePps = false;
+    auto nals = SplitAnnexB(csd0, l0h);
     for (const auto& n : nals) {
         int t = HevcNalType(n);
         if (t == 32 || t == 33 || t == 34 || t == 39 || t == 40) {
@@ -364,16 +530,42 @@ bool BuildFormatDescriptionHEVC(const uint8_t* csd0, int csd0Len,
             if (t == 34) havePps = true;
         }
     }
+    int nalLenFieldH = 4;
+    if (!(haveVps && haveSps && havePps) && l0h > 0) {
+        // hvcC fallback (same ACodec-compatibility reason as avcC above).
+        std::vector<const uint8_t*> p2;
+        std::vector<size_t> s2;
+        int nl2 = 4;
+        if (ParseHvcC(csd0, l0h, p2, s2, &nl2)) {
+            bool v = false, sp = false, pp = false;
+            for (size_t k = 0; k < p2.size(); k++) {
+                int t = ((p2[k][0] >> 1) & 0x3F);
+                if (t == 32) v = true;
+                if (t == 33) sp = true;
+                if (t == 34) pp = true;
+            }
+            if (v && sp && pp) {
+                ptrs = p2; sizes = s2; nalLenFieldH = nl2;
+                haveVps = haveSps = havePps = true;
+                std::fprintf(stderr,
+                    "[video-toolbox] HEVC: built format description from hvcC "
+                    "(%zu param-set NALs, NALUnitHeaderLength=%d)\n",
+                    ptrs.size(), nalLenFieldH);
+            }
+        }
+    }
     if (!(haveVps && haveSps && havePps)) {
         std::fprintf(stderr,
             "[video-toolbox] HEVC: csd-0 missing VPS/SPS/PPS (vps=%d sps=%d pps=%d, "
             "%zu param-set NALs kept, csd0Len=%d)\n",
             haveVps, haveSps, havePps, ptrs.size(), csd0Len);
+        if (l0h > 0) std::fprintf(stderr, "[video-toolbox] HEVC: csd-0 = %s\n",
+                                  HexDump(csd0, l0h, 48).c_str());
         return false;
     }
     OSStatus s = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
         kCFAllocatorDefault, ptrs.size(), ptrs.data(), sizes.data(),
-        /*NALUnitHeaderLength=*/4, /*extensions=*/nullptr, outDesc);
+        4, /*extensions=*/nullptr, outDesc);
     if (s != noErr) {
         std::fprintf(stderr,
             "[video-toolbox] CMVideoFormatDescriptionCreateFromHEVCParameterSets "
@@ -561,6 +753,7 @@ struct VtDecoder {
     CMVideoFormatDescriptionRef fmtDesc = nullptr;
     CMVideoCodecType codecType = 0;
     int  width = 0, height = 0;
+    int inputNalLengthSize = 4; // avcC/hvcC input; output always uses 4-byte lengths
     bool isAvcOrHevc = false;     // gates the AnnexBToAvcc rewrite on feed
     bool usingHardware = false;
 
@@ -581,7 +774,146 @@ struct VtDecoder {
     // flush") -- otherwise a decode that was in flight across a flush could
     // land a frame from the pre-flush stream into the post-flush queue.
     std::atomic<int> generation{0};
+
+    // Strict in-flight flow control: prevents runaway submissions to
+    // VTDecompressionSessionDecodeFrame from exploding VTDecoderXPCService memory.
+    std::atomic<int> inFlight{0};
+    std::condition_variable cvInFlight;
 };
+
+// Rewrites an Annex-B or AVCC buffer into AVCC format required by VTDecompressionSessionDecodeFrame,
+// stripping in-band parameter sets (SPS/PPS/VPS/AUD) so that the hardware decoder does not reject the
+// frame with -12909 or -17696. Updates the decoder's format description if new parameter sets are encountered.
+static std::vector<uint8_t> PrepareAvccPayload(VtDecoder* d, const uint8_t* data, size_t len) {
+    std::vector<uint8_t> out;
+    if (!data || len == 0) return out;
+
+    // Prefer the configured length-prefixed framing when it validates in full;
+    // scanning arbitrary compressed bytes for start codes can split AVCC NALs.
+    std::vector<NalRef> nals;
+    const size_t prefix = static_cast<size_t>(d->inputNalLengthSize);
+    size_t off = 0;
+    bool valid = prefix >= 1 && prefix <= 4;
+    while (valid && off < len) {
+        if (len - off < prefix) { valid = false; break; }
+        uint32_t nlen = 0;
+        for (size_t i = 0; i < prefix; ++i) nlen = (nlen << 8) | data[off + i];
+        off += prefix;
+        if (nlen == 0 || nlen > len - off) { valid = false; break; }
+        nals.push_back({data + off, nlen});
+        off += nlen;
+    }
+    if (!valid || nals.empty()) {
+        nals = SplitAnnexB(data, len);
+        if (nals.empty()) {
+            out.assign(data, data + len);
+            return out;
+        }
+    }
+
+    std::vector<NalRef> vclNals;
+    std::vector<NalRef> paramNals;
+
+    for (const auto& n : nals) {
+        if (n.len == 0) continue;
+        if (d->codecType == kCMVideoCodecType_H264) {
+            int t = H264NalType(n);
+            if (t == 7 || t == 8) {
+                paramNals.push_back(n);
+            } else if (t != 9) { // 9 = AUD (access unit delimiter), strip it
+                vclNals.push_back(n);
+            }
+        } else if (d->codecType == kCMVideoCodecType_HEVC) {
+            int t = HevcNalType(n);
+            if (t == 32 || t == 33 || t == 34) {
+                paramNals.push_back(n);
+            } else if (t != 35) { // 35 = AUD, strip it
+                vclNals.push_back(n);
+            }
+        } else {
+            vclNals.push_back(n);
+        }
+    }
+
+    // In-band parameter set update
+    if (!paramNals.empty()) {
+        CMVideoFormatDescriptionRef newFmt = nullptr;
+        if (d->codecType == kCMVideoCodecType_H264) {
+            std::vector<const uint8_t*> ptrs;
+            std::vector<size_t> sizes;
+            bool haveSps = false, havePps = false;
+            for (const auto& n : paramNals) {
+                int t = H264NalType(n);
+                if (t == 7) haveSps = true;
+                if (t == 8) havePps = true;
+                ptrs.push_back(n.ptr);
+                sizes.push_back(n.len);
+            }
+            if (haveSps && havePps) {
+                OSStatus s = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    kCFAllocatorDefault, ptrs.size(), ptrs.data(), sizes.data(), 4, &newFmt);
+                if (s == noErr && newFmt) {
+                    if (!d->fmtDesc || !CFEqual(d->fmtDesc, newFmt)) {
+                        if (d->session && VTDecompressionSessionCanAcceptFormatDescription(d->session, newFmt)) {
+                            if (d->fmtDesc) CFRelease(d->fmtDesc);
+                            d->fmtDesc = newFmt;
+                        } else {
+                            CFRelease(newFmt);
+                        }
+                    } else {
+                        CFRelease(newFmt);
+                    }
+                }
+            }
+        } else if (d->codecType == kCMVideoCodecType_HEVC) {
+            std::vector<const uint8_t*> ptrs;
+            std::vector<size_t> sizes;
+            bool haveVps = false, haveSps = false, havePps = false;
+            for (const auto& n : paramNals) {
+                int t = HevcNalType(n);
+                if (t == 32) haveVps = true;
+                if (t == 33) haveSps = true;
+                if (t == 34) havePps = true;
+                ptrs.push_back(n.ptr);
+                sizes.push_back(n.len);
+            }
+            if (haveVps && haveSps && havePps) {
+                OSStatus s = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    kCFAllocatorDefault, ptrs.size(), ptrs.data(), sizes.data(), 4, nullptr, &newFmt);
+                if (s == noErr && newFmt) {
+                    if (!d->fmtDesc || !CFEqual(d->fmtDesc, newFmt)) {
+                        if (d->session && VTDecompressionSessionCanAcceptFormatDescription(d->session, newFmt)) {
+                            if (d->fmtDesc) CFRelease(d->fmtDesc);
+                            d->fmtDesc = newFmt;
+                        } else {
+                            CFRelease(newFmt);
+                        }
+                    } else {
+                        CFRelease(newFmt);
+                    }
+                }
+            }
+        }
+    }
+
+    // Assemble clean AVCC sample payload with only VCL / slice NALs
+    for (const auto& n : vclNals) {
+        uint8_t lenBytes[4] = {
+            (uint8_t)((n.len >> 24) & 0xFF),
+            (uint8_t)((n.len >> 16) & 0xFF),
+            (uint8_t)((n.len >> 8) & 0xFF),
+            (uint8_t)(n.len & 0xFF),
+        };
+        out.insert(out.end(), lenBytes, lenBytes + 4);
+        out.insert(out.end(), n.ptr, n.ptr + n.len);
+    }
+    return out;
+}
+
+static std::atomic<int64_t> s_vtb_retained{0};
+static std::atomic<int64_t> s_vtb_released{0};
+static std::atomic<int64_t> s_vtb_polled{0};
+static std::atomic<int64_t> s_vtb_rendered{0};
 
 struct DecodeCtx {
     VtDecoder* dec;
@@ -594,15 +926,47 @@ void OutputCallback(void* refcon, void* sourceFrameRefCon, OSStatus status,
     DecodeCtx* ctx = (DecodeCtx*)sourceFrameRefCon;
     VtDecoder* d = (VtDecoder*)refcon;
     if (!ctx) return;  // the probe path (below) passes a null refcon/ctx
+    if (d) {
+        int prev = d->inFlight.fetch_sub(1, std::memory_order_relaxed);
+        if (prev <= 0) {
+            d->inFlight.store(0, std::memory_order_relaxed);
+        }
+    }
     if (status == noErr && imageBuffer
             && ctx->generation == d->generation.load(std::memory_order_relaxed)) {
         CVPixelBufferRef pb = (CVPixelBufferRef)CFRetain(imageBuffer);
+        s_vtb_retained.fetch_add(1, std::memory_order_relaxed);
         int64_t ptsUs = CMTIME_IS_VALID(pts)
             ? (int64_t)llround(CMTimeGetSeconds(pts) * 1.0e6) : -1;
         std::lock_guard<std::mutex> lk(d->mu);
+        // Container safety cap: prevent runaway queue growth if consumer is dead/stalled,
+        // avoiding VTDecoderXPCService / kernel_task wired Mach memory exhaustion.
+        // Emergency cap only; normal backpressure in dequeueInputBuffer() prevents reaching this.
+        constexpr size_t kMaxOutQ = 16;
+        while (d->outQ.size() >= kMaxOutQ) {
+            VtDecoder::OutFrame old = d->outQ.front();
+            d->outQ.pop_front();
+            if (old.pb) {
+                CFRelease(old.pb);
+                s_vtb_released.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<int64_t> s_droppedAtCap{0};
+                int64_t drops = s_droppedAtCap.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (drops % 30 == 1) {
+                    std::fprintf(stderr, "[vtb-stat] WARNING: dropped frame at cap! total_drops=%lld (outQ=%zu)\n",
+                                 (long long)drops, d->outQ.size());
+                }
+            }
+        }
         d->outQ.push_back({pb, ptsUs, 0});
+        d->cvInFlight.notify_one();
     } else if (status != noErr) {
-        std::fprintf(stderr, "[video-toolbox] decode callback error %d\n", (int)status);
+        static std::atomic<int> s_errCount{0};
+        if (s_errCount.fetch_add(1, std::memory_order_relaxed) < 10) {
+            std::fprintf(stderr, "[video-toolbox] decode callback error %d\n", (int)status);
+        }
+        if (d) d->cvInFlight.notify_one();
+    } else {
+        if (d) d->cvInFlight.notify_one();
     }
     // else: noErr but stale generation (flushed mid-flight), or a dropped
     // frame (imageBuffer null) -- nothing to enqueue either way.
@@ -845,6 +1209,14 @@ void* macapk_vtb_open(const char* mimeC, int width, int height,
     VtDecoder* d = new VtDecoder();
     d->codecType = fourcc;
     d->isAvcOrHevc = isAvcHevc;
+    // Configuration records declare the input prefix width. Annex-B CSD starts
+    // with a start code, so it retains the default four-byte length assumption.
+    if (csd0 && csd0Len > 0 && csd0[0] == 1) {
+        if (fourcc == kCMVideoCodecType_H264 && csd0Len >= 7)
+            d->inputNalLengthSize = (csd0[4] & 3) + 1;
+        else if (fourcc == kCMVideoCodecType_HEVC && csd0Len >= 23)
+            d->inputNalLengthSize = (csd0[21] & 3) + 1;
+    }
     d->fmtDesc = fmt;
     CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(fmt);
     d->width  = dim.width  > 0 ? dim.width  : width;
@@ -873,9 +1245,22 @@ int macapk_vtb_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int 
     VtDecoder* d = (VtDecoder*)h;
     if (!d || !d->session) return -1;
     if (au && auLen > 0) {
+        {
+            std::unique_lock<std::mutex> lk(d->mu);
+            constexpr int kMaxInFlight = 4;
+            constexpr size_t kMaxQ = 6;
+            if (d->inFlight.load(std::memory_order_relaxed) >= kMaxInFlight || d->outQ.size() >= kMaxQ) {
+                d->cvInFlight.wait_for(lk, std::chrono::milliseconds(50), [&] {
+                    return d->inFlight.load(std::memory_order_relaxed) < kMaxInFlight && d->outQ.size() < kMaxQ;
+                });
+            }
+        }
         std::vector<uint8_t> payload = d->isAvcOrHevc
-            ? AnnexBToAvcc(au, (size_t)auLen)
+            ? PrepareAvccPayload(d, au, (size_t)auLen)
             : std::vector<uint8_t>(au, au + auLen);
+        if (payload.empty()) {
+            return 0;
+        }
         void* mem = std::malloc(payload.size());
         if (!mem) return -2;
         std::memcpy(mem, payload.data(), payload.size());
@@ -904,12 +1289,14 @@ int macapk_vtb_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int 
         }
         DecodeCtx* ctx = new DecodeCtx{ d, d->generation.load(std::memory_order_relaxed) };
         VTDecodeInfoFlags infoOut = 0;
+        d->inFlight.fetch_add(1, std::memory_order_relaxed);
         OSStatus ds = VTDecompressionSessionDecodeFrame(
             d->session, sbuf,
             kVTDecodeFrame_EnableAsynchronousDecompression | kVTDecodeFrame_EnableTemporalProcessing,
             ctx, &infoOut);
         CFRelease(sbuf);
         if (ds != noErr) {
+            d->inFlight.fetch_sub(1, std::memory_order_relaxed);
             std::fprintf(stderr, "[video-toolbox] VTDecompressionSessionDecodeFrame failed %d\n", (int)ds);
             delete ctx;
             return -5;
@@ -936,10 +1323,20 @@ int macapk_vtb_poll(void* h, void** outPixbuf, int64_t* outPtsUs, int* outFlags)
     if (d->outQ.empty()) return 0;
     VtDecoder::OutFrame f = d->outQ.front();
     d->outQ.pop_front();
+    d->cvInFlight.notify_one();
+    s_vtb_polled.fetch_add(1, std::memory_order_relaxed);
     if (outPixbuf) *outPixbuf = f.pb;
     if (outPtsUs)  *outPtsUs  = f.ptsUs;
     if (outFlags)  *outFlags  = f.flags;
     return 1;
+}
+
+// Returns the current depth of unconsumed frames (ready in outQ + in-flight).
+int macapk_vtb_queue_depth(void* h) {
+    VtDecoder* d = (VtDecoder*)h;
+    if (!d) return 0;
+    std::lock_guard<std::mutex> lk(d->mu);
+    return (int)d->outQ.size() + d->inFlight.load(std::memory_order_relaxed);
 }
 
 // releaseOutputBuffer(index, render=true): hand the frame to the screen.
@@ -948,6 +1345,7 @@ int macapk_vtb_poll(void* h, void** outPixbuf, int64_t* outPtsUs, int* outFlags)
 // file header for why nothing is reimplemented here.
 void macapk_vtb_render_frame(void* pixbuf, int width, int height) {
     if (!pixbuf) return;
+    s_vtb_rendered.fetch_add(1, std::memory_order_relaxed);
     CocoaPresentVideoFrame(pixbuf, width, height);
 }
 
@@ -957,7 +1355,18 @@ void macapk_vtb_render_frame(void* pixbuf, int width, int height) {
 // AOSP's "if you don't render the buffer... call ... with render set to
 // false to simply return the buffer to the codec" contract.
 void macapk_vtb_release_frame(void* pixbuf) {
-    if (pixbuf) CFRelease((CVPixelBufferRef)pixbuf);
+    if (pixbuf) {
+        CFRelease((CVPixelBufferRef)pixbuf);
+        int64_t rel = s_vtb_released.fetch_add(1, std::memory_order_relaxed) + 1;
+        int64_t ret = s_vtb_retained.load(std::memory_order_relaxed);
+        if (rel % 60 == 0) {
+            std::fprintf(stderr,
+                "[vtb-stat] retained=%lld released=%lld live=%lld polled=%lld rendered=%lld\n",
+                (long long)ret, (long long)rel, (long long)(ret - rel),
+                (long long)s_vtb_polled.load(std::memory_order_relaxed),
+                (long long)s_vtb_rendered.load(std::memory_order_relaxed));
+        }
+    }
 }
 
 // Best-effort raw-pixel readout for the no-Surface decode path (MediaCodec.
@@ -997,12 +1406,20 @@ void macapk_vtb_flush(void* h) {
     VtDecoder* d = (VtDecoder*)h;
     if (!d) return;
     d->generation.fetch_add(1, std::memory_order_relaxed);
-    if (d->session) VTDecompressionSessionFinishDelayedFrames(d->session);
+    if (d->session) {
+        VTDecompressionSessionFinishDelayedFrames(d->session);
+        VTDecompressionSessionWaitForAsynchronousFrames(d->session);
+    }
     std::lock_guard<std::mutex> lk(d->mu);
+    d->inFlight.store(0, std::memory_order_relaxed);
     while (!d->outQ.empty()) {
-        if (d->outQ.front().pb) CFRelease(d->outQ.front().pb);
+        if (d->outQ.front().pb) {
+            CFRelease(d->outQ.front().pb);
+            s_vtb_released.fetch_add(1, std::memory_order_relaxed);
+        }
         d->outQ.pop_front();
     }
+    d->cvInFlight.notify_all();
 }
 
 void macapk_vtb_close(void* h) {
@@ -1017,7 +1434,10 @@ void macapk_vtb_close(void* h) {
     {
         std::lock_guard<std::mutex> lk(d->mu);
         while (!d->outQ.empty()) {
-            if (d->outQ.front().pb) CFRelease(d->outQ.front().pb);
+            if (d->outQ.front().pb) {
+                CFRelease(d->outQ.front().pb);
+                s_vtb_released.fetch_add(1, std::memory_order_relaxed);
+            }
             d->outQ.pop_front();
         }
     }
@@ -1221,9 +1641,20 @@ jlongArray Java_com_macapk_loader_NativeMedia_nativeVidPoll(JNIEnv* env, jclass,
     return arr;
 }
 
+jint Java_com_macapk_loader_NativeMedia_nativeVidQueueDepth(JNIEnv*, jclass, jlong h) {
+    return (jint)macapk_vtb_queue_depth((void*)(uintptr_t)h);
+}
+
 void Java_com_macapk_loader_NativeMedia_nativeVidRender(JNIEnv*, jclass, jlong pixbuf,
                                                          jint width, jint height) {
     macapk_vtb_render_frame((void*)(uintptr_t)pixbuf, width, height);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidRenderToSurface(JNIEnv*, jclass, jlong pixbuf,
+                                                                jint width, jint height, jobject target) {
+    if (!pixbuf) return;
+    s_vtb_rendered.fetch_add(1, std::memory_order_relaxed);
+    CocoaPresentVideoFrameToSurface((void*)(uintptr_t)pixbuf, width, height, target);
 }
 
 void Java_com_macapk_loader_NativeMedia_nativeVidReleaseFrame(JNIEnv*, jclass, jlong pixbuf) {
@@ -1274,8 +1705,12 @@ static const JNINativeMethod kNativeVideoMethods[] = {
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidDecode},
     {(char*)"nativeVidPoll",             (char*)"(J)[J",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidPoll},
+    {(char*)"nativeVidQueueDepth",       (char*)"(J)I",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidQueueDepth},
     {(char*)"nativeVidRender",           (char*)"(JII)V",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidRender},
+    {(char*)"nativeVidRenderToSurface",  (char*)"(JIILandroid/graphics/SurfaceTexture;)V",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidRenderToSurface},
     {(char*)"nativeVidReleaseFrame",     (char*)"(J)V",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidReleaseFrame},
     {(char*)"nativeVidFrameBgra",        (char*)"(J[B[I)I",

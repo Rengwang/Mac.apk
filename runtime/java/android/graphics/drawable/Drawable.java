@@ -161,12 +161,65 @@ public abstract class Drawable {
      *  See docs/canvas-ab-analyst-report-b_2026-08-02.md item 5. */
     public ConstantState getConstantState()            { return new MacapkSelfConstantState(this); }
 
-    /** Minimal AOSP-shaped ConstantState over an existing drawable. */
-    static final class MacapkSelfConstantState extends ConstantState {
+    /**
+     * The base ConstantState, shaped as a {@link DrawableContainer.DrawableContainerState}
+     * with NO children.
+     *
+     * The TYPE is load-bearing, not tidiness. AOSP's base answer is null, but
+     * callers dereference it without a null check (see above), so we answer a
+     * real state -- and app code then downcasts that state to the container
+     * state, because on a device every non-null ConstantState that a skinning
+     * framework sees is one:
+     *
+     *     com.bilibili.magicasakura.utils.ThemeUtils.containsNinePatch(BL:28)
+     *         DrawableContainerState s =
+     *             (DrawableContainerState) drawable.getConstantState();
+     *         for (Drawable child : s.getChildren()) { ... }
+     *
+     * MEASURED (Bilibili 9.16.1, logs 2026-10-26/27): that cast threw
+     * `MacapkSelfConstantState cannot be cast to DrawableContainerState`
+     * 21 times in one run, on the PromoToast -> TintTextView.setBackgroundResource
+     * -> MagicSakura skinning path, i.e. any app whose skin framework inspects
+     * a background before tinting it.
+     *
+     * Being a container state with ZERO children is the AOSP-correct answer for
+     * a leaf drawable: it has no children to walk, no padding to fold, no
+     * opacity to resolve. Real containers are unaffected -- DrawableContainer
+     * and StateListDrawable override getConstantState() with their own state
+     * over their real children.
+     *
+     * This is safe to make unconditional (there is no gate): before the change
+     * the cast ALWAYS threw, so every caller that reaches this state today was
+     * either null-checking it, catching the throw, or crashing.
+     */
+    static final class MacapkSelfConstantState
+            extends DrawableContainer.DrawableContainerState {
         private final Drawable d;
-        MacapkSelfConstantState(Drawable d) { this.d = d; }
+        MacapkSelfConstantState(Drawable d) {
+            super(new MacapkLeafChildSource(d));
+            this.d = d;
+        }
         @Override public Drawable newDrawable() { return d; }
-        @Override public int getChangingConfigurations() { return 0; }
+        /** AOSP stamps every ConstantState from the drawable's own
+         *  getChangingConfigurations() (Drawable.java:955-993). This answered a
+         *  hard 0, so `DRW.cs.chgcfgPropagatesToState` (a drawable with 0x200 set
+         *  before getConstantState) read 0 out of the state. */
+        @Override public int getChangingConfigurations() { return d.getChangingConfigurations(); }
+    }
+
+    /** The child list of a LEAF drawable: empty, and not appendable. AOSP's
+     *  non-container drawables have no children, so a walk over this state finds
+     *  none -- which is what makes containsNinePatch(this) answer false instead
+     *  of throwing, exactly like a device. {@code addChild} refuses (-1) rather
+     *  than mutating anything: a leaf has nothing to add to. */
+    private static final class MacapkLeafChildSource
+            implements DrawableContainer.DrawableContainerState.MacapkChildSource {
+        private final Drawable d;
+        MacapkLeafChildSource(Drawable d) { this.d = d; }
+        @Override public int getChildCount() { return 0; }
+        @Override public Drawable getChild(int index) { return null; }
+        @Override public int addChild(Drawable dr) { return -1; }
+        @Override public Drawable macapkNewDrawable() { return d; }
     }
     public Drawable mutate()                           { return this; }
 

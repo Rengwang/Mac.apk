@@ -94,6 +94,47 @@ public class ImageView extends View {
             }
             ta.recycle();
         } catch (Throwable ignored) {}
+        if (MACAPK_IMAGEVIEW_THEME_TINT) macapkApplyStyledTint(c, a, defStyleAttr, defStyleRes);
+    }
+
+    /** AOSP ImageView.<init> (android14 ImageView.java:213-230):
+     *      if (a.hasValue(R.styleable.ImageView_tint)) {
+     *          mDrawableTintList = a.getColorStateList(R.styleable.ImageView_tint);
+     *          mHasDrawableTint = true;
+     *          // Prior to L, this attribute would always set a color filter with
+     *          // blending mode SRC_ATOP. Preserve that default behavior.
+     *          mDrawableBlendMode = BlendMode.SRC_ATOP; mHasDrawableBlendMode = true;
+     *      }
+     *  obtainStyledAttributes answers from the view's XML, its style, the
+     *  default style AND, last, the THEME -- so a theme item
+     *  `<item name="android:tint">?iconTint</item>` tints every ImageView that
+     *  does not say otherwise. NoNonsense Notes' ThemeNnnLight does exactly
+     *  that (iconTint = black_alpha85) over white-filled vector icons; we read
+     *  android:tint only from the XML attribute (LayoutInflater's "tint" case),
+     *  so its settings icons drew white on the light grey list -- previously
+     *  hidden by VectorDrawable's white-to-#333 stand-in. Read here, only when
+     *  the attribute resolves, so an untinted ImageView is untouched; the
+     *  inflater's direct XML case still runs afterwards and wins.
+     *  MACAPK_IMAGEVIEW_THEME_TINT=0 restores the XML-only read. */
+    static final boolean MACAPK_IMAGEVIEW_THEME_TINT =
+        !"0".equals(System.getenv("MACAPK_IMAGEVIEW_THEME_TINT"));
+    private void macapkApplyStyledTint(Context c, android.util.AttributeSet a,
+                                       int defStyleAttr, int defStyleRes) {
+        try {
+            android.content.res.TypedArray ta = c.obtainStyledAttributes(
+                a, new int[]{0x01010121 /* android.R.attr.tint */}, defStyleAttr, defStyleRes);
+            try {
+                if (ta.hasValue(0)) {
+                    android.content.res.ColorStateList csl = ta.getColorStateList(0);
+                    if (csl != null) {
+                        setImageTintList(csl);
+                        setImageTintMode(android.graphics.PorterDuff.Mode.SRC_ATOP);
+                    }
+                }
+            } finally {
+                ta.recycle();
+            }
+        } catch (Throwable ignored) {}
     }
 
     public void setImageBitmap(android.graphics.Bitmap b) {
@@ -453,6 +494,8 @@ public class ImageView extends View {
     public void setColorFilter(int color) { /* tint not wired through Canvas yet */ }
     public void clearColorFilter() { this.colorFilter = null; }
 
+    private boolean tracedNull;
+
     @Override
     protected void onDraw(android.graphics.Canvas canvas) {
         if (canvas == null) return;
@@ -464,6 +507,30 @@ public class ImageView extends View {
             return;
         }
         android.graphics.Bitmap b = this.bitmap;
+        // DIAGNOSTIC (2026-10-28): an ImageView with NO drawable draws nothing
+        // and used to log nothing either, which is exactly the shape of "the
+        // slot is laid out but the icon never appears". MACAPK_TRACE_IMAGEVIEW_DRAW=2
+        // reports these too, with the parent chain, so a blank icon is
+        // attributable instead of invisible.
+        if ("2".equals(ENV_MACAPK_TRACE_IMAGEVIEW_DRAW) && drawable == null && !tracedNull) {
+            tracedNull = true;
+            try {
+                String chain = "";
+                android.view.ViewParent pv0 = getParent();
+                int cd = 0;
+                while (pv0 != null && cd < 5) {
+                    chain += "<" + pv0.getClass().getSimpleName();
+                    if (pv0 instanceof android.view.View) pv0 = ((android.view.View) pv0).getParent();
+                    else break;
+                    cd++;
+                }
+                com.macapk.loader.NativeLog.i("ImageView",
+                    "NODRAW " + getClass().getSimpleName()
+                    + "@" + Integer.toHexString(System.identityHashCode(this))
+                    + " bounds=[" + getLeft() + "," + getTop() + "-" + getRight() + "," + getBottom() + "]"
+                    + " vis=" + getVisibility() + " parents=" + chain);
+            } catch (Throwable ignored) {}
+        }
         if (b == null) {
             // v1.0.99: fall back to drawable.draw() for non-bitmap
             // drawables (VectorDrawable, RippleDrawable wrapping a

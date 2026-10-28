@@ -369,6 +369,11 @@ public final class NativeCocoa {
      *  nowhere -- an invisible, permanent, un-dismissable modal block.
      *  Same read-only, read-during-the-call contract as presentBitmap. */
     public static native void presentOverlayBitmap(int[] argb, int width, int height);
+    /** Fast native conversion from direct OpenGL RGBA pbuffer to ARGB int[] with vertical flip. */
+    public static native boolean convertGlPbufferToArgb(java.nio.ByteBuffer rgbaDirect, int[] argb, int width, int height);
+    public static native boolean convertVideoArgbToRgba(int[] argb, java.nio.ByteBuffer rgbaDirect,
+                                                       int width, int height, int stride, boolean premultiply);
+
     /** Hide/clear the GL overlay layer once WindowOverlayStack goes back to
      *  empty, so the last-rendered dialog frame does not stick on screen. */
     public static native void clearOverlayBitmap();

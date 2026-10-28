@@ -1881,7 +1881,20 @@ public final class TouchDispatcher {
         if (android.os.Looper.macapkIsActivityThread()) return false; // already on loop
         if (active == null) return false;
         View root = active.macapkContentView();
-        return root != null && !hostInputTree(root);   // UI-thread input unless OS-main renders
+        // An activity with NO content yet is one being created right now: the
+        // launch pushed it (ActivityHost.performLaunch) and its onCreate is
+        // running, or about to, on the loop. Its input belongs on the loop too
+        // -- AOSP binds a window's input receiver to its own looper, and nothing
+        // reaches a window before it exists -- so it must queue behind onCreate,
+        // not run beside it. Delivering it directly ran the app's key handling on
+        // the host thread INSIDE another thread's onCreate: the Enter release
+        // that follows a search submit reached NoNonsense Notes' ActivitySearch
+        // mid-create, AppCompat attached its delegate from the wrong thread, and
+        // onCreate threw "AppCompat has already installed itself into the
+        // Window" (or lost android.R.id.content), leaving the search screen
+        // blank. The OS-main exception (hostInputTree) needs a tree to name.
+        if (root == null) return true;
+        return !hostInputTree(root);   // UI-thread input unless OS-main renders
     }
 
     /** MACAPK_INPUT_UI_THREAD (default ON, 2026-09-30): which content trees
@@ -2821,8 +2834,113 @@ public final class TouchDispatcher {
         float scale = macapkBackingScale();
         float px = x * scale;
         float py = (viewH - y) * scale;  // Y-flip: Cocoa origin bottom -> Android origin top
+        // MacApkCompat (docs/03 task two, P0): DESKTOP TOUCH SLOP. A mouse press
+        // is never perfectly still -- AppKit reports the 1-2 px the hand moves
+        // while the button is held. Every one of those becomes an ACTION_MOVE
+        // here, and a widget that starts a gesture on ANY move consumes the
+        // stream: HorizontalScrollView.onInterceptTouchEvent returns true as
+        // soon as |dx| > its slop, the child's pressed state is cancelled and
+        // the ACTION_UP never reaches the child's OnClickListener. That is the
+        // measured shape of "the top Tab row does not respond to clicks on a
+        // Mac" (Bilibili's SecondaryPagerSlidingTabStrip / HomePagerSlidingTabStrip
+        // are both HorizontalScrollViews).
+        //
+        // Android's own answer is ViewConfiguration.getScaledTouchSlop()
+        // = 8dp x density, which is 16 SURFACE px here (the runtime reports
+        // 320dpi, density 2). We apply the same threshold to the whole stream
+        // BEFORE the view tree sees it, so it holds for framework widgets AND
+        // for app-side scrollers (androidx ViewPager's own slop is 8dp too, so
+        // the two agree instead of the framework one firing at 8 raw pixels).
+        //
+        // A dropped MOVE is simply not delivered: a tap therefore stays a tap
+        // (DOWN at the press point, UP a couple of px away, no MOVE in
+        // between), and a real drag starts at the first MOVE past the slop --
+        // the accumulated delta arrives in that one event, exactly as it does
+        // on a device when the finger moves fast.
+        if (macapkDropSlopMove(active, action, px, py)) {
+            slopTrace("touch-slop: withheld a sub-" + TOUCH_SLOP_DP
+                    + "dp MOVE at (" + px + "," + py + ")");
+            return;
+        }
         dispatchSurfaceTouch(active, action, px, py,
                 Math.round(viewW * scale), Math.round(viewH * scale), logThis);
+    }
+
+    // ---- desktop touch-slop filter (docs/03 task two) -------------------------
+    // Default ON; MACAPK_TOUCH_SLOP=0 restores the pre-change path (every MOVE
+    // delivered) for a one-binary bisect. MACAPK_TOUCH_SLOP_TRACE=1 logs what it
+    // withholds (capped): a normal click here produces zero log lines, because
+    // one line per click would drown the dispatch trace it is meant to explain.
+    static final boolean TOUCH_SLOP = !"0".equals(System.getenv("MACAPK_TOUCH_SLOP"));
+    private static final boolean SLOP_TRACE =
+        "1".equals(System.getenv("MACAPK_TOUCH_SLOP_TRACE"));
+    private static int sSlopTraceLines;
+    private static void slopTrace(String msg) {
+        if (!SLOP_TRACE || sSlopTraceLines >= 40) return;
+        sSlopTraceLines++;
+        NativeLog.i(TAG, msg + (sSlopTraceLines == 40 ? " (trace cap reached)" : ""));
+    }
+    /** 8dp, ViewConfiguration's TOUCH_SLOP / config_viewConfigurationTouchSlop. */
+    private static final float TOUCH_SLOP_DP = 8.0f;
+    /** Press point of the current stream, in SURFACE px. */
+    private float slopDownX, slopDownY;
+    /** Set once the pointer has moved past the slop: from then on every MOVE of
+     *  this stream is delivered verbatim. */
+    private boolean slopDragging;
+    private int slopDropped;
+
+    /** Should this event be WITHHELD from the view tree as hand jitter?
+     *
+     *  Only ACTION_MOVE before the first slop-exceeding move of a stream can be
+     *  dropped. DOWN always passes (it anchors the stream), UP/CANCEL always
+     *  pass (a tap must complete), and the multi-pointer actions
+     *  (POINTER_DOWN/UP, move with more than one pointer) are left to the widgets
+     *  -- pinch/rotate streams are real gestures, not jitter.
+     *
+     *  A dropped MOVE is not lost information: the view tree's next MOVE carries
+     *  the absolute position, so the delta a scroller sees is measured from the
+     *  DOWN/previous-delivered point exactly as AOSP's own
+     *  ViewGroup.onInterceptTouchEvent interprets it. */
+    private boolean macapkDropSlopMove(Activity active, int action, float px, float py) {
+        if (!TOUCH_SLOP) return false;
+        if (action == MotionEvent.ACTION_DOWN) {
+            slopDownX = px;
+            slopDownY = py;
+            slopDragging = false;
+            slopDropped = 0;
+            return false;
+        }
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            if (slopDropped > 0) {
+                slopTrace("touch-slop: tap completed after withholding "
+                        + slopDropped + " jitter MOVE(s)");
+            }
+            slopDragging = false;
+            slopDropped = 0;
+            return false;
+        }
+        if (action != MotionEvent.ACTION_MOVE || slopDragging) return false;
+        final float slopPx = TOUCH_SLOP_DP * macapkDensity(active);
+        final float dx = px - slopDownX, dy = py - slopDownY;
+        if (dx * dx + dy * dy < slopPx * slopPx) {
+            slopDropped++;
+            return true;
+        }
+        slopDragging = true;
+        return false;
+    }
+
+    /** Android's density (dp -> px) for the top activity, with the runtime's
+     *  own 320dpi default (density 2) when no Resources are reachable yet.
+     *  NOT macapkBackingScale: that is the Cocoa backing scale, which only
+     *  coincides with the Android density on the retina default. */
+    private static float macapkDensity(Activity active) {
+        try {
+            android.util.DisplayMetrics dm = (active != null)
+                    ? active.getResources().getDisplayMetrics() : null;
+            if (dm != null && dm.density > 0f) return dm.density;
+        } catch (Throwable ignored) { }
+        return 2.0f;
     }
 
     /** Everything a host mouse event does once it is in SURFACE pixels

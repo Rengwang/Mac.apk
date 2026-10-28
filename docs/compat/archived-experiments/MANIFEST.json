@@ -1,0 +1,35 @@
+{
+  "base_commit": "b2af6ed167de26ad876e7bed26abbba414e1c572",
+  "source_tree": "macapk-codex-audit",
+  "comparison_tree": "macapk-safe",
+  "date": "2026-10-28",
+  "patches": {
+    "0001-async-owner-only-frame-scheduling.patch": "de8ae9aba45e703ce30596f9917b476aec3fab65b5ab88576ef942d015d69a35",
+    "0002-p0-direct-egl-surface-experiment.patch": "2ed604a9bd8851f5e9df34055af70e352cf81f3f6eb971800ee80772d2c60adf",
+    "0003-heartbeat-throttle-and-diagnostics-experiment.patch": "605b2f14aaede7e046b90702a5787061906d19d052a38a5f0d2c5c15d130abb6",
+    "0004-limit-local-build-parallelism.patch": "60bbb92390f607deec663ce0d2e8ee74a2239bb0a09588ba7b51b826bd248a46"
+  },
+  "archived_audit_files": {
+    "runtime/java/android/os/Handler.java": "ce1fa27e8cf2bb766c600372469db1dc1b7a2495ceadbe3a3c60df5d0b6a5d3b",
+    "runtime/java/android/os/MessageQueue.java": "3e80227d374dbc3f7604ca25dd001a322a68518d00ccc17c96e605c9b9e89b90",
+    "runtime/java/android/view/SurfaceView.java": "b89ddc7fe6f74b3d670f36c34ce27f93799dbeee16197532a665723c0bbbc1b3",
+    "runtime/java/com/macapk/loader/ThreadCpuTrace.java": "567aa5fe90e83495b8eba292b4ba5073abbbcc53ba62d7badd1660020f4fe90c",
+    "runtime/java/com/macapk/loader/ViewCanvasDriver.java": "50ecfa4d77b09826ea0717d251a51e1882d377de2897cb8a28ef958d35497d86",
+    "runtime/java/javax/microedition/khronos/egl/MacApkEGL10.java": "280756fbdf4a4d379389763dc43a1090514ae4480f839895f42198e42d7be999",
+    "runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java": "92a02b0d00734d3ddd4a690627b84670a505a3568d92fc461dd40237390b1a4e",
+    "runtime/scripts/build.sh": "0743ddadd2dbc1f9b45ec89e70d32d20f231cca2fa0cdedd1beea3d59fbcf20b",
+    "runtime/src/angle_glue.cpp": "bb5d943baf4d3e17f4227332f0477fdc0e7342cc7de72d2a14eaf0faafd29c6f",
+    "runtime/src/cocoa_bridge.mm": "5109c22d37a1972f548186b110665e4a91cb01080c825e08345a6002d15739ef"
+  },
+  "comparison_safe_files": {
+    "runtime/java/android/os/Handler.java": "fc0a06858dca208f2b1cadee7414c77834518fbca8b55369f0f7093011c4b1da",
+    "runtime/java/android/os/MessageQueue.java": "b83a56c01dc9ca821c06278582fa7528ca9ad95516676671f39f64db146d92fe",
+    "runtime/java/android/view/SurfaceView.java": "6b2c84f391407b3d046ae0d5809934a3e98449949fdd689967c7a3cda9c426dc",
+    "runtime/java/com/macapk/loader/ViewCanvasDriver.java": "cfe04979424d73a1837d70773d43df694fc6a4dc2af4d0c7e2a45874ff80161b",
+    "runtime/java/javax/microedition/khronos/egl/MacApkEGL10.java": "409558cff50d10e99c98bb63d7adcb682a733e45ccca0060affc05774adc220a",
+    "runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java": "13424fa977c827b198206a307d1350c1260943b4ce95628cf5a739ead07d2cc6",
+    "runtime/scripts/build.sh": "d61b3f6525cc48c80e9b102beb466ff384c1a669a557c15371c658f86629be6d",
+    "runtime/src/angle_glue.cpp": "c8133be59ce31eab2107e50313e20f3ac8c7747366258871f211e938e2cdda8c",
+    "runtime/src/cocoa_bridge.mm": "05b27163094c6bfd50505fe48a2e0006e01f2f2f6b23288179ba44fdbdb2125d"
+  }
+}

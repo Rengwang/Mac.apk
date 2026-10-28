@@ -1,0 +1,6 @@
+0001-async-owner-only-frame-scheduling.patch: git apply --check and apply PASS
+0002-p0-direct-egl-surface-experiment.patch: git apply --check and apply PASS
+0003-heartbeat-throttle-and-diagnostics-experiment.patch: git apply --check and apply PASS
+0004-limit-local-build-parallelism.patch: git apply --check and apply PASS
+Combined reconstructed selected files match macapk-codex-audit byte-for-byte.
+No build, runtime or UI validation was performed by this archival pass.

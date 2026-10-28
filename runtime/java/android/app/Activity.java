@@ -193,7 +193,29 @@ public class Activity extends ContextThemeWrapper
     public void macapkAttach(Application app, Intent launchIntent) {
         this.application = app;
         this.intent = launchIntent;
-        attachBaseContext(app);
+        // MacApkCompat: a wrapper Application (Tinker/AppCompat-style) may
+        // override getResources() and return null even though the underlying
+        // Application.resources field is valid. AOSP's Activity would still see
+        // the ContextImpl (base context) resources; use that fallback here.
+        Context macapkBase = app;
+        android.content.res.Resources macapkRes =
+            (app != null) ? app.getResources() : null;
+        if (macapkRes == null && app != null) {
+            Context b = app.getBaseContext();
+            if (b != null) {
+                android.content.res.Resources br = b.getResources();
+                if (br != null) {
+                    macapkBase = b;
+                    macapkRes = br;
+                }
+            }
+        }
+        Context macapkAttachCtx = macapkBase;
+        if (macapkRes != null) {
+            macapkAttachCtx = new MacApkAttachContext(macapkBase, macapkRes,
+                                                      macapkRes.getAssets());
+        }
+        attachBaseContext(macapkAttachCtx);
         // AOSP Activity.attach(): `mCurrentConfig = config;` -- the configuration
         // this instance launches with, which every later configuration change is
         // diffed against (ActivityThread.performActivityConfigurationChanged).
@@ -201,7 +223,7 @@ public class Activity extends ContextThemeWrapper
         // Activity, so the live Resources config cannot serve as that baseline:
         // it has already moved by the time an activity is told. A snapshot can.
         try {
-            android.content.res.Resources r = (app != null) ? app.getResources() : null;
+            android.content.res.Resources r = macapkRes;
             Configuration c = (r != null) ? r.getConfiguration() : null;
             if (c != null) {
                 mCurrentConfig = new Configuration(c);
@@ -265,7 +287,13 @@ public class Activity extends ContextThemeWrapper
     // returns false they immediately finish() before calling
     // System.loadLibrary, which prevents the app's main native blob
     // from ever loading.
-    public boolean isTaskRoot()       { return true; }
+    private boolean macapkTaskRoot = true;
+    /** ActivityHost tells each launch whether it is the bottom of the task
+     *  (initial/root) or was started on top of another activity. Returning
+     *  true unconditionally made every BaseActivity.onCreate take the
+     *  "spurious launcher relaunch" path and finish() detail pages. */
+    public boolean isTaskRoot()       { return macapkTaskRoot; }
+    public void macapkSetTaskRoot(boolean root) { macapkTaskRoot = root; }
     /** AOSP: `return mParent != null` -- true only for an Activity embedded in
      *  a (long-deprecated) ActivityGroup. Nothing in Mac.apk ever constructs an
      *  embedded child activity, so mParent is structurally always null and
@@ -5335,4 +5363,22 @@ public class Activity extends ContextThemeWrapper
      *  @deprecated matches AOSP. */
     @Deprecated
     public void onVisibleBehindCanceled() { }
+    /** Context handed to AppCompat/Activity.attachBaseContext: pins the
+     *  Resources we resolved so a Tinker-style getResources() override that is
+     *  stateful (first call returns resources, later calls return the fence's
+     *  null) cannot make AppCompat NPE inside attachBaseContext2. */
+    private static final class MacApkAttachContext
+            extends android.view.ContextThemeWrapper {
+        private final android.content.res.Resources res;
+        private final android.content.res.AssetManager assets;
+        MacApkAttachContext(Context base, android.content.res.Resources res,
+                            android.content.res.AssetManager assets) {
+            super(base, 0);
+            this.res = res;
+            this.assets = assets;
+        }
+        @Override public android.content.res.Resources getResources() { return res; }
+        @Override public android.content.res.AssetManager getAssets() { return assets; }
+    }
+
 }

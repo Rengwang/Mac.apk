@@ -264,13 +264,45 @@ public final class ViewTextDump {
         catch (Throwable ignored) { }
         try { drg = v.macapkHasOnDragListener() || overrides(v.getClass(), "onDragEvent", android.view.DragEvent.class); }
         catch (Throwable ignored) { }
+        // draw=/uni= : DIAGNOSTIC for "the slot is there but nothing is painted".
+        //
+        // An icon that occupies its bounds and draws NOTHING is invisible to
+        // every field this dump already has: clk/tch prove the view is live,
+        // b= proves it is laid out, and src=/text= just say where the content
+        // came from. Two shapes cover essentially every real case:
+        //   draw=<DrawableClass> iw x ih   -- an ImageView whose drawable is
+        //       null or has no intrinsic size (an inflated-empty vector /
+        //       animated-vector: AnimatedVectorDrawable.draw() returns
+        //       immediately when its inner vector is null);
+        //   uni=U+E6xx                    -- a TextView whose "icon" is a PRIVATE
+        //       USE AREA glyph from an icon font. It measures like text, so the
+        //       slot is right, but if the typeface did not actually load the
+        //       glyph rasterises to nothing.
+        String drawInfo = "";
+        try {
+            if (v instanceof android.widget.ImageView) {
+                android.graphics.drawable.Drawable d = ((android.widget.ImageView) v).getDrawable();
+                if (d == null) drawInfo = " draw=null";
+                else drawInfo = " draw=" + className(d) + " iw=" + d.getIntrinsicWidth()
+                              + "x" + d.getIntrinsicHeight();
+            }
+        } catch (Throwable ignored) { }
+        if (drawInfo.isEmpty() && text != null && text.length() > 0) {
+            char c0 = text.charAt(0);
+            if (c0 >= 0xE000 && c0 <= 0xF8FF) {     // Private Use Area
+                StringBuilder u = new StringBuilder(" uni=");
+                for (int i = 0; i < text.length() && i < 4; i++)
+                    u.append(String.format(java.util.Locale.US, "U+%04X ", (int) text.charAt(i)));
+                drawInfo = u.toString().trim();
+            }
+        }
         count[0]++;
         out.accept("NODE seq=" + seq + " win=" + win + " d=" + depth + " b=" + box(vis)
                 + " clk=" + (clk ? 1 : 0) + " lclk=" + (lclk ? 1 : 0) + " edit=" + (edit ? 1 : 0)
                 + " web=" + (web ? 1 : 0) + " prov=" + (prov != null ? 1 : 0)
                 + " tch=" + (tch ? 1 : 0) + " drg=" + (drg ? 1 : 0)
                 + " src=" + src + " cls=" + className(v) + "@" + hex(v) + " wcls=" + widgetClass(v)
-                + " desc=" + json(desc) + " text=" + json(text));
+                + " desc=" + json(desc) + " text=" + json(text) + drawInfo);
         if (prov != null) {
             try { walkProvider(prov, v, abs, vis, depth + 1, win, seq, out, count); }
             catch (Throwable t) { out.accept("VERROR seq=" + seq + " host=" + hex(v) + " " + oneLine(String.valueOf(t))); }

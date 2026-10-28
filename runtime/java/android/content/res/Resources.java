@@ -584,6 +584,34 @@ public class Resources {
         return null;
     }
 
+    /** ResourceIndex.macapkFileValueOf, resolved once (same reasoning as
+     *  macapkTypeNameMethod: the index class never changes for the life of
+     *  the process, and a getMethod per getValue call is pure overhead on a
+     *  path every drawable load runs through). */
+    private static volatile java.lang.reflect.Method macapkFileValueMethod;
+    /** APK path -> AssetManager cookie. One entry per installed member, so a
+     *  linear canonical-path scan happens once per APK, not per lookup. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Integer>
+        macapkCookiesByApk = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** The AssetManager cookie of the APK a file row came from, or 0 ("any",
+     *  the reverse-order search) when the index and the mount disagree -- the
+     *  text-fallback ingest has no member list, and a cookie of 0 keeps the
+     *  historic behaviour instead of pointing at the wrong APK. */
+    private int macapkCookieForApk(String apkPath) {
+        if (apkPath == null) return 0;
+        Integer c = macapkCookiesByApk.get(apkPath);
+        if (c == null) {
+            AssetManager am = assets;
+            c = (am != null) ? am.macapkCookieOfApk(apkPath) : 0;
+            // An AssetManager can mount an APK later. Do not cache a miss,
+            // and never share cookies with another Resources/AssetManager:
+            // their mount order and therefore their cookie numbers can differ.
+            if (c != 0) macapkCookiesByApk.put(apkPath, c);
+        }
+        return c;
+    }
+
     /** v1.0.95: AOSP Resources.getValue(int, TypedValue, boolean). Looks
      *  up `id` and fills `outValue` with a resolved TypedValue.
      *  resolveRefs=true means follow @ref/foo references; we ignore
@@ -598,6 +626,8 @@ public class Resources {
      *  null-default path, which is fine for our stub. */
     public void getValue(int id, android.util.TypedValue outValue, boolean resolveRefs) {
         if (outValue == null) return;
+        outValue.assetCookie = 0;
+        outValue.density = 0;
         outValue.resourceId = id;
         // A <color> VALUE resource must report a COLOR_INT type. aapt2 stores
         // `<color name="x">#ff1b1b1b</color>` in the resource table as a colour
@@ -680,6 +710,46 @@ public class Resources {
                     return;
                 }
             }
+        }
+        // File-backed entries retain their real string-pool index and the
+        // cookie of the APK that owns the file. Both are load-bearing:
+        //
+        //  - AppCompat's ResourceManagerInternal caches drawable delegates by
+        //    (assetCookie << 32) | data. Answering 0/0 for every file made all
+        //    of an app's icons collide onto the first cached drawable.
+        //  - The cookie is ALSO an input: magicasakura (Bilibili, and the skin
+        //    frameworks of several other Chinese apps) reads a selector with
+        //      XmlResourceParser p = am.openXmlResourceParser(tv.assetCookie, tv.string);
+        //    A cookie that does not name the APK holding `res/color/x.xml`
+        //    makes that call answer null and the caller NPE, which aborts the
+        //    fragment building the home page and leaves the splash up.
+        //
+        // The cookie must therefore be the AssetManager's own 1-based mount
+        // index (AOSP ApkAssetsCookieToJavaCookie), NOT a ResourceIndex member
+        // number: the AssetManager prepends framework-res, so member 0 is
+        // cookie 2, and reusing the member number pointed every app resource at
+        // the platform APK. macapkCookieOfApk maps one to the other.
+        //
+        // resourceId stays the QUERIED id. A resource reference chain is
+        // followed to pick the file, but AOSP reports the entry the caller
+        // asked for, and callers here use resourceId as an id to look up again.
+        if (resolveRefs && id != 0 && macapkResourceIndex != null) {
+            try {
+                java.lang.reflect.Method m = macapkFileValueMethod;
+                if (m == null) {
+                    m = macapkResourceIndex.getClass().getMethod("macapkFileValueOf", int.class);
+                    macapkFileValueMethod = m;
+                }
+                Object[] file = (Object[]) m.invoke(macapkResourceIndex, id);
+                if (file != null) {
+                    outValue.type = android.util.TypedValue.TYPE_STRING;
+                    outValue.assetCookie = macapkCookieForApk((String) file[0]);
+                    outValue.data = (Integer) file[1];
+                    outValue.string = (String) file[2];
+                    outValue.resourceId = id;
+                    return;
+                }
+            } catch (ReflectiveOperationException ignored) { }
         }
         // FRAMEWORK colour ids (package 0x01). The block below only ever fires
         // for APP ids: macapkTypeNameOf reads ResourceIndex.idToTypeName, which
@@ -1860,7 +1930,13 @@ public class Resources {
         catch (NumberFormatException nfe) { return null; }
         if (id == 0) return null;
         String[] tn = macapkTypeNameOf(id);
-        if (tn == null || tn.length < 2 || !"attr".equals(tn[0])
+        // "^attr-private" is a PRIVATE platform attribute (0x0112....): the
+        // platform themes bind it by name like any public one (ResourceIndex
+        // .macapkStyleItemKey), e.g. popup_background_material's
+        // ?attr/colorPopupBackground.
+        if (tn == null || tn.length < 2
+                || !("attr".equals(tn[0])
+                     || ((id >>> 24) == 0x01 && "^attr-private".equals(tn[0])))
                 || tn[1] == null || tn[1].isEmpty()) return null;
         return ((id >>> 24) == 0x01 ? "?android:" : "?") + tn[1];
     }
@@ -2060,6 +2136,11 @@ public class Resources {
             // android:color. A root <color> is how a solid-colour drawable
             // resource is spelled.
             case "color":           return macapkInflateColorDrawable(e, theme);
+            case "icon-font": {
+                android.graphics.drawable.Drawable icon = macapkInflateIconFont(e);
+                if (icon != null) return icon;
+                return null;
+            }
             default:
                 // A FULLY-QUALIFIED CLASS NAME is a first-class drawable root on
                 // Android, not an exotic case. AOSP's DrawableInflater tries the
@@ -2087,6 +2168,66 @@ public class Resources {
                 macapkWarnUnhandledDrawableTag(macapkLocalTag(e));
                 return null;
         }
+    }
+
+    // Compatibility for the widely used <icon-font app:code="..."> resource
+    // convention. Only activate when the resource supplies a valid private-use
+    // glyph AND its own APK has assets/iconfont.ttf; never substitute system font.
+    private android.graphics.Typeface macapkIconFontFace;
+    private synchronized android.graphics.Typeface macapkIconFontFace() {
+        if (macapkIconFontFace != null) return macapkIconFontFace;
+        // Compose icon resources and older iconfont libraries can bundle
+        // different faces with identical family names and different codepoints.
+        // Prefer the packaged Compose resource face when present.
+        String[] paths = {"composeResources/srcs.common.iconfont.generated.resources/font/iconfont.ttf", "iconfont.ttf"};
+        for (String path : paths) {
+            try (java.io.InputStream ignored = getAssets().open(path)) {
+                android.graphics.Typeface face = android.graphics.Typeface.createFromAsset(getAssets(), path);
+                if (face != android.graphics.Typeface.DEFAULT) return macapkIconFontFace = face;
+            } catch (Throwable ignored) { }
+        }
+        return null;
+    }
+    private android.graphics.drawable.Drawable macapkInflateIconFont(org.w3c.dom.Element e) {
+        String code = e.getAttributeNS("http://schemas.android.com/apk/res-auto", "code");
+        if (code == null || code.isEmpty()) code = e.getAttribute("app:code");
+        try {
+            int cp = Integer.parseInt(code.replaceFirst("^(0x|0X)", ""), 16);
+            if (!Character.isValidCodePoint(cp) || Character.getType(cp) != Character.PRIVATE_USE)
+                return null;
+            android.graphics.Typeface face = macapkIconFontFace();
+            if (face == null) return null;
+            return new MacapkIconFontDrawable(face, cp, getDisplayMetrics().density);
+        } catch (Throwable ignored) { return null; }
+    }
+
+    private static final class MacapkIconFontDrawable extends android.graphics.drawable.Drawable {
+        private final android.graphics.Paint paint = new android.graphics.Paint(1);
+        private final String glyph;
+        private final int size;
+        private int alpha = 255;
+        MacapkIconFontDrawable(android.graphics.Typeface face, int cp, float density) {
+            glyph = new String(Character.toChars(cp));
+            size = Math.max(1, Math.round(24 * density));
+            paint.setTypeface(face);
+        }
+        @Override public void draw(android.graphics.Canvas canvas) {
+            android.graphics.Rect b = getBounds();
+            if (b.width() <= 0 || b.height() <= 0) return;
+            paint.setTextSize(Math.min(b.width(), b.height()));
+            int color = mTintList != null ? macapkEffectiveTint() : 0xffffffff;
+            paint.setColor(color);
+            paint.setAlpha(((color >>> 24) * alpha + 127) / 255);
+            android.graphics.Paint.FontMetrics fm = paint.getFontMetrics();
+            float x = b.left + (b.width() - paint.measureText(glyph)) / 2f;
+            float y = b.top + (b.height() - fm.ascent - fm.descent) / 2f;
+            canvas.drawText(glyph, x, y, paint);
+        }
+        @Override public void setAlpha(int value) { alpha = Math.max(0, Math.min(255, value)); invalidateSelf(); }
+        @Override public void setColorFilter(android.graphics.ColorFilter filter) { paint.setColorFilter(filter); invalidateSelf(); }
+        @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
+        @Override public int getIntrinsicWidth() { return size; }
+        @Override public int getIntrinsicHeight() { return size; }
     }
 
     /** AOSP's {@code DrawableInflater.inflateFromClass} + the {@code <drawable
@@ -4259,6 +4400,13 @@ public class Resources {
             return out;
         }
         if (v.startsWith("@")) {
+            // A reference already resolved to its numeric form (AOSP's decimal
+            // spelling, or our parser's hex one) is the id itself -- there is
+            // no name to look up. See macapkNumericRefId.
+            final int numericId = macapkNumericRefId(v.substring(1));
+            if (numericId != 0) {
+                try { return getColor(numericId); } catch (Throwable ignored) { }
+            }
             // v1.0.834: route through the ResourceIndex colour-expression
             // resolver FIRST. The old code stripped the package qualifier and
             // asked getIdentifier(name, "color", null) -- the APP's table only
@@ -4281,6 +4429,46 @@ public class Resources {
             return def;
         }
         return def;
+    }
+
+    /** A resource reference that is already in NUMERIC form, read out of an
+     *  AttributeSet/TypedValue string. `body` is the text AFTER the leading '@'.
+     *
+     *  TWO spellings exist and BOTH must answer:
+     *    "@2131104145"  -- AOSP's TypedValue.coerceToString(TYPE_REFERENCE, data)
+     *                      is literally `"@" + data` (TypedValue.java:498-528),
+     *                      so this is what a device hands an app.
+     *    "@0x7f060e34"  -- BinaryXmlParser.refText's fallback for an id its name
+     *                      table cannot name, which is EVERY reference in the
+     *                      DOM AssetManager.openXmlResourceParser builds (that
+     *                      parser has no table). Apps therefore see the hex
+     *                      spelling on Mac.apk where a device shows decimal.
+     *
+     *  Returning 0 means "not a numeric reference". Callers fall through to
+     *  their name-based resolution.
+     *
+     *  MEASURED (Bilibili 9.16.1): res/color/selector_tab_item.xml compiles to
+     *  `android:color="@0x7f060e34"`. TypedArray.getResourceId passed
+     *  "0x7f060e34" to getIdentifier(<name>, "id") -- no such name -- and
+     *  returned the caller's default 0, so the skinning framework resolved no
+     *  colour for ANY row and the top tabs / bottom-bar icons painted
+     *  Color.MAGENTA (#FFFF00FF), AOSP's absent-colour sentinel. */
+    static int macapkNumericRefId(String body) {
+        if (body == null) return 0;
+        body = body.trim();
+        if (body.isEmpty()) return 0;
+        try {
+            if (body.length() > 2 && body.charAt(0) == '0'
+                    && (body.charAt(1) == 'x' || body.charAt(1) == 'X')) {
+                return (int) Long.parseLong(body.substring(2), 16);
+            }
+            for (int i = 0; i < body.length(); i++) {
+                if (!Character.isDigit(body.charAt(i))) return 0;
+            }
+            return (int) Long.parseLong(body);
+        } catch (Throwable notNumeric) {
+            return 0;
+        }
     }
 
     /** Reflective bridge to ResourceIndex.macapkResolveColorExpr -- the single
@@ -4347,10 +4535,35 @@ public class Resources {
             java.lang.reflect.Method m = macapkResourceIndex.getClass()
                 .getMethod("idOfName", String.class, String.class, String.class);
             Object id = m.invoke(macapkResourceIndex, name, type, pkg);
-            if (id instanceof Integer) return (Integer) id;
+            if (id instanceof Integer) {
+                final int rid = (Integer) id;
+                // DIAGNOSTIC (2026-10-28, MACAPK_RESREF_TRACE=1): a
+                // `@drawable/NAME` that resolves to an id whose own type is NOT
+                // drawable is never a legitimate answer -- getDrawable(id) then
+                // takes the colour branch and yields a flat ColorDrawable, so
+                // the icon draws as a blank/solid slot. That is exactly how the
+                // AppCompat up-arrow vanished (see ResourceIndex's
+                // homeAsUpIndicator row). One line per distinct name so a run
+                // stays readable.
+                if ("1".equals(System.getenv("MACAPK_RESREF_TRACE"))
+                        && "drawable".equals(type) && rid != 0 && sResRefSeen.add(name)) {
+                    String[] tn = null;
+                    try { tn = macapkTypeNameOf(rid); } catch (Throwable ignored) { }
+                    com.macapk.loader.NativeLog.i("Resources",
+                        "resref: @drawable/" + name + " -> 0x" + Integer.toHexString(rid)
+                        + " type=" + (tn != null ? tn[0] : "?")
+                        + (tn != null && !"drawable".equals(tn[0])
+                           ? "  <-- NOT A DRAWABLE (will render as ColorDrawable)" : ""));
+                }
+                return rid;
+            }
         } catch (Throwable ignored) {}
         return 0;
     }
+
+    /** Names already reported by the MACAPK_RESREF_TRACE diagnostic. */
+    private static final java.util.Set<String> sResRefSeen =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
 
     // ------------------------------------------------------------------
     // v1.0.917: the last-reference channel (reflective bridge).
@@ -6532,10 +6745,13 @@ public class Resources {
                     .getMethod("resolveAttrInTheme", String.class, String.class);
                 for (int hop = 0; hop < 4 && sr.startsWith("?"); hop++) {
                     String refAttr = sr.substring(1);
+                    // App attribute: whole-cascade identity first (see
+                    // macapkResolveAppAttrExact / resolveDefStyleName).
+                    final boolean appHop = !refAttr.startsWith("android:");
                     if (refAttr.startsWith("attr/")) refAttr = refAttr.substring(5);
                     else if (refAttr.startsWith("android:attr/")) refAttr = refAttr.substring(13);
-                    String next = null;
-                    for (String style : appliedStyles) {
+                    String next = appHop ? macapkResolveAppAttrExact(refAttr) : null;
+                    if (next == null) for (String style : appliedStyles) {
                         Object r = mResolve.invoke(macapkResourceIndex, style, refAttr);
                         if (r instanceof String) { next = (String) r; break; }
                     }
@@ -6552,6 +6768,31 @@ public class Resources {
                 }
             } catch (Throwable ignored) { return ref; }
             return sr;
+        }
+
+        /** Pass 1 of macapkResolveAppAttrRawHonest alone: the highest-priority
+         *  applied style whose chain declares the APP attribute `attrName` under
+         *  that exact key, or null (also for a one-style cascade, where the
+         *  per-style walk already asks that style first). */
+        private String macapkResolveAppAttrExact(String attrName) {
+            if (!MACAPK_THEME_APP_ATTR_CASCADE || attrName == null
+                    || attrName.startsWith("android:") || appliedStyles.size() <= 1
+                    || macapkResourceIndex == null) {
+                return null;
+            }
+            try {
+                java.lang.reflect.Method mExact = macapkThemeExactMethod;
+                if (mExact == null) {
+                    mExact = macapkResourceIndex.getClass()
+                        .getMethod("resolveAttrInThemeExact", String.class, String.class);
+                    macapkThemeExactMethod = mExact;
+                }
+                for (String style : appliedStyles) {
+                    Object r = mExact.invoke(macapkResourceIndex, style, attrName);
+                    if (r instanceof String s && !s.isEmpty()) return s;
+                }
+            } catch (Throwable ignored) {}
+            return null;
         }
 
         /** Resolve a defStyleAttr (a theme attr id like actionOverflowButtonStyle)
@@ -6587,9 +6828,28 @@ public class Resources {
                     if (attrName != null) {
                         java.lang.reflect.Method mResolve = macapkResourceIndex.getClass()
                             .getMethod("resolveAttrInTheme", String.class, String.class);
-                        for (String style : appliedStyles) {
-                            Object r = mResolve.invoke(macapkResourceIndex, style, attrName);
-                            if (r instanceof String) { styleRef = (String) r; break; }
+                        // An APP attribute (not 0x01) is answered by its own
+                        // identity across the WHOLE cascade first, the rule
+                        // resolveAttribute already follows
+                        // (macapkResolveAppAttrRawHonest). The per-style walk
+                        // below runs each style's `android:` alias and platform
+                        // fallback before the next style is asked, so a dialog
+                        // theme whose parent is a PLATFORM theme answered
+                        // AppCompat's alertDialogStyle with the platform's
+                        // android:alertDialogStyle before the activity theme's own
+                        // AlertDialog.AppCompat was reached. AlertController then
+                        // read listLayout 0 and every list dialog (ListPreference,
+                        // single/multi choice) threw ClassCastException in
+                        // AlertDialog.Builder.create (NoNonsense Notes'
+                        // ThemeNnnDialogLight extends Theme.DeviceDefault.Light.Dialog).
+                        if ((defStyleAttr >>> 24) != 0x01) {
+                            styleRef = macapkResolveAppAttrExact(attrName);
+                        }
+                        if (styleRef == null) {
+                            for (String style : appliedStyles) {
+                                Object r = mResolve.invoke(macapkResourceIndex, style, attrName);
+                                if (r instanceof String) { styleRef = (String) r; break; }
+                            }
                         }
                         if (styleRef == null) {
                             Object appName = macapkResourceIndex.getClass()
@@ -6621,12 +6881,15 @@ public class Resources {
                     // hang the inflater, so cap the hops and drop out.
                     for (int hop = 0; hop < 4 && sr.startsWith("?"); hop++) {
                         String refAttr = sr.substring(1);
+                        // `?X` / `?attr/X` names an APP attribute; the same
+                        // whole-cascade identity rule applies to the hop.
+                        final boolean appHop = !refAttr.startsWith("android:");
                         if (refAttr.startsWith("attr/")) refAttr = refAttr.substring(5);
                         else if (refAttr.startsWith("android:attr/")) refAttr = refAttr.substring(13);
-                        String next = null;
+                        String next = appHop ? macapkResolveAppAttrExact(refAttr) : null;
                         java.lang.reflect.Method mResolve2 = macapkResourceIndex.getClass()
                             .getMethod("resolveAttrInTheme", String.class, String.class);
-                        for (String style : appliedStyles) {
+                        if (next == null) for (String style : appliedStyles) {
                             Object r = mResolve2.invoke(macapkResourceIndex, style, refAttr);
                             if (r instanceof String) { next = (String) r; break; }
                         }

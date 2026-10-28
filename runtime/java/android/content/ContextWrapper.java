@@ -5,6 +5,8 @@
 // resolves the app context.
 package android.content;
 
+import android.app.Application;
+
 import android.content.res.AssetManager;
 import android.content.res.Resources;
 
@@ -30,10 +32,25 @@ public class ContextWrapper extends Context {
         return (p != null) ? p : "";
     }
     @Override public Resources getResources() {
-        return baseContext != null ? baseContext.getResources() : null;
+        Resources r = baseContext != null ? baseContext.getResources() : null;
+        // MacApkCompat: a wrapper Context (Tinker's resource fence, an
+        // AppCompat ContextThemeWrapper with a null base, ...) can answer null
+        // even though the process has a perfectly good Application Resources.
+        // AOSP never has this state; fall back to the Application's primary
+        // Resources rather than letting callers NPE in getConfiguration().
+        if (r == null) {
+            Application app = Application.macapk_get();
+            if (app != null) r = app.macapkResources();
+        }
+        return r;
     }
     @Override public AssetManager getAssets() {
-        return baseContext != null ? baseContext.getAssets() : null;
+        AssetManager a = baseContext != null ? baseContext.getAssets() : null;
+        if (a == null) {
+            Application app = Application.macapk_get();
+            if (app != null) a = app.macapkAssets();
+        }
+        return a;
     }
     @Override public Context getApplicationContext() {
         return baseContext != null ? baseContext.getApplicationContext() : this;

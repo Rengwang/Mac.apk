@@ -123,6 +123,7 @@ public final class MacApkProcessExit {
     static final boolean THREAD_OWNER = !"0".equals(System.getenv("MACAPK_EXIT_THREAD_OWNER"));
 
     private static void exit(int status, String api) {
+        new Throwable("[DEBUG] " + api + "(" + status + ") stack trace:").printStackTrace();
         if (LEGACY) { Runtime.getRuntime().exit(status); return; }
         boolean onMain = onMainThread();
         Owner contained = exitLocked(status, api, onMain);

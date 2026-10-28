@@ -21,6 +21,12 @@ public final class ActivityThread {
      *  callbacks. */
     private static final ActivityThread INSTANCE = new ActivityThread();
 
+    /** AOSP compatibility alias. Reflective hot-fix / routing code
+     *  (Tinker's AppUtils.hookStartActivity and friends) reads
+     *  ActivityThread.sCurrentActivityThread as a FIELD; AOSP has it, our
+     *  minimal shim previously only had INSTANCE/currentActivityThread(). */
+    public static ActivityThread sCurrentActivityThread = INSTANCE;
+
     private ActivityThread() {
         // AOSP constructs the process Instrumentation during attach(); we do it
         // here because ActivityThread is a lazily-initialized singleton for us.

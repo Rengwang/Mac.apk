@@ -74,6 +74,12 @@ public final class ClassFileRewriter {
     private static final boolean DEBUG =
         "1".equals(System.getenv("MACAPK_DEBUG_REWRITER"));
 
+    /** Toggle: stack-trace a class this rewriter could not repair (the failure is
+     *  still swallowed and the ORIGINAL bytes are used -- this only says WHY).
+     *  MACAPK_DEBUG_REWRITER_TRACE=1. */
+    private static final boolean TRACE =
+        "1".equals(System.getenv("MACAPK_DEBUG_REWRITER_TRACE"));
+
     /** CP entry tags (JVMS §4.4 table 4.4-A). Only the ones we touch. */
     private static final int CP_UTF8         = 1;
     private static final int CP_CLASS        = 7;
@@ -111,6 +117,47 @@ public final class ClassFileRewriter {
     private static final int ACC_ABSTRACT     = 0x0400;
     private static final int ACC_INTERFACE    = 0x0200;
     private static final int ACC_STATIC       = 0x0008;
+
+    // -----------------------------------------------------------------
+    // Boot-class-loader shim (2026-10-27)
+    // -----------------------------------------------------------------
+    /** Android's `Class.getClassLoader()` NEVER returns null: a class loaded by
+     *  the boot class loader answers the singleton `BootClassLoader`, whose
+     *  `getParent()` is null. HotSpot answers NULL for the same class (the
+     *  bootstrap loader is represented by null), so the very common Android
+     *  idiom
+     *
+     *      Object.class.getClassLoader().loadClass(name)
+     *
+     *  throws NullPointerException here where a device throws
+     *  ClassNotFoundException (which the caller usually handles).
+     *
+     *  MEASURED (Bilibili 9.16.1, 2026-10-27): their Tribe module loader does
+     *  exactly that in DefaultClassLoaderService.i(String), and the NPE lands in
+     *  its catch(Throwable) branch whose `c` Function0 is still null, so the
+     *  class's <clinit> dies with ExceptionInInitializerError ->
+     *  com.bilibili.lib.oaid.MsaHelper could not initialize -> their OAID task
+     *  and finally their boot watchdog abort into SafeModeActivity.
+     *
+     *  The rewrite is stack-neutral and length-neutral: `invokevirtual
+     *  Class.getClassLoader()Ljava/lang/ClassLoader;` (receiver: Class) becomes
+     *  `invokestatic MacApkBootClassLoader.get(Ljava/lang/Class;)Ljava/lang/ClassLoader;`
+     *  (argument: Class) -- 3 bytes, same stack shape, and StackMapTable frames
+     *  are untouched because the stack type does not change. The helper returns
+     *  the REAL loader whenever it is non-null, so only the bootstrap case (the
+     *  one that is broken) changes.
+     *
+     *  Done at CLASS-LOAD time (not in the converter) on purpose: no
+     *  re-conversion of the installed fleet, and the shim can be switched off
+     *  per launch. MACAPK_BOOT_CLASSLOADER_SHIM=0 restores the JDK answer. */
+    static final boolean BOOT_LOADER_SHIM =
+        !"0".equals(System.getenv("MACAPK_BOOT_CLASSLOADER_SHIM"));
+    private static final String SHIM_OWNER = "android/app/MacApkBootClassLoader";
+    private static final String SHIM_NAME  = "get";
+    private static final String SHIM_DESC  = "(Ljava/lang/Class;)Ljava/lang/ClassLoader;";
+    private static final String GET_CLASS_LOADER_DESC = "()Ljava/lang/ClassLoader;";
+    private static final java.util.concurrent.atomic.AtomicLong sBootShimSites =
+        new java.util.concurrent.atomic.AtomicLong();
 
     // -----------------------------------------------------------------
     // Pattern H registry -- components AOSP would run in ANOTHER process
@@ -301,15 +348,22 @@ public final class ClassFileRewriter {
                 String name = cf.utf8(m.nameIndex);
                 String desc = cf.utf8(m.descIndex);
                 if (!"<clinit>".equals(name) || !"()V".equals(desc)) {
-                    // Only scan <clinit> in this pass. Method-body
+                    // Only scan <clinit> in THIS pass. Method-body
                     // patterns (FreeType.a() -> h3) are a separate
                     // case requiring concrete-subclass discovery
-                    // (deferred).
+                    // (deferred). The boot-class-loader shim below is the
+                    // one exception: it has to see EVERY method body.
+                    if (BOOT_LOADER_SHIM && m.code != null) {
+                        hits += scanAndRewriteBootClassLoader(cf, m.code, className);
+                    }
                     continue;
                 }
                 CodeAttr code = m.code;
                 if (code == null) continue;
                 hits += scanAndRewriteClinit(cf, code, className);
+                if (BOOT_LOADER_SHIM) {
+                    hits += scanAndRewriteBootClassLoader(cf, code, className);
+                }
             }
 
             // ----------------- Pattern F -- neutralize JDK-removed ------------
@@ -455,6 +509,7 @@ public final class ClassFileRewriter {
                 System.err.println("[rewriter] " + className
                     + ": parse failed (" + t + "); pass-through");
             }
+            if (TRACE) t.printStackTrace();
             return new Result(raw, false, "parse failed: " + t);
         }
     }
@@ -586,6 +641,14 @@ public final class ClassFileRewriter {
     private static final byte[] NEEDLE_CLINIT =
         "<clinit>".getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
+    /** The boot-class-loader shim's only marker: the METHOD NAME utf8 of
+     *  Class.getClassLoader(). A modified-UTF8 entry stores it verbatim, and no
+     *  other method name contains it (`Thread.getContextClassLoader` is
+     *  "getContextClassLoader"). One needle, cheap scan, and an over-match costs
+     *  a parse that finds nothing. */
+    private static final byte[] NEEDLE_GET_CLASS_LOADER =
+        "getClassLoader".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
     /** True if `raw` might match ANY pattern and therefore needs the
      *  full structured parse. See the block comment above for the
      *  per-pattern reasoning. Never throws -- any hiccup fails OPEN
@@ -621,6 +684,10 @@ public final class ClassFileRewriter {
             if (containsNeedle(raw, NEEDLE_CLINIT)
                 && (containsNeedle(raw, NEEDLE_JAVA_LANG_ENUM)
                     || containsNeedle(raw, NEEDLE_JAVA_LANG_OBJECT))) {
+                return true;
+            }
+            // Boot-class-loader shim: any class that names the method at all.
+            if (BOOT_LOADER_SHIM && containsNeedle(raw, NEEDLE_GET_CLASS_LOADER)) {
                 return true;
             }
             return classNeedsPatternDFullParse(raw);
@@ -783,6 +850,75 @@ public final class ClassFileRewriter {
      *  Returns the number of repairs applied. Rewrites happen
      *  in-place on cf.raw (CodeAttr.code is a live view); CP additions
      *  go through cf.findOrAddMethodref(). */
+    /**
+     *  Rewrite every `invokevirtual java/lang/Class.getClassLoader()Ljava/lang/ClassLoader;`
+     *  in this method body to `invokestatic android/app/MacApkBootClassLoader.get(Class)`.
+     *  See BOOT_LOADER_SHIM for why (Android's boot loader is an object, the
+     *  JDK's is null).
+     *
+     *  The instruction WALK is the same one scanAndRewriteClinit uses
+     *  (instructionLength hands back the real size of every opcode including
+     *  the variable-length ones), so an operand byte that happens to equal 0xB6
+     *  is never mistaken for the instruction. The rewrite itself is three bytes:
+     *  opcode invokevirtual -> invokestatic, and the CP index -> the helper's
+     *  Methodref. Stack shape, length and StackMapTable all stay valid.
+     *
+     *  Never applied inside com/macapk/* or to the helper itself: the helper's
+     *  own body deliberately calls Class.getClassLoader(), and rewriting that
+     *  would make it recurse forever.
+     *
+     *  Returns the number of call sites rewritten. */
+    private static int scanAndRewriteBootClassLoader(
+            ClassFile cf, CodeAttr code, String className) {
+        if (className != null
+                && (className.startsWith("com/macapk/") || className.equals(SHIM_OWNER))) {
+            return 0;
+        }
+        byte[] bc    = code.code;
+        int pc       = code.codeOffset;
+        final int codeEnd = code.codeOffset + code.codeLen;
+        int sites = 0;
+        while (pc < codeEnd) {
+            final int op = bc[pc] & 0xFF;
+            final int len = instructionLength(op, bc, pc);
+            if (len <= 0) break;
+            if (op == OP_INVOKEVIRTUAL && pc + 2 < codeEnd) {
+                final int methodref = u2(bc, pc + 1);
+                if (isClassGetClassLoader(cf, methodref)) {
+                    final int owner = cf.findOrAddClass(SHIM_OWNER);
+                    final int nt    = cf.findOrAddNameAndType(SHIM_NAME, SHIM_DESC);
+                    final int ref   = cf.findOrAddMethodref(owner, nt);
+                    bc[pc] = (byte) OP_INVOKESTATIC;
+                    writeU2(bc, pc + 1, ref);
+                    sites++;
+                    final long n = sBootShimSites.incrementAndGet();
+                    if (n == 1 || n % 200 == 0) {
+                        System.err.println("[rewriter] boot-class-loader shim: " + n
+                            + " Class.getClassLoader() site(s); latest in " + className);
+                    }
+                }
+            }
+            pc += len;
+        }
+        return sites;
+    }
+
+    /** Is this CP index a Methodref for java/lang/Class.getClassLoader()? */
+    private static boolean isClassGetClassLoader(ClassFile cf, int methodref) {
+        try {
+            if (methodref <= 0 || methodref >= cf.cpEntries.size()) return false;
+            final CpEntry e = cf.cpEntries.get(methodref);
+            if (e == null || e.tag != CP_METHODREF) return false;
+            final int classIdx = cf.methodrefClass(methodref);
+            if (!"java/lang/Class".equals(cf.classNameOf(classIdx))) return false;
+            final int nt = cf.methodrefNameAndType(methodref);
+            if (!"getClassLoader".equals(cf.utf8(cf.nameAndTypeName(nt)))) return false;
+            return GET_CLASS_LOADER_DESC.equals(cf.utf8(cf.nameAndTypeDescriptor(nt)));
+        } catch (Throwable notOurShape) {
+            return false;
+        }
+    }
+
     private static int scanAndRewriteClinit(
             ClassFile cf, CodeAttr code, String className) {
         int repairs = 0;
@@ -1625,12 +1761,19 @@ public final class ClassFileRewriter {
             CpEntry e = cpEntries.get(idx);
             if (e == null || (e.tag != CP_METHODREF
                               && e.tag != CP_IFACE_METHODREF)) return -1;
+            // An APPENDED entry has no bytes in `raw` (offset -1); its operands
+            // live on the CpEntry. Reading raw for one returns the class-file
+            // magic as an index (measured: "Index 51966" == 0xCAFE). Reachable
+            // since BOOT_LOADER_SHIM inserts an appended Methodref into a method
+            // body that later passes (Pattern F) then resolve.
+            if (e.added) return e.addedClassIdx;
             return u2(raw, e.offset + 1);
         }
         int methodrefNameAndType(int idx) {
             CpEntry e = cpEntries.get(idx);
             if (e == null || (e.tag != CP_METHODREF
                               && e.tag != CP_IFACE_METHODREF)) return -1;
+            if (e.added) return e.addedNtIdx;
             return u2(raw, e.offset + 3);
         }
         int fieldrefClass(int idx) {
@@ -1647,18 +1790,33 @@ public final class ClassFileRewriter {
         int nameAndTypeName(int idx) {
             CpEntry e = cpEntries.get(idx);
             if (e == null || e.tag != CP_NAMEANDTYPE) return -1;
+            if (e.added) {
+                if (e.addedBytes == null || e.addedBytes.length < 3) return -1;
+                return ((e.addedBytes[1] & 0xFF) << 8) | (e.addedBytes[2] & 0xFF);
+            }
             return u2(raw, e.offset + 1);
         }
         /** NameAndType is 5 bytes: tag, name_idx (u2), desc_idx (u2). */
         int nameAndTypeDescriptor(int idx) {
             CpEntry e = cpEntries.get(idx);
             if (e == null || e.tag != CP_NAMEANDTYPE) return -1;
+            if (e.added) {
+                if (e.addedBytes == null || e.addedBytes.length < 5) return -1;
+                return ((e.addedBytes[3] & 0xFF) << 8) | (e.addedBytes[4] & 0xFF);
+            }
             return u2(raw, e.offset + 3);
         }
         /** Resolve a Class CP index to its UTF-8 class name. */
         String classNameOf(int classIdx) {
             CpEntry e = cpEntries.get(classIdx);
             if (e == null || e.tag != CP_CLASS) return "?";
+            if (e.added) {
+                // findOrAddClass stores the whole 3-byte entry; its name_index is
+                // the two bytes after the tag.
+                if (e.addedBytes == null || e.addedBytes.length < 3) return "?";
+                int addedNameIdx = ((e.addedBytes[1] & 0xFF) << 8) | (e.addedBytes[2] & 0xFF);
+                return utf8(addedNameIdx);
+            }
             int nameIdx = u2(raw, e.offset + 1);
             return utf8(nameIdx);
         }
@@ -1666,6 +1824,7 @@ public final class ClassFileRewriter {
             if (idx <= 0 || idx >= cpEntries.size()) return "?";
             CpEntry e = cpEntries.get(idx);
             if (e == null || e.tag != CP_UTF8) return "?";
+            if (e.added) return e.addedText != null ? e.addedText : "?";
             int len = u2(raw, e.offset + 1);
             return new String(raw, e.offset + 3, len, java.nio.charset.StandardCharsets.UTF_8);
         }

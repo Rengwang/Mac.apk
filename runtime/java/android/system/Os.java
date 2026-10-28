@@ -178,6 +178,71 @@ public class Os {
         try { java.lang.reflect.Field f = java.io.FileDescriptor.class.getDeclaredField("fd");
               f.setAccessible(true); return f; } catch (Throwable t) { return null; }
     }
+    /** AOSP Os.mmap. Bilibili's BootOpt/FastKType calls this during
+     *  Application.onCreate; without it the NoSuchMethodError aborts DI. */
+    public static long mmap(long address, long length, int prot, int flags,
+                            java.io.FileDescriptor fd, long offset) throws ErrnoException {
+        long r = com.macapk.loader.NativeOs.mmap(address, length, prot, flags,
+                fd == null ? -1 : fdOf(fd), offset);
+        if (r == -1) throw new ErrnoException("mmap", OsConstants.EINVAL);
+        return r;
+    }
+
+    /** AOSP libcore Os.munmap (libcore/luni/src/main/java/android/system/Os.java):
+     *      public static void munmap(long address, long size) throws ErrnoException
+     *
+     *  The other half of {@link #mmap}: every memory-mapped file closes its
+     *  region through here. It was MISSING while mmap existed, which is the
+     *  worst state to be in -- code that mapped successfully aborts on the
+     *  unmap. MEASURED (Bilibili 9.16.1, 2026-10-27): its memory-mapped cache
+     *  (F50.a.a -> G50.c.close on the BLSP thread, plus
+     *  com.bilibili.lib.blkv.internal.NativeBridge) threw
+     *  `NoSuchMethodError: 'void android.system.Os.munmap(long, long)'`, and the
+     *  app's crash guard (BiliBootProtector) counted the crash and finished
+     *  MainActivityV2 -- the window went away and the task emptied.
+     *
+     *  A jar staged ahead of the runtime binary has no NativeOs.munmap symbol
+     *  yet. That case keeps the PROCESS alive (the mapping is released at exit)
+     *  instead of re-breaking the app the method exists to fix; see
+     *  native_os.cpp's NativeOs_munmap for the real implementation. */
+    public static void munmap(long address, long length) throws ErrnoException {
+        final int r;
+        try {
+            r = com.macapk.loader.NativeOs.munmap(address, length);
+        } catch (UnsatisfiedLinkError missingSymbol) {
+            warnNativeMissing("munmap");
+            return;
+        }
+        if (r < 0) throw new ErrnoException("munmap", -r);
+    }
+
+    /** AOSP libcore Os.msync:
+     *      public static void msync(long address, long size, int flags)
+     *
+     *  The flush half of the mmap family. com.bilibili.lib.blkv (Bilibili's
+     *  key-value store, the same NativeBridge that calls munmap) references it,
+     *  so an app that writes a mapped store would abort on its first flush. */
+    public static void msync(long address, long length, int flags) throws ErrnoException {
+        final int r;
+        try {
+            r = com.macapk.loader.NativeOs.msync(address, length, flags);
+        } catch (UnsatisfiedLinkError missingSymbol) {
+            warnNativeMissing("msync");
+            return;
+        }
+        if (r < 0) throw new ErrnoException("msync", -r);
+    }
+
+    /** One line per missing memory-mapping symbol, not one per call: these sit
+     *  on hot paths (a store flushes on every commit). */
+    private static final java.util.Set<String> MISSING_NATIVE =
+        java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+    private static void warnNativeMissing(String name) {
+        if (!MISSING_NATIVE.add(name)) return;
+        System.err.println("[macapk] Os." + name + ": the runtime binary has no native "
+            + "symbol yet (staged jar newer than macapk-runtime) -- degrading to a no-op");
+    }
+
     private static int fdOf(java.io.FileDescriptor fd) {
         if (fd == null || FD_FIELD == null) return -1;
         try { return FD_FIELD.getInt(fd); } catch (Throwable t) { return -1; }

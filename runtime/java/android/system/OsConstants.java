@@ -19,6 +19,26 @@ public final class OsConstants {
     public static final int EINVAL  = 22;
     public static final int ENOSPC  = 28;
 
+    // mmap(2) / mprotect(2). Bilibili's BootOpt/FastKType reads PROT_READ very
+    // early; without the field the NoSuchFieldError aborts Application.onCreate
+    // and its Hilt service stays uninitialized.
+    public static final int PROT_NONE  = 0;
+    public static final int PROT_READ  = 1;
+    public static final int PROT_WRITE = 2;
+    public static final int PROT_EXEC  = 4;
+
+    public static final int MAP_SHARED    = 1;
+    public static final int MAP_PRIVATE   = 2;
+    public static final int MAP_FIXED     = 0x10;
+    public static final int MAP_ANONYMOUS = 0x20;
+    public static final int MAP_FAILED    = -1;
+
+    // access(2)
+    public static final int F_OK = 0;
+    public static final int X_OK = 1;
+    public static final int W_OK = 2;
+    public static final int R_OK = 4;
+
     // open(2) flags. AOSP's OsConstants exposes the *bionic* O_* values (its
     // native initConstants() reads them straight from bionic's fcntl.h), so an
     // app reads these and passes them to Os.open, which translates them to

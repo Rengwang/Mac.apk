@@ -740,7 +740,7 @@ public final class ActivityHost {
         runResult(deliver, "resumed top");
         if (resultEndedRestore(a)) return;   // finished (or covered) from onNewIntent
         try {
-            resumeCallbacks(a);
+            if (!resumeCallbacks(a)) return;   // finished from onResume/onPostResume
         } catch (Throwable t) {
             NativeLog.w(TAG, "resume after onNewIntent threw for " + a.getClass().getName() + ": " + t);
         }
@@ -752,14 +752,59 @@ public final class ActivityHost {
      *  stale-state clear, onResume, the androidx RESUMED event, onPostResume, the
      *  application callback and the fragment state. Window work (adding a hidden
      *  window, the window-added latch, focus) stays with each caller: a restore owes
-     *  it, an in-place resume of an activity that never lost its window does not. */
-    private static void resumeCallbacks(Activity a) {
+     *  it, an in-place resume of an activity that never lost its window does not.
+     *
+     *  @return false when the activity called finish() from onResume/onPostResume;
+     *          the caller must NOT then record it as the resumed top. */
+    private static boolean resumeCallbacks(Activity a) {
         resumeFinalState(a);
         runTolerant(a, "onResume", new Class<?>[0], new Object[0]);
+        if (macapkFinishedInResume(a, "onResume")) return false;
         driveLifecycleTo(a, "RESUMED");
         runTolerant(a, "onPostResume", new Class<?>[0], new Object[0]);
+        if (macapkFinishedInResume(a, "onPostResume")) return false;
         if (app != null) app.dispatchActivityResumed(a);
         a.macapkDispatchFragmentState(android.app.FragmentManagerImpl.RESUMED);
+        return true;
+    }
+
+    /** The mFinished check for the RESUME half, the third of the burst.
+     *
+     *  AOSP has three independent early returns -- handleStartActivity:3690 and
+     *  performResumeActivity:4760 -- and the two earlier ones (finish() during
+     *  onCreate, finish() between onStart and onResume) are already mirrored
+     *  above. This is the window AFTER onResume/onPostResume has run, which AOSP
+     *  reaches through performResume returning with mFinished set: the system
+     *  server then skips the window work and tears the activity down.
+     *
+     *  It is a REAL window, not a theoretical one: the standard splash pattern
+     *  `onResume { if (!loggedIn) { startActivity(Login); finish(); } }` finishes
+     *  from onResume, and our Activity.finish() runs the WHOLE teardown
+     *  synchronously (onPause/onStop/onDestroy + LifecycleRegistry to DESTROYED).
+     *  Without this check the code after it would
+     *    - driveLifecycleTo("RESUMED") a registry that is already DESTROYED,
+     *      resurrecting a torn-down LifecycleOwner (fragment host nulled, repeated
+     *      ON_CREATE/ON_START to observers that already tore their state down);
+     *    - dispatch onPostResume / the application RESUMED callback / the
+     *      fragment RESUMED state for a destroyed activity;
+     *    - set currentActivityResumed = true for it, so window focus, input
+     *      routing and the GL-behind-top detector keep pointing at a dead top.
+     *  The measured shape of that is a blank Cocoa window over a task whose only
+     *  live activity is no longer "resumed" by us.
+     *
+     *  Returns true (and logs) when the activity is finishing, in which case the
+     *  caller returns: Activity.finish() has ALREADY restored the activity
+     *  underneath (onActivityFinished -> restoreTop) or hidden the app when the
+     *  task emptied (`scheduleEmptyTaskCheck`), so there is nothing left to do. */
+    private static boolean macapkFinishedInResume(Activity a, String where) {
+        if (a == null || !a.isFinishing()) return false;
+        NativeLog.i(TAG, a.getClass().getName() + " finished during " + where
+            + " -- skipping the rest of the resume (AOSP performResumeActivity"
+            + " returns on mFinished; the synchronous teardown already ran"
+            + " onPause/onStop/onDestroy, so driving the LifecycleRegistry to"
+            + " RESUMED or marking it the resumed top would resurrect a dead"
+            + " activity)");
+        return true;
     }
 
     // ---- BACK at the task root, moveTaskToBack, and an emptied task ---------
@@ -1591,7 +1636,7 @@ public final class ActivityHost {
                 result = null;
                 if (resultEndedRestore(a)) return;
             }
-            resumeCallbacks(a);
+            if (!resumeCallbacks(a)) return;   // finished from onResume/onPostResume
             // A window hidden for now (it started an activity for result from
             // its own resume) is added at this later resume, as on AOSP.
             addEmptyWindowIfNeeded(a);
@@ -3438,6 +3483,7 @@ public final class ActivityHost {
             windowPolicyOnStarting(activity, className, launchAi, stack.isEmpty());
             try {
                 activity.macapkSetReferrer(referrer);
+                activity.macapkSetTaskRoot(stack.isEmpty());
                 activity.macapkAttach(app, intent);
             } catch (Throwable t) {
                 NativeLog.e(TAG, "startActivity attach failed for " + className + ": " + t);
@@ -3449,6 +3495,7 @@ public final class ActivityHost {
             try {
                 activity = (Activity) cls.getDeclaredConstructor().newInstance();
                 activity.macapkSetReferrer(referrer);
+                activity.macapkSetTaskRoot(stack.isEmpty());
                 activity.macapkAttach(app, intent);
             } catch (Throwable t) {
                 NativeLog.e(TAG, "startActivity construct failed for " + className + ": " + t);
@@ -3619,6 +3666,29 @@ public final class ActivityHost {
                 + " skipping onStart/onResume (AOSP ActivityThread.handleStartActivity"
                 + " + performResumeActivity both return early for a finished activity)."
                 + " Its teardown already ran in finish().");
+            // MacApkCompat: AOSP's system server would immediately resume the
+            // activity underneath. We already tore this one down synchronously,
+            // but the incoming window may have replaced the surface; explicitly
+            // restore the nearest live activity so the Cocoa layer cannot stay
+            // on the finished page's white background.
+            Activity fallback = outgoing;
+            if (fallback == null || fallback.isFinishing() || fallback == activity) {
+                fallback = null;
+                java.util.ArrayList<Activity> snapshot = new java.util.ArrayList<>(stack);
+                for (int i = snapshot.size() - 1; i >= 0; i--) {
+                    Activity a = snapshot.get(i);
+                    if (a != null && a != activity && !a.isFinishing()) { fallback = a; break; }
+                }
+            }
+            if (fallback != null) {
+                try {
+                    NativeLog.i(TAG, "finished-in-onCreate fallback: restoring "
+                        + fallback.getClass().getName());
+                    restoreTop(fallback);
+                } catch (Throwable t) {
+                    NativeLog.e(TAG, "finished-in-onCreate fallback failed: " + t);
+                }
+            }
             return;
         }
         // onPostCreate comes AFTER the finished-check, and (on AOSP) after
@@ -3783,11 +3853,19 @@ public final class ActivityHost {
         }
         resumeFinalState(activity);
         runTolerant(activity, "onResume", new Class<?>[0], new Object[0]);
+        // Third and last mFinished guard of the burst -- see macapkFinishedInResume.
+        // AOSP checks mFinished in performResumeActivity AFTER onResume has run
+        // (handleResumeActivity then sees the activity is finished and does not
+        // add/keep its window); our synchronous teardown means the checks below
+        // would otherwise walk a DESTROYED LifecycleRegistry back up to RESUMED
+        // and leave a dead activity recorded as the resumed top.
+        if (macapkFinishedInResume(activity, "onResume")) return;
         driveLifecycleTo(activity, "RESUMED");
         // AOSP ActivityThread.handleResumeActivity calls onPostResume after
         // performResume (onResume) once the activity is resumed. AppCompat
         // finalizes its resumed ActionBar/menu state here. v1.0.418.
         runTolerant(activity, "onPostResume", new Class<?>[0], new Object[0]);
+        if (macapkFinishedInResume(activity, "onPostResume")) return;
         if (app != null) app.dispatchActivityResumed(activity);
         activity.macapkDispatchFragmentState(
             android.app.FragmentManagerImpl.RESUMED);

@@ -93,11 +93,13 @@ bool CocoaPolicyDisplayBudget(winpolicy::DisplayBudget* out, std::string* desc);
 // run pinned MACAPK_WINDOW_PREF), Activity.setRequestedOrientation goes
 // through winpolicy::ApplyRequestedOrientation, and the post-JVM max-aspect
 // clamp is skipped (the decision already applied it). Main thread.
+enum class CocoaWindowMode { kDefault, kFitContent, kFreeResize };
 void CocoaInstallWindowPolicy(const winpolicy::WindowTraits& traits,
                               const winpolicy::DeviceSettings& settings,
                               const std::string& pref_path,
                               winpolicy::UserWindowPref pref,
-                              bool persist_pref);
+                              bool persist_pref,
+                              CocoaWindowMode window_mode);
 // Drop the session (the authoritative read fell back to the legacy rule).
 void CocoaClearWindowPolicy();
 bool CocoaWindowPolicyActive();

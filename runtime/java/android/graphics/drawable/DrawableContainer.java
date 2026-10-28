@@ -389,13 +389,66 @@ public class DrawableContainer extends Drawable implements Drawable.Callback {
      * (nested class DrawableContainerState)
      */
     public static class DrawableContainerState extends ConstantState {
+        /**
+         * Where this state's child list comes from.
+         *
+         * On a device EVERY DrawableContainerState is backed by a live
+         * DrawableContainer (AOSP's single constructor). This tree needs the same
+         * TYPE for drawables that are not containers, because app code casts to it
+         * unconditionally:
+         *
+         *   - {@code Drawable.getConstantState()}'s base answer. A plain drawable
+         *     has no children, so its state must answer an EMPTY list and must not
+         *     crash the cast. MEASURED (Bilibili 9.16.1, 2026-10-27 logs):
+         *     `com.bilibili.magicasakura.utils.ThemeUtils.containsNinePatch`
+         *     (BL:28) does `(DrawableContainerState) drawable.getConstantState()`
+         *     for every StateListDrawable, and every TintTextView.setBackgroundResource
+         *     -- i.e. PromoToast, the skinning framework, Toast -- died with
+         *     `MacapkSelfConstantState cannot be cast to DrawableContainerState`
+         *     (21 occurrences in one run).
+         *   - {@code StateListDrawable.getConstantState()}. AOSP's SLD IS a
+         *     DrawableContainer and answers a real DrawableContainerState over its
+         *     rows; this tree's SLD predates the container class, so it reports its
+         *     rows through this seam instead (see StateListDrawable).
+         *
+         * A source is read LIVE (no snapshot), so a state keeps matching the
+         * drawable as rows are added -- which is what the AOSP container state does.
+         */
+        public interface MacapkChildSource {
+            int getChildCount();
+            Drawable getChild(int index);
+            /** AOSP DrawableContainerState.addChild: append and return the index. */
+            int addChild(Drawable dr);
+            /** AOSP DrawableContainerState.newDrawable: the drawable this state describes. */
+            Drawable macapkNewDrawable();
+        }
+
+        /** The container this state belongs to; null when mSource is set. */
         private final DrawableContainer mOwner;
+        /** Set only for the non-container states described on MacapkChildSource. */
+        private final MacapkChildSource mSource;
 
-        DrawableContainerState(DrawableContainer owner) { mOwner = owner; }
+        DrawableContainerState(DrawableContainer owner) {
+            mOwner = owner;
+            mSource = null;
+        }
 
-        public final int getChildCount() { return mOwner.mChildren.size(); }
+        /** A state over an arbitrary (live) child source instead of a container.
+         *  Package-visible on purpose: Drawable's base answer and
+         *  StateListDrawable are the only intended callers. */
+        DrawableContainerState(MacapkChildSource source) {
+            mOwner = null;
+            mSource = source;
+        }
+
+        private int macapkChildCount() {
+            return (mSource != null) ? mSource.getChildCount() : mOwner.mChildren.size();
+        }
+
+        public final int getChildCount() { return macapkChildCount(); }
 
         public final Drawable getChild(int index) {
+            if (mSource != null) return mSource.getChild(index);
             return (index >= 0 && index < mOwner.mChildren.size())
                     ? mOwner.mChildren.get(index) : null;
         }
@@ -407,15 +460,23 @@ public class DrawableContainer extends Drawable implements Drawable.Callback {
          * strict subset of that contract and safe for every such caller.
          */
         public final Drawable[] getChildren() {
-            return mOwner.mChildren.toArray(new Drawable[0]);
+            if (mSource == null) return mOwner.mChildren.toArray(new Drawable[0]);
+            final int n = macapkChildCount();
+            final Drawable[] out = new Drawable[n];
+            for (int i = 0; i < n; i++) out[i] = mSource.getChild(i);
+            return out;
         }
 
         // AOSP: `public final int addChild(Drawable)` -- returns the new child's
         // index, which callers (e.g. StateListDrawable.addState) use directly.
         // frameworks/base/graphics/java/android/graphics/drawable/DrawableContainer.java
-        public final int addChild(Drawable dr) { return mOwner.addChild(dr); }
+        public final int addChild(Drawable dr) {
+            return (mSource != null) ? mSource.addChild(dr) : mOwner.addChild(dr);
+        }
 
-        @Override public Drawable newDrawable() { return mOwner; }
+        @Override public Drawable newDrawable() {
+            return (mSource != null) ? mSource.macapkNewDrawable() : mOwner;
+        }
 
         @Override public int getChangingConfigurations() { return 0; }
 

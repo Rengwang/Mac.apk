@@ -895,7 +895,10 @@ public final class ResourceIndex {
     // bypasses it; MACAPK_FWVIEW_DISK_CACHE_VERIFY=1 builds AND replays and
     // logs any field mismatch (the positive control).
     private static final int MACAPK_FWVIEW_CACHE_MAGIC = 0x4657_5631;   // "FWV1"
-    private static final int MACAPK_FWVIEW_CACHE_FORMAT_VER = 1;
+    // 2: macapkStyleItemKey / macapkFwItemText keep ^attr-private items and hops.
+    private static final int MACAPK_FWVIEW_CACHE_FORMAT_VER = 2;
+    /** ArscReader's type/name spelling of a private platform attribute. */
+    static final String ATTR_PRIVATE_PREFIX = "^attr-private/";
 
     /** The framework's own -w/-h/-sw dp thresholds, set by the last live build
      *  (macapkBuildFwViewUncached) so the wrapper can canonicalize the config
@@ -1691,6 +1694,11 @@ public final class ResourceIndex {
                 if (tn != null && tn.startsWith("attr/")) {
                     return "?android:" + tn.substring(5);
                 }
+                // A private platform attr hop (see macapkStyleItemKey).
+                if (tn != null && tn.startsWith(ATTR_PRIVATE_PREFIX)
+                        && tn.length() > ATTR_PRIVATE_PREFIX.length()) {
+                    return "?android:" + tn.substring(ATTR_PRIVATE_PREFIX.length());
+                }
                 return String.format("?0x%08x", data);
             }
             case ArscReader.TYPE_REFERENCE:
@@ -2234,7 +2242,7 @@ public final class ResourceIndex {
         });
         for (Object[] o : ordered) {
             ArscReader.Row row = (ArscReader.Row) o[2];
-            fileRowById.put(row.resId, new Object[] { -((Integer) o[1]), row.value, row.config });
+            fileRowById.put(row.resId, new Object[] { -((Integer) o[1]), row.value, row.config, row.data });
         }
         return fileRowById.size();
     }
@@ -2859,6 +2867,19 @@ public final class ResourceIndex {
      *  keyed cannot be looked up either way). */
     private static String macapkStyleItemKey(String bagItemName) {
         if (bagItemName == null || bagItemName.isEmpty()) return null;
+        // A PRIVATE platform attr (table type ^attr-private, ids 0x0112....) is
+        // still an attribute, and the platform themes bind them: Theme binds
+        // `colorPopupBackground` (to ?attr/colorBackgroundFloating), which
+        // @android:drawable/popup_background_material paints as its <solid>.
+        // Dropping these items left every such ?attr unresolved -- the solid
+        // came out transparent and every AppCompat overflow / popup menu drew
+        // its items straight over the screen behind it. Keyed by NAME like the
+        // public attrs (a name is unique across attr and ^attr-private in one
+        // package; LayoutInflater's dimension walk relies on the same).
+        if (bagItemName.startsWith(ATTR_PRIVATE_PREFIX)) {
+            String n = bagItemName.substring(ATTR_PRIVATE_PREFIX.length());
+            return n.isEmpty() ? null : n;
+        }
         if (bagItemName.charAt(0) == '^') return null;
         int a = bagItemName.indexOf("attr/");
         if (a == 0) return bagItemName.substring(5);
@@ -2877,6 +2898,34 @@ public final class ResourceIndex {
     private final Map<Integer, Object[]> rawTypedById = new HashMap<>();
 
     public Object[] macapkRawValueOf(int id) { return rawTypedById.get(id); }
+
+    /** A file's owning APK path and string-pool index form Android's drawable
+     *  cache key, and the APK path is also what resolves to an AssetManager
+     *  cookie. Aliases must return the target's entry, rather than every file
+     *  sharing one key. {apkPath, stringPoolIndex, compiledPath, finalResId} */
+    public Object[] macapkFileValueOf(int id) {
+        java.util.HashSet<Integer> seen = new java.util.HashSet<>();
+        while (id != 0 && seen.add(id)) {
+            Object[] file = fileRowById.get(id);
+            if (file != null) {
+                return new Object[] { macapkMemberPath((Integer) file[0]), file[3], file[1], id };
+            }
+            Object[] raw = rawTypedById.get(id);
+            if (raw == null || (Integer) raw[0] != android.util.TypedValue.TYPE_REFERENCE) break;
+            id = (Integer) raw[1];
+        }
+        return null;
+    }
+
+    /** Absolute path of the installed-set member a file row came from, or null
+     *  when this index has no member list (the text-fallback ingest). The
+     *  AssetManager turns it into a cookie; a member NUMBER is not a cookie. */
+    public String macapkMemberPath(int memberIndex) {
+        java.util.List<java.io.File> m = macapkMembers;
+        if (m == null || memberIndex < 0 || memberIndex >= m.size()) return null;
+        java.io.File f = m.get(memberIndex);
+        return f != null ? f.getAbsolutePath() : null;
+    }
 
     /** Raw `<dimen name="X">16.0dip</dimen>` strings (unit kept) and
      *  `<fraction name="Y">15%</fraction>` strings from res/values.
@@ -4932,7 +4981,9 @@ public final class ResourceIndex {
      *  is set from Configuration.uiMode in the ctor). */
     private static volatile boolean macapkCfgNightStatic = false;
 
+    private static boolean sUpArrowLogged;
     private static String frameworkThemeAttr(String plainStyleName, String attrName) {
+        final String s0 = plainStyleName;
         String s = plainStyleName;
         // Only framework THEMES answer theme attributes. Widget/TextAppearance
         // styles must keep falling through to null.
@@ -5151,7 +5202,24 @@ public final class ResourceIndex {
             case "listChoiceIndicatorMultiple":
                 return "@drawable/abc_btn_check_material";
             case "homeAsUpIndicator":
-                return "@android:drawable/ic_ab_back_material";
+                // `ic_ab_back_material` is an APPCOMPAT drawable, not a framework
+                // one: its real name is `abc_ic_ab_back_material`, and
+                // framework-res has no `ic_ab_back_material` at all (it only
+                // ships the Holo-era `ic_ab_back_holo_*` PNGs). Resolving the
+                // @android: reference therefore yields nothing, and AppCompat's
+                // ToolbarWidgetWrapper hands that to
+                // Toolbar.setNavigationIcon(): the nav button ends up with no
+                // image, so the up-arrow is BLANK while still occupying its
+                // slot and still clickable -- exactly the reported symptom
+                // (empty square at the toolbar's left edge that still goes
+                // back). Point at the drawable the app actually ships.
+                if ("1".equals(System.getenv("MACAPK_RESREF_TRACE")) && !sUpArrowLogged) {
+                    sUpArrowLogged = true;
+                    com.macapk.loader.NativeLog.i("Resources",
+                        "homeAsUpIndicator -> FRAMEWORK FALLBACK used: "
+                        + "@drawable/abc_ic_ab_back_material (style=" + s0 + ")");
+                }
+                return "@drawable/abc_ic_ab_back_material";
             case "dividerHorizontal":
             case "dividerVertical":
                 return "?android:listDivider";

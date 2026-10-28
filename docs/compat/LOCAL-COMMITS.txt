@@ -1,0 +1,42 @@
+Local development commit inventory before the publication snapshot.
+This list preserves provenance; it does not assert each commit is upstream.
+Baseline: 25bc68bd668cddea61c39816acd8a759e226218d
+
+7b421d9 Mac.apk compatibility: resources fallback, Tinker field, proxy hide, DexVMP stubs, signature override
+e9040a2 Document Mac.apk compat patches, install and validation
+509750b Record c001apk Flutter client running on patched Mac.apk
+5fb1a16 Official CoolApk 16.6.5 runs on Mac.apk after DEX reconstruction and ad-lib removal
+77059cf Document CoolApk detail-page native onCreate limitation
+02d869c Update Mac.apk patch: real isTaskRoot task tracking
+fd9de63 Document detail page isTaskRoot fix and remaining feed-data gap
+e8a1fb8 Official CoolApk detail page now renders via feedId + loader
+c50bf52 Mac.apk: real isTaskRoot + finish-in-onCreate layer fallback
+9e76546 Add generalized macapk-dump tool for wiped DEX headers
+149b35c Fix maps regex in macapk-dump
+6839007 Document generalized Mac.apk fixes and dump tool
+6a42a54 Mac.apk: add OsConstants mmap flags and NativeOs.mmap bridge
+a6ba981 Document Bilibili startup blocker and Os.mmap fixes
+5ffc61a Framework: drawable state cast, 8dp touch slop, finish-in-onResume, Os.munmap/msync, converter static-final
+1583035 Framework: /proc/<pid>/cmdline, non-null boot class loader, times(NULL)
+987841e Framework: instance finals in mixin helpers, TypedValue.assetCookie=0
+e4d4640 Framework: numeric resource refs (magenta UI), isnanf/posix_fallocate shims (freeze)
+a01d5ac wip(video): Antigravity handoff snapshot (builds clean)
+1e91b88 Canvas: trace text draws, route aligned 1:1 blits through the fast blitter
+184ec85 Fix video surface routing, clipped holes and bounded codec polling; support preferred host display
+273b20c Window: support per-app window mode (fit/free) and delayed startup refit
+3020b7d Optimize(Step 2): cache JNI reflection, isolate per-stream buffer pool, use glTexSubImage2D and clean caches on release
+6bf50fd Optimize(Step 3): implement S1 damage authority in ViewRootImpl, map View damage rects, and isolate draw-only partial redraws
+404b45c Optimize(Step 4): correct video transform matrix (fix vertical clipping) and vectorize GL pbuffer readback conversion via critical pinned JNI
+d69eeed Optimize(Step 5): release SurfaceTexture and EGL buffers on detach/destroy and unregister video sinks on surface release
+4b998ab Fix immersive fullscreen feedback and transparent dialogs; harden rendering and restore window size
+8f2949b DialogFragment: create, fill and show the dialog from the fragment lifecycle
+d2d6d2a Read attributes of shrunk APKs and round XML dimensions as AOSP does
+05c86d0 Fix requested features in package archive info
+852d362 Queue input for an activity still being created on its looper
+5e618ab Parse searchable metadata and answer getSearchableInfo, as AOSP does
+d950ea3 Test imported resource aliases and package features
+69929c5 Take an ImageView's android:tint from its style and theme, as AOSP does
+abb41b8 Grey a white vector only when it declares a tint we could not resolve
+ebee626 Merge child drawable states under addStatesFromChildren, as AOSP does
+1781edb Keep private platform attributes in theme bags, as AOSP does
+b2af6ed Resolve an app defStyleAttr by its own identity first, as AOSP does

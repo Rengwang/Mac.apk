@@ -12,6 +12,7 @@
 #include "macapk/cocoa_bridge.h"
 #include "macapk/self_capture.h"   // SelfCaptureGlWanted
 #include "macapk/gles_bridge.h"
+#include "video_pixels.h"
 
 #include <atomic>
 #include <cstdint>
@@ -760,6 +761,63 @@ jint Cocoa_presentFrame(JNIEnv* env, jclass, jintArray argb_j, jint width, jint 
     return r;
 }
 
+jboolean Cocoa_convertVideoArgbToRgba(JNIEnv* env, jclass, jintArray argbArr,
+                                    jobject rgbaBuf, jint w, jint h, jint stride, jboolean premul) {
+    if (!argbArr || !rgbaBuf || w <= 0 || h <= 0 || stride < w) return JNI_FALSE;
+    const jlong requiredPixels = static_cast<jlong>(h - 1) * stride + w;
+    const jlong outputBytes = static_cast<jlong>(w) * h * 4;
+    if (env->GetArrayLength(argbArr) < requiredPixels
+        || env->GetDirectBufferCapacity(rgbaBuf) < outputBytes) return JNI_FALSE;
+    auto* dst = static_cast<uint32_t*>(env->GetDirectBufferAddress(rgbaBuf));
+    if (!dst) return JNI_FALSE;
+    void* input = env->GetPrimitiveArrayCritical(argbArr, nullptr);
+    if (!input) return JNI_FALSE;
+    pixels::ArgbToRgba(static_cast<const uint32_t*>(input), dst, w, h, stride, premul == JNI_TRUE);
+    env->ReleasePrimitiveArrayCritical(argbArr, input, JNI_ABORT);
+    return JNI_TRUE;
+}
+
+jboolean Cocoa_convertGlPbufferToArgb(JNIEnv* env, jclass, jobject rgbaBuf, jintArray argbArr, jint w, jint h) {
+    if (!rgbaBuf || !argbArr || w <= 0 || h <= 0) return JNI_FALSE;
+    const uint32_t* src = static_cast<const uint32_t*>(env->GetDirectBufferAddress(rgbaBuf));
+    if (!src) return JNI_FALSE;
+    const jsize len = env->GetArrayLength(argbArr);
+    if ((long long)len < (long long)w * h) return JNI_FALSE;
+    const jlong capacity = env->GetDirectBufferCapacity(rgbaBuf);
+    const jlong required = static_cast<jlong>(w) * h * 4;
+    if (capacity < required) return JNI_FALSE;
+
+    void* raw = env->GetPrimitiveArrayCritical(argbArr, nullptr);
+    if (!raw) return JNI_FALSE;
+    uint32_t* dst = static_cast<uint32_t*>(raw);
+
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* srcRow = src + (h - 1 - y) * w;
+        uint32_t* dstRow = dst + y * w;
+        for (int x = 0; x < w; ++x) {
+            uint32_t px = srcRow[x];
+            uint32_t a = px >> 24;
+            uint32_t r = px & 0xff;
+            uint32_t b = (px >> 16) & 0xff;
+            if (a != 0xff) {
+                if (a == 0) {
+                    px = 0; r = 0; b = 0;
+                } else {
+                    uint32_t g = (px >> 8) & 0xff;
+                    r = (r * 255 + (a >> 1)) / a;
+                    g = (g * 255 + (a >> 1)) / a;
+                    b = (b * 255 + (a >> 1)) / a;
+                    px = (a << 24) | (g << 8);
+                }
+            }
+            dstRow[x] = (px & 0xff00ff00) | (r << 16) | b;
+        }
+    }
+
+    env->ReleasePrimitiveArrayCritical(argbArr, raw, 0);
+    return JNI_TRUE;
+}
+
 const JNINativeMethod kNativeCocoaMethods[] = {
     {const_cast<char*>("init"),                   const_cast<char*>("()Z"),
      reinterpret_cast<void*>(Cocoa_init)},
@@ -897,6 +955,12 @@ const JNINativeMethod kNativeCocoaMethods[] = {
     {const_cast<char*>("presentFrame"),
      const_cast<char*>("([IIIIIIII)I"),
      reinterpret_cast<void*>(Cocoa_presentFrame)},
+    {const_cast<char*>("convertGlPbufferToArgb"),
+     const_cast<char*>("(Ljava/nio/ByteBuffer;[III)Z"),
+     reinterpret_cast<void*>(Cocoa_convertGlPbufferToArgb)},
+    {const_cast<char*>("convertVideoArgbToRgba"),
+     const_cast<char*>("([ILjava/nio/ByteBuffer;IIIZ)Z"),
+     reinterpret_cast<void*>(Cocoa_convertVideoArgbToRgba)},
 };
 
 // ---------- com.macapk.loader.NativeGles (placeholder) ----------
@@ -1046,11 +1110,17 @@ void GLES20_glActiveTexture(JNIEnv*, jclass, jint unit) {
 }
 void GLES20_glBindTexture(JNIEnv*, jclass, jint target, jint tex) {
 #ifdef MACAPK_HAS_ANGLE
+    if (target == 0x8D65 /* GL_TEXTURE_EXTERNAL_OES */) {
+        target = GL_TEXTURE_2D;
+    }
     glBindTexture(target, tex);
 #endif
 }
 void GLES20_glTexParameteri(JNIEnv*, jclass, jint target, jint pname, jint param) {
 #ifdef MACAPK_HAS_ANGLE
+    if (target == 0x8D65 /* GL_TEXTURE_EXTERNAL_OES */) {
+        target = GL_TEXTURE_2D;
+    }
     glTexParameteri(target, pname, param);
 #endif
 }
@@ -1225,9 +1295,38 @@ void GLES20_glShaderSource(JNIEnv* env, jclass, jint shader, jstring src) {
 #ifdef MACAPK_HAS_ANGLE
     if (!src) return;
     const char* s = env->GetStringUTFChars(src, nullptr);
-    GLint len = (GLint) std::strlen(s);
-    glShaderSource(shader, 1, &s, &len);
+    std::string source(s ? s : "");
     env->ReleaseStringUTFChars(src, s);
+
+    // GLES external texture translation for ANGLE Metal backend:
+    // DisplayMtl.mm does not expose GL_OES_EGL_image_external (EGLImageExternalOES = false).
+    // Translate external texture shaders to standard 2D texture shaders:
+    // 1. Comment out `#extension ... GL_OES_EGL_image_external ...`
+    // 2. Replace `samplerExternalOES` with `sampler2D`
+    bool rewritten = false;
+    size_t extPos = source.find("GL_OES_EGL_image_external");
+    if (extPos != std::string::npos) {
+        size_t lineStart = source.rfind('\n', extPos);
+        lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+        size_t lineEnd = source.find('\n', extPos);
+        std::string line = source.substr(lineStart, (lineEnd == std::string::npos ? source.size() : lineEnd) - lineStart);
+        if (line.find("#extension") != std::string::npos) {
+            source.insert(lineStart, "// (rewritten) ");
+            rewritten = true;
+        }
+    }
+    size_t pos = 0;
+    while ((pos = source.find("samplerExternalOES", pos)) != std::string::npos) {
+        source.replace(pos, 18, "sampler2D");
+        pos += 9;
+        rewritten = true;
+    }
+    if (rewritten) {
+        std::fprintf(stderr, "[I] gles: translated GL_OES_EGL_image_external to sampler2D for shader %d\n", (int)shader);
+    }
+    const char* p = source.c_str();
+    GLint len = (GLint) source.length();
+    glShaderSource(shader, 1, &p, &len);
 #endif
 }
 void GLES20_glCompileShader(JNIEnv*, jclass, jint shader) {
@@ -1482,6 +1581,9 @@ static jsize GlCopyCount(GLint pname, jsize avail) {
 
 void GLES20_glGetIntegerv(JNIEnv* env, jclass, jint pname, jintArray params, jint offset) {
 #ifdef MACAPK_HAS_ANGLE
+    if (pname == 0x8D67 /* GL_TEXTURE_BINDING_EXTERNAL_OES */) {
+        pname = GL_TEXTURE_BINDING_2D;
+    }
     if (!params || offset < 0) return;
     jsize avail = env->GetArrayLength(params) - offset;
     if (avail <= 0) return;
@@ -2250,6 +2352,9 @@ void GLES20_glReleaseShaderCompiler(JNIEnv*, jclass) {
 #endif
 }
 void GLES20_glTexParameterf(JNIEnv*, jclass, jint t, jint pn, jfloat v) {
+    if (t == 0x8D65 /* GL_TEXTURE_EXTERNAL_OES */) {
+        t = GL_TEXTURE_2D;
+    }
     GL_GATE("texparam");
     // finer bisect: 0x2800/0x2801 = MAG/MIN filter, 0x2802/0x2803 = WRAP_S/T
     if ((pn == 0x2800 || pn == 0x2801) && gl_grp_off("texfilter")) return;
@@ -2783,6 +2888,9 @@ void GLES20_glVertexAttrib4fv_arr(JNIEnv* env, jclass, jint i, jfloatArray v, ji
 // that was fixed in v1.0.682. GLES2 pnames are single-valued; GL_TEXTURE_
 // BORDER_COLOR (an EXT/GLES3.2 addition) takes 4, so accept up to 4. ----
 void GLES20_glTexParameterfv_arr(JNIEnv* env, jclass, jint t, jint pn, jfloatArray v, jint off) {
+    if (t == 0x8D65 /* GL_TEXTURE_EXTERNAL_OES */) {
+        t = GL_TEXTURE_2D;
+    }
 #ifdef MACAPK_HAS_ANGLE
     GLfloat f[4] = {0, 0, 0, 0};
     if (!v || off < 0) return;

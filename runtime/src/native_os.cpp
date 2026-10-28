@@ -43,6 +43,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/file.h>      // flock(2), for NativeOs_takeRunLock
 #include <stdlib.h>
 #include <cstdio>
@@ -467,6 +468,50 @@ jbyteArray NativeOs_xzDecompress(JNIEnv* env, jclass, jbyteArray in) {
     return res;
 }
 
+static jlong NativeOs_mmap(JNIEnv*, jclass, jlong address, jlong length,
+                             jint prot, jint flags, jint fd, jlong offset) {
+    jint hostFlags = flags;
+#ifdef MAP_ANON
+    // bionic MAP_ANONYMOUS is 0x20; Darwin MAP_ANON is 0x1000.
+    if (hostFlags & 0x20) hostFlags = (hostFlags & ~0x20) | MAP_ANON;
+#endif
+    void* p = mmap(reinterpret_cast<void*>(static_cast<intptr_t>(address)),
+                   static_cast<size_t>(length), prot, hostFlags, fd,
+                   static_cast<off_t>(offset));
+    if (p == MAP_FAILED) return -1;
+    return reinterpret_cast<jlong>(p);
+}
+
+// android.system.Os.munmap's other half; see its javadoc for the measured
+// Bilibili abort (NoSuchMethodError on the mapped-cache close path).
+static jint NativeOs_munmap(JNIEnv*, jclass, jlong address, jlong length) {
+    if (address == 0 || length <= 0) return -EINVAL;
+    if (munmap(reinterpret_cast<void*>(static_cast<intptr_t>(address)),
+               static_cast<size_t>(length)) != 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+// android.system.Os.msync (the flush half of the mmap family).
+static jint NativeOs_msync(JNIEnv*, jclass, jlong address, jlong length, jint flags) {
+    if (address == 0 || length <= 0) return -EINVAL;
+    // bionic MS_ASYNC=1, MS_INVALIDATE=2, MS_SYNC=4; Darwin's are
+    // MS_ASYNC=0x1, MS_INVALIDATE=0x2, MS_SYNC=0x10 -- so MS_SYNC must be
+    // translated, or a flush silently becomes an async request (or vice versa).
+    int host = 0;
+    if (flags & 1) host |= MS_ASYNC;
+    if (flags & 2) host |= MS_INVALIDATE;
+#ifdef MS_SYNC
+    if (flags & 4) host |= MS_SYNC;
+#endif
+    if (msync(reinterpret_cast<void*>(static_cast<intptr_t>(address)),
+              static_cast<size_t>(length), host) != 0) {
+        return -errno;
+    }
+    return 0;
+}
+
 const JNINativeMethod kNativeOsMethods[] = {
     {(char*)"xzDecompress", (char*)"([B)[B",          (void*)NativeOs_xzDecompress},
     {(char*)"open",        (char*)"(Ljava/lang/String;II)I", (void*)NativeOs_open},
@@ -478,6 +523,9 @@ const JNINativeMethod kNativeOsMethods[] = {
     {(char*)"memfdCreate", (char*)"(Ljava/lang/String;I)I", (void*)NativeOs_memfdCreate},
     {(char*)"fstat",       (char*)"(I)[J",                  (void*)NativeOs_fstat},
     {(char*)"ftruncate",   (char*)"(IJ)I",                  (void*)NativeOs_ftruncate},
+    {(char*)"mmap",        (char*)"(JJIIIJ)J",              (void*)NativeOs_mmap},
+    {(char*)"munmap",      (char*)"(JJ)I",                  (void*)NativeOs_munmap},
+    {(char*)"msync",       (char*)"(JJI)I",                 (void*)NativeOs_msync},
     {(char*)"takeRunLock", (char*)"(Ljava/lang/String;)I",  (void*)NativeOs_takeRunLock},
     {(char*)"read",        (char*)"(I[BII)I",               (void*)NativeOs_read},
     {(char*)"write",       (char*)"(I[BII)I",               (void*)NativeOs_write},

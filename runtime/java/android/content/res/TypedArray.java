@@ -47,6 +47,11 @@ public class TypedArray implements AutoCloseable {
     // has no applied-style cascade, so this is additive, not a behavior
     // change, for any caller that doesn't pass one).
     private Resources.Theme theme;
+    private boolean macapkWindowBackground;
+    /** PhoneWindow owns background resolution; its probe must see transparent
+     * window themes even while legacy AppCompat drawable tinting is gated. */
+    public void macapkEnableWindowBackground() { macapkWindowBackground = true; }
+
     /** Internal: constructed by Context.obtainStyledAttributes (and
      *  the Theme.obtainStyledAttributes variant). */
     public TypedArray(Resources r, int attrCount) {
@@ -627,6 +632,7 @@ public class TypedArray implements AutoCloseable {
                 // unitconverter pair holds.
                 if (("windowBackground".equals(name)
                         || "android:windowBackground".equals(name))
+                        && !macapkWindowBackground
                         && !"1".equals(System.getenv("MACAPK_THEME_TIER_WINDOWBG"))) {
                     return null;
                 }
@@ -1476,9 +1482,11 @@ public class TypedArray implements AutoCloseable {
                 if ("uniform".equals(v)) return 1;
                 break;
             case "visibility":
+                // XML enums are indices into View/ConstraintSet's {0,4,8}
+                // table, not the View visibility flags themselves (attrs.xml).
                 if ("visible".equals(v))   return 0;
-                if ("invisible".equals(v)) return 4;
-                if ("gone".equals(v))      return 8;
+                if ("invisible".equals(v)) return 1;
+                if ("gone".equals(v))      return 2;
                 break;
             case "showAsAction":
                 int total = 0;
@@ -1847,6 +1855,15 @@ public class TypedArray implements AutoCloseable {
         // Strip leading '@' and optional '+id/' prefix; identifier of
         // form `<type>/<name>` looks up in ResourceIndex.
         String body = v.substring(1);
+        // A reference already in numeric form IS the id (AOSP spells it
+        // "@2131104145"; our AXML parser spells it "@0x7f060e34" -- both are
+        // the same resource). getIdentifier cannot look up either spelling, so
+        // without this every compiled reference read through getResourceId
+        // returned the caller's default. MEASURED (Bilibili's tab selector):
+        // android:color read back as 0 -> the skin framework resolved no
+        // colour -> magenta tabs. See Resources.macapkNumericRefId.
+        int numericRef = Resources.macapkNumericRefId(body);
+        if (numericRef != 0) return numericRef;
         String type = "id";
         // The PACKAGE has to survive to getIdentifier (v1.0.927). This branch
         // used to strip `android:` and then look the name up with pkg=null, so
@@ -2084,6 +2101,9 @@ public class TypedArray implements AutoCloseable {
     private static final boolean TEXTARRAY_AOSP =
             !"0".equals(System.getenv("MACAPK_TYPEDARRAY_TEXTARRAY_AOSP"));
     public String getNonResourceString(int index)         { return null; }
+    private static final java.util.Set<Integer> sColorAttrSeen =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<Integer>());
+
     public android.graphics.drawable.Drawable getDrawable(int index) {
         // v1.0.97: when the attribute carries a `@drawable/foo`
         // reference, route through Resources.getDrawable so we
@@ -2096,7 +2116,23 @@ public class TypedArray implements AutoCloseable {
             // docs/attr-theme-threading_2026-07-31.md: thread `theme` so any
             // ?attr/-valued colour inside the referenced drawable XML resolves
             // against the Theme this TypedArray was obtained through.
-            try { return resources.getDrawable(id, theme); } catch (Throwable ignored) {}
+            try {
+                android.graphics.drawable.Drawable d0 = resources.getDrawable(id, theme);
+                // DIAGNOSTIC (MACAPK_RESREF_TRACE=1): a themed <attr> that asks
+                // for a drawable but comes back as a flat ColorDrawable paints
+                // an invisible/solid slot instead of an icon -- the shape of
+                // every "the button is there but blank" report. Name the id and
+                // its real type so the wrong mapping is obvious.
+                if (d0 instanceof android.graphics.drawable.ColorDrawable
+                        && "1".equals(System.getenv("MACAPK_RESREF_TRACE"))
+                        && sColorAttrSeen.add(id)) {
+                    com.macapk.loader.NativeLog.i("TypedArray",
+                        "attr->drawable became ColorDrawable: id=0x"
+                        + Integer.toHexString(id) + " name=" + resources.getResourceName(id)
+                        + " type=" + resources.getResourceTypeName(id));
+                }
+                return d0;
+            } catch (Throwable ignored) {}
         }
         // v1.0.499: AOSP getDrawable returns NULL when the attribute is unset.
         // Returning a non-null empty VectorDrawable stub for UNSET attrs broke

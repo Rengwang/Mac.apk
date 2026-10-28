@@ -626,9 +626,16 @@ public class ColorStateList implements android.os.Parcelable {
         // "@2130903040": a resource id already resolved to its numeric form.
         if (value.charAt(0) == '@' || isAllDigits(value)) {
             String body = value.charAt(0) == '@' ? value.substring(1) : value;
-            if (isAllDigits(body)) {
+            // Numeric reference: AOSP's decimal spelling "@2131104145" AND our
+            // AXML parser's hex spelling "@0x7f060e34". The old isAllDigits
+            // gate rejected the hex form, so a compiled selector's every row
+            // fell through to `def` -- Color.MAGENTA -- which is exactly the
+            // magenta tabs/icons Bilibili showed. See
+            // Resources.macapkNumericRefId.
+            final int resId = Resources.macapkNumericRefId(body);
+            if (resId != 0) {
                 try {
-                    return Resources.macapkColorById(Integer.parseInt(body), def);
+                    return Resources.macapkColorById(resId, def);
                 } catch (Throwable ignored) {}
             }
         }

@@ -181,18 +181,53 @@ public class SurfaceTexture {
     // native_window_api_connect fails and eglCreateWindowSurface reports
     // EGL_BAD_ALLOC. Guarded by mLock.
     private Object mProducer;
+    private java.lang.ref.WeakReference<android.view.SurfaceView> mOwnerSurfaceView;
+
+    public void macapkSetOwnerSurfaceView(android.view.SurfaceView owner) {
+        mOwnerSurfaceView = owner != null ? new java.lang.ref.WeakReference<>(owner) : null;
+    }
 
     // ---- Latch scratch state (consumer-thread-only, NOT under mLock) -----
     // A SurfaceTexture has exactly one consumer (the thread that latches), so
     // these are touched only from that thread; latching holds no lock across
     // the native pixel copy, which takes milliseconds.
     private java.nio.ByteBuffer mLatchRgba;             // GL upload scratch
+    private int[] mSwappedLineBuf;                      // GL upload scanline scratch
     private int[] mLatchArgb;                           // Bitmap scratch
     private Bitmap mLatchBitmap;                        // software-latched frame
     private final int[] mLatchDims = new int[2];
     private int mGlParamsSetForTex;                     // 0 = not yet
+    private int mGlUploadedTex;                         // texture storage already allocated for this name
+    private int mGlUploadedW;                           // width of allocated storage
+    private int mGlUploadedH;                           // height of allocated storage
     private boolean mGlUploadCheckedOnce;
     private volatile int mLatchGeneration;              // bumps per fresh latch
+
+    // Per-stream pool of reusable int[] buffers for decoded video (BufferQueue analogue).
+    // Bounded to 3 buffers: filling (native), queued, latching (consumer).
+    private final java.util.concurrent.ConcurrentLinkedQueue<int[]> mVideoBufferPool =
+        new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.function.Consumer<int[]> mVideoBufferRecycler = buf -> {
+        if (buf != null && !mAbandoned && mVideoBufferPool.size() < 4) {
+            mVideoBufferPool.add(buf);
+        }
+    };
+
+    /** Acquire a reusable buffer from this SurfaceTexture's pool or allocate. */
+    public int[] macapkAcquireVideoBuffer(int nInts) {
+        int[] buf = mVideoBufferPool.poll();
+        while (buf != null && buf.length != nInts) {
+            buf = mVideoBufferPool.poll();
+        }
+        return buf != null ? buf : new int[nInts];
+    }
+
+    /** Acquire a reusable buffer from the active video target's pool or allocate. */
+    public static int[] macapkAcquireActiveVideoBuffer(int nInts) {
+        SurfaceTexture target = sActiveVideoTarget != null ? sActiveVideoTarget.get() : null;
+        if (target == null || target.mAbandoned) return null;
+        return target.macapkAcquireVideoBuffer(nInts);
+    }
 
     /**
      * Construct a new SurfaceTexture to stream images to a given OpenGL texture.
@@ -373,6 +408,7 @@ public class SurfaceTexture {
         if (cam != 0) {
             latchCameraFrameToGl(cam, tex);
         } else if (vArgb != null) {
+            macapkTracePixels("gl-latch", vArgb, vW, vH);
             latchDecodedFrameToGl(vArgb, vW, vH, vStride, tex, vPremul);
             if (vRecycle != null) vRecycle.accept(vArgb);
         }
@@ -469,11 +505,22 @@ public class SurfaceTexture {
                     android.opengl.GLES20.GL_CLAMP_TO_EDGE);
             }
             mLatchRgba.position(0);
-            android.opengl.GLES20.glTexImage2D(
-                android.opengl.GLES20.GL_TEXTURE_2D, 0,
-                android.opengl.GLES20.GL_RGBA, w, h, 0,
-                android.opengl.GLES20.GL_RGBA,
-                android.opengl.GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+            if (mGlUploadedTex == tex && mGlUploadedW == w && mGlUploadedH == h) {
+                android.opengl.GLES20.glTexSubImage2D(
+                    android.opengl.GLES20.GL_TEXTURE_2D, 0,
+                    0, 0, w, h,
+                    android.opengl.GLES20.GL_RGBA,
+                    android.opengl.GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+            } else {
+                android.opengl.GLES20.glTexImage2D(
+                    android.opengl.GLES20.GL_TEXTURE_2D, 0,
+                    android.opengl.GLES20.GL_RGBA, w, h, 0,
+                    android.opengl.GLES20.GL_RGBA,
+                    android.opengl.GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+                mGlUploadedTex = tex;
+                mGlUploadedW = w;
+                mGlUploadedH = h;
+            }
             if (!mGlUploadCheckedOnce) {
                 mGlUploadCheckedOnce = true;
                 // One diagnostic error read on the first upload only, so the
@@ -533,22 +580,37 @@ public class SurfaceTexture {
         }
         mLatchRgba.order(java.nio.ByteOrder.LITTLE_ENDIAN);
         mLatchRgba.clear();
-        for (int y = 0; y < h; y++) {
-            int row = y * strideInPixels;
-            for (int x = 0; x < w; x++) {
-                int p = argb[row + x];
-                if (premul && (p >>> 24) != 0xff) p = premultiplyArgb(p);
-                // p = 0xAARRGGBB. Target memory bytes (LE putInt writes
-                // low-byte-first): R, G, B, A -- so the int VALUE written
-                // must be 0xAABBGGRR (A stays at bits24-31, G stays at
-                // bits8-15, R and B swap between bits0-7 and bits16-23).
-                int swapped = (p & 0xFF00FF00)
-                            | ((p & 0x00FF0000) >>> 16)
-                            | ((p & 0x000000FF) << 16);
-                mLatchRgba.putInt(swapped);
+        boolean converted = false;
+        if (sNativeVideoSwizzle) {
+            try {
+                converted = com.macapk.loader.NativeCocoa.convertVideoArgbToRgba(
+                    argb, mLatchRgba, w, h, strideInPixels, premul);
+            } catch (UnsatisfiedLinkError oldRuntime) {
+                sNativeVideoSwizzle = false;
             }
         }
-        mLatchRgba.position(0);
+        if (!converted) {
+            if (mSwappedLineBuf == null || mSwappedLineBuf.length < w) {
+                mSwappedLineBuf = new int[w];
+            }
+            java.nio.IntBuffer intBuf = mLatchRgba.asIntBuffer();
+            for (int y = 0; y < h; y++) {
+                int row = y * strideInPixels;
+                for (int x = 0; x < w; x++) {
+                    int p = argb[row + x];
+                    if (premul && (p >>> 24) != 0xff) p = premultiplyArgb(p);
+                    // p = 0xAARRGGBB. Target memory bytes (LE putInt writes
+                    // low-byte-first): R, G, B, A -- so the int VALUE written
+                    // must be 0xAABBGGRR (A stays at bits24-31, G stays at
+                    // bits8-15, R and B swap between bits0-7 and bits16-23).
+                    mSwappedLineBuf[x] = (p & 0xFF00FF00)
+                                       | ((p & 0x00FF0000) >>> 16)
+                                       | ((p & 0x000000FF) << 16);
+                }
+                intBuf.put(mSwappedLineBuf, 0, w);
+            }
+        }
+        mLatchRgba.position(0).limit(need);
         mLatchGeneration++;
         try {
             android.opengl.EGLContext ctx = android.opengl.EGL14.eglGetCurrentContext();
@@ -576,11 +638,22 @@ public class SurfaceTexture {
                     android.opengl.GLES20.GL_TEXTURE_WRAP_T,
                     android.opengl.GLES20.GL_CLAMP_TO_EDGE);
             }
-            android.opengl.GLES20.glTexImage2D(
-                android.opengl.GLES20.GL_TEXTURE_2D, 0,
-                android.opengl.GLES20.GL_RGBA, w, h, 0,
-                android.opengl.GLES20.GL_RGBA,
-                android.opengl.GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+            if (mGlUploadedTex == tex && mGlUploadedW == w && mGlUploadedH == h) {
+                android.opengl.GLES20.glTexSubImage2D(
+                    android.opengl.GLES20.GL_TEXTURE_2D, 0,
+                    0, 0, w, h,
+                    android.opengl.GLES20.GL_RGBA,
+                    android.opengl.GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+            } else {
+                android.opengl.GLES20.glTexImage2D(
+                    android.opengl.GLES20.GL_TEXTURE_2D, 0,
+                    android.opengl.GLES20.GL_RGBA, w, h, 0,
+                    android.opengl.GLES20.GL_RGBA,
+                    android.opengl.GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+                mGlUploadedTex = tex;
+                mGlUploadedW = w;
+                mGlUploadedH = h;
+            }
             android.opengl.GLES20.glBindTexture(
                 android.opengl.GLES20.GL_TEXTURE_2D, saved[0]);
         } catch (Throwable t) {
@@ -597,6 +670,8 @@ public class SurfaceTexture {
      *  is the GLES 2.0 core enum (gl2.h). */
     private static final int GL_TEXTURE_BINDING_2D = 0x8069;
     private static volatile boolean sWarnedGlUploadFailed;
+    private static volatile boolean sNativeVideoSwizzle =
+        !"0".equals(System.getenv("MACAPK_VIDEO_NATIVE_SWIZZLE"));
 
     /**
      * Releases the texture content. Needed in single buffered mode to let the
@@ -636,6 +711,10 @@ public class SurfaceTexture {
         if (err) {
             throw new RuntimeException("Error during detachFromGLContext (see logcat for details)");
         }
+        mGlParamsSetForTex = 0;
+        mGlUploadedTex = 0;
+        mGlUploadedW = 0;
+        mGlUploadedH = 0;
     }
 
     /**
@@ -731,8 +810,13 @@ public class SurfaceTexture {
         // mAbandoned under mLock first, and every null it could still see is
         // handled by the reallocation guards.
         mLatchRgba = null;
+        mSwappedLineBuf = null;
         mLatchArgb = null;
         mLatchBitmap = null;
+        mGlUploadedTex = 0;
+        mGlUploadedW = 0;
+        mGlUploadedH = 0;
+        mVideoBufferPool.clear();
     }
 
     /**
@@ -905,6 +989,12 @@ public class SurfaceTexture {
         }
     }
 
+    public static void macapkUnregisterVideoTarget(SurfaceTexture target) {
+        if (sActiveVideoTarget != null && (target == null || sActiveVideoTarget.get() == target)) {
+            sActiveVideoTarget = null;
+        }
+    }
+
     /** Cheap peek for cocoa_bridge.mm's CocoaPresentVideoFrame to make
      *  BEFORE paying for a pixel copy: is there a live registered target at
      *  all? Abandoned counts as "no" even if still referenced, matching
@@ -934,6 +1024,13 @@ public class SurfaceTexture {
         return true;
     }
 
+    private static final float[] VIDEO_TRANSFORM_MATRIX = {
+        1.0f,  0.0f, 0.0f, 0.0f,
+        0.0f, -1.0f, 0.0f, 0.0f,
+        0.0f,  0.0f, 1.0f, 0.0f,
+        0.0f,  1.0f, 0.0f, 1.0f,
+    };
+
     /** Mac.apk framework-internal PRODUCER entry point, decoded-video shape
      *  (the sole caller is macapkOfferDecodedFrame above). Unlike
      *  macapkQueueFrame (the metadata-only, pull-the-pixels-later shape the
@@ -942,7 +1039,7 @@ public class SurfaceTexture {
      *  delegate of the per-instance macapkQueueProducerFrame below, with no
      *  transform and no recycler, which is exactly what it always did. */
     void macapkQueueDecodedFrame(int[] argb, int width, int height, int strideInPixels) {
-        macapkQueueProducerFrame(argb, width, height, strideInPixels, null, null, false);
+        macapkQueueProducerFrame(argb, width, height, strideInPixels, VIDEO_TRANSFORM_MATRIX, mVideoBufferRecycler, false);
     }
 
     // ---- Per-instance pixel producer (EGL window surfaces) ----------------
@@ -1014,6 +1111,7 @@ public class SurfaceTexture {
                                          int strideInPixels, float[] transform,
                                          java.util.function.Consumer<int[]> recycler,
                                          boolean premultipliedSource) {
+        macapkTracePixels("queue", argb, width, height);
         Handler h;
         int[] superseded = null;
         java.util.function.Consumer<int[]> supersededRecycler = null;
@@ -1059,12 +1157,30 @@ public class SurfaceTexture {
             h = mOnFrameAvailableHandler;
         }
         if (supersededRecycler != null) supersededRecycler.accept(superseded);
+        if (mOwnerSurfaceView != null) {
+            android.view.SurfaceView sv = mOwnerSurfaceView.get();
+            if (sv != null) sv.macapkPresentFrame(argb, width, height);
+        }
         // AOSP postEventFromNative shape, same as macapkQueueFrame: dispatched
         // on the listener's thread, never inline on the producer's (which for
         // decoded video is whatever thread called releaseOutputBuffer --
         // MediaCodec's own async dispatch thread, or the app's own; for a GL
         // window surface, the app's EGL thread inside eglSwapBuffers).
         if (h != null) h.sendEmptyMessage(0);
+    }
+
+    private long macapkTraceQueue, macapkTraceLatch;
+    private void macapkTracePixels(String stage, int[] pixels, int w, int h) {
+        if (!"1".equals(System.getenv("MACAPK_VIDEO_FRAME_TRACE")) || pixels == null) return;
+        long n = "queue".equals(stage) ? ++macapkTraceQueue : ++macapkTraceLatch;
+        if (n > 3 && n % 60 != 0) return;
+        int hash = 1;
+        for (int i = 0; i < pixels.length; i += Math.max(1, pixels.length / 256))
+            hash = 31 * hash + pixels[i];
+        System.err.println("[video-frame] " + stage + " st=" + System.identityHashCode(this)
+            + " tex=" + mTexName + " n=" + n + " size=" + w + "x" + h
+            + " hash=" + Integer.toHexString(hash) + " producer=" + (mProducer != null)
+            + " owner=" + (mOwnerSurfaceView != null && mOwnerSurfaceView.get() != null));
     }
 
     /** Consume the pushed frame's owner hooks under mLock: apply its own

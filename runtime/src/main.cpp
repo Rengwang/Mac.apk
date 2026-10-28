@@ -511,7 +511,8 @@ CliArgs ParseArgs(int argc, char** argv) {
         else if (s == "-h" || s == "--help") { Usage(argv[0]); std::exit(0); }
         else { Usage(argv[0]); std::exit(2); }
     }
-    if (a.apk.empty() && a.peek_manifest.empty() && a.gles_scan.empty() && a.gms_args.empty()) { Usage(argv[0]); std::exit(2); }
+    if (a.apk.empty() && a.peek_manifest.empty() && a.peek_window_policy.empty()
+        && a.gles_scan.empty() && a.gms_args.empty()) { Usage(argv[0]); std::exit(2); }
     // CLI flag wins; env var is the next fallback; the default is
     // expanded later (we need $HOME).
     if (a.android_root.empty()) {
@@ -1845,11 +1846,29 @@ static bool SizeWindowByPolicy(const std::string& apk, const std::string& cli_ro
         return false;
     }
     std::string warnings;
-    const winpolicy::DeviceSettings settings = winpolicy::SettingsFromEnv(&warnings);
+    winpolicy::DeviceSettings settings = winpolicy::SettingsFromEnv(&warnings);
     if (!warnings.empty())
         std::fprintf(stderr, "[macapk] window-policy: %s\n", warnings.c_str());
     const std::string pref_path =
         winpolicy::UserPrefPath(ResolveAndroidRootDir(cli_root), traits.package);
+    const std::string window_mode_path = ResolveAndroidRootDir(cli_root)
+        + "/.macapk/window_mode/" + traits.package;
+    CocoaWindowMode window_mode = CocoaWindowMode::kDefault;
+    {
+        std::ifstream in(window_mode_path);
+        std::string value;
+        if (in >> value) {
+            if (value == "fit") window_mode = CocoaWindowMode::kFitContent;
+            else if (value == "free") window_mode = CocoaWindowMode::kFreeResize;
+            else if (value != "default")
+                std::fprintf(stderr, "[macapk] window-policy: unrecognized window mode '%s' in %s; using default\n",
+                             value.c_str(), window_mode_path.c_str());
+        }
+    }
+    std::fprintf(stderr, "[macapk] window-policy: per-app window mode=%s (%s)\n",
+                 window_mode == CocoaWindowMode::kFitContent ? "fit"
+                 : window_mode == CocoaWindowMode::kFreeResize ? "free" : "default",
+                 window_mode_path.c_str());
     // MACAPK_WINDOW_PREF pins the Cmd+R preference for this run and wins over
     // the per-app file; while it is set Cmd+R does not write the file either,
     // so a harness run can neither read nor leave behind someone's choice.
@@ -1867,6 +1886,29 @@ static bool SizeWindowByPolicy(const std::string& apk, const std::string& cli_ro
                          "(default|portrait); using the per-app file\n", e);
         }
     }
+    // Restore a previous normal content size BEFORE resolving and creating the
+    // placeholder. This avoids opening at monitor size then snapping to a
+    // portrait app after its first runtime orientation request.
+    if (window_mode != CocoaWindowMode::kDefault) {
+        const std::string size_path = ResolveAndroidRootDir(cli_root)
+            + "/.macapk/window_size/" + traits.package;
+        std::ifstream saved(size_path);
+        int sw = 0, sh = 0;
+        if ((saved >> sw >> sh) && sw >= 220 && sh >= 220 && sw <= 8192 && sh <= 8192) {
+            const float bs = budget.backing_scale > 0 ? budget.backing_scale : 2.f;
+            const float fit = std::min(1.f, std::min(budget.width_px / (sw * bs),
+                                                     budget.height_px / (sh * bs)));
+            budget.width_px = static_cast<int>(std::lround(sw * bs * fit));
+            budget.height_px = static_cast<int>(std::lround(sh * bs * fit));
+            budget.display_sw_dp = 0;
+            // A remembered desktop window can be smaller than a tablet. Keep
+            // resolving its app box instead of falling back to monitor-sized
+            // legacy launch geometry merely because its short side is <600dp.
+            if (settings.ignore_orientation_request == winpolicy::IgnoreOrientationMode::kAuto)
+                settings.ignore_orientation_request = winpolicy::IgnoreOrientationMode::kOn;
+            budget_desc += ", restored content=" + std::to_string(sw) + "x" + std::to_string(sh) + "pt";
+        }
+    }
     const winpolicy::WindowDecision d = winpolicy::Resolve(traits, budget, settings, pref);
     std::fprintf(stderr,
         "[macapk] window-policy (%s): %s | budget %s, %s, pref=%s (%s)%s%s\n", phase,
@@ -1879,7 +1921,7 @@ static bool SizeWindowByPolicy(const std::string& apk, const std::string& cli_ro
         g_window_policy.decision = d;
         return false;
     }
-    CocoaInstallWindowPolicy(traits, settings, pref_path, pref, persist_pref);
+    CocoaInstallWindowPolicy(traits, settings, pref_path, pref, persist_pref, window_mode);
     CocoaApplyWindowDecision(d, budget);
     g_window_policy.sized = true;
     g_window_policy.scale = budget.backing_scale;

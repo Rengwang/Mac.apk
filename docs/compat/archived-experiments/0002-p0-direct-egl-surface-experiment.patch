@@ -1,0 +1,628 @@
+diff --git a/runtime/java/android/view/SurfaceView.java b/runtime/java/android/view/SurfaceView.java
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -1442,7 +1442,7 @@
+      *  formula for the video plane (macapkActiveVideoRectPacked) and the
+      *  placement of a lockCanvas surface, so a hole and its plane cannot drift
+      *  apart; the v1.0.997 correction it carries is documented there. */
+-    private void macapkWindowOrigin(int[] out) {
++    public void macapkWindowOrigin(int[] out) {
+         int[] loc = new int[2];
+         getLocationInWindow(loc);
+         View root = getRootView();
+@@ -1503,6 +1503,50 @@
+         }
+         return k;
+     }
++
++    /** Painting-order key for a surface layer: the view's position in the
++     *  hierarchy, packed root-first, 5 bits per level (indexOfChild saturates
++     *  at 31, far beyond any real sibling count; 12 levels covers every layout
++     *  we have measured).
++     *
++     *  WHY IT MATTERS. Two SurfaceViews can cover the SAME rect -- Bilibili's
++     *  player puts the video and the danmaku on two full-window
++     *  `render.core` surfaces -- and on a device SurfaceFlinger composites
++     *  their SurfaceControls in the order the window lays them out. This
++     *  framework used ONE constant z for every below-window surface
++     *  (overlay - 0.25), so the order was whatever CALayer insertion order
++     *  happened to be: the video layer covered the danmaku layer completely
++     *  (measured 2026-10-28: danmaku invisible, two layers both "shown
++     *  0,0 1040x1334"). Sorting the layers by this key restores the device's
++     *  paint order for every app with overlapping surfaces, not just this one.
++     *
++     *  Walking up is O(depth) -- a handful of pointer hops, once per layer per
++     *  tick -- and allocates nothing. */
++    public static long macapkSurfaceOrderKey(int key) {
++        java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
++        SurfaceView v = ref != null ? ref.get() : null;
++        if (v == null) return 0L;
++        long k = 0;
++        android.view.View cur = v;
++        for (int depth = 0; depth < 12; depth++) {
++            android.view.ViewParent p = cur.getParent();
++            if (!(p instanceof android.view.ViewGroup)) break;
++            int idx = ((android.view.ViewGroup) p).indexOfChild(cur);
++            if (idx < 0) idx = 0;
++            k = (k << 5) | (long) (idx & 0x1f);
++            if (!(p instanceof android.view.View)) break;
++            cur = (android.view.View) p;
++        }
++        return k;
++    }
++
++    /** P0 (2026-10-28): the framework's OWN per-surface layer key for this
++     *  view. A direct (EGL window) layer must be placed by the SAME rect pull
++     *  that positions the canvas hole it shows through -- if the two come from
++     *  different numbers the plane drifts from the hole (the
++     *  measure-and-layout-must-share-one-height lesson of v1.0.865). So the
++     *  direct layer has to live in this key space rather than invent one. */
++    public int macapkDirectLayerKey() { return macapkSurfaceKey(); }
+ 
+     /** 0 = not probed, 1 = the runtime has a per-surface layer, -1 = it does not. */
+     private static volatile int sSurfaceLayerState;
+diff --git a/runtime/java/javax/microedition/khronos/egl/MacApkEGL10.java b/runtime/java/javax/microedition/khronos/egl/MacApkEGL10.java
+--- a/runtime/java/javax/microedition/khronos/egl/MacApkEGL10.java
++++ b/runtime/java/javax/microedition/khronos/egl/MacApkEGL10.java
+@@ -286,6 +286,7 @@
+         final MacApkGlWindow window;               // null for a pbuffer
+         private final int hash;
+         volatile boolean destroyed;
++        int directLayerKey;
+         RealSurface(RealDisplay d, android.opengl.EGLSurface pbuffer, MacApkGlWindow window) {
+             dpy = d; this.pbuffer = pbuffer; this.window = window;
+             hash = Long.hashCode(nativeSurface().getNativeHandle());
+@@ -558,7 +559,25 @@
+     @Override public EGLSurface eglCreateWindowSurface(EGLDisplay display, EGLConfig config,
+             Object nativeWindow, int[] attribList) {
+         RealDisplay d = realDisplay(display);
+-        if (d == null || onSurfaceViewGlThread(false)) {
++        if (d == null) {
++            return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
++        }
++        // P0 DIRECT WINDOW: a SurfaceView's Surface gets its own CAMetalLayer
++        // and the app's GL output presents into it -- no pbuffer, no
++        // glReadPixels, no int[] hand-off (that round trip measured ~12 ns/px,
++        // i.e. ~16 ms per full-window swap, ~35% of a core for Bilibili's
++        // player). Only for a Surface OWNED by a SurfaceView: a bare
++        // SurfaceTexture must keep the sampling path (AOSP lets TextureView
++        // take part in the parent's transform/clip).
++        if (DIRECT_WINDOW) {
++            DirectCreated direct = tryDirectWindowSurface(d, config, nativeWindow, attribList);
++            if (direct != null && direct.surface.getNativeHandle() != 0) {
++                RealSurface result = new RealSurface(d, direct.surface, null);
++                result.directLayerKey = direct.key;
++                return result;
++            }
++        }
++        if (onSurfaceViewGlThread(false)) {
+             return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
+         }
+         // EGLImpl.eglCreateWindowSurface's dispatch, in its order.
+@@ -620,7 +639,9 @@
+         }
+         s.destroyed = true;
+         nativeCall();
+-        return s.window != null ? s.window.destroy() : EGL14.eglDestroySurface(s.dpy.h, s.pbuffer);
++        boolean ok = s.window != null ? s.window.destroy() : EGL14.eglDestroySurface(s.dpy.h, s.pbuffer);
++        if (ok && s.directLayerKey != 0) nativeReleaseDirectLayer(s.directLayerKey);
++        return ok;
+     }
+ 
+     @Override public boolean eglMakeCurrent(EGLDisplay display, EGLSurface draw,
+@@ -1022,6 +1043,56 @@
+         @Override public int hashCode() { return Long.hashCode(h.getNativeHandle()); }
+     }
+ 
++    /** P0: build a window surface on a per-Surface layer. Returns null when
++     *  the target is not a SurfaceView's Surface, or the runtime has no
++     *  render view yet (then the caller falls back to the legacy path). */
++    private static final java.util.concurrent.atomic.AtomicInteger sDirectLayerIds =
++        new java.util.concurrent.atomic.AtomicInteger(1);
++    private static final class DirectCreated {
++        final android.opengl.EGLSurface surface; final int key;
++        DirectCreated(android.opengl.EGLSurface surface, int key) { this.surface = surface; this.key = key; }
++    }
++    private DirectCreated tryDirectWindowSurface(RealDisplay d, EGLConfig config,
++            Object nativeWindow, int[] attribList) {
++        try {
++            android.view.Surface sur = null;
++            if (nativeWindow instanceof android.view.SurfaceView) {
++                sur = ((android.view.SurfaceView) nativeWindow).getHolder().getSurface();
++            } else if (nativeWindow instanceof android.view.SurfaceHolder) {
++                sur = ((android.view.SurfaceHolder) nativeWindow).getSurface();
++            } else if (nativeWindow instanceof android.view.Surface) {
++                sur = (android.view.Surface) nativeWindow;
++            }
++            if (sur == null) return null;
++            android.view.SurfaceView owner = sur.macapkGetOwnerSurfaceView();
++            if (owner == null) return null;      // not a SurfaceView's Surface
++            int w = owner.getWidth(), h = owner.getHeight();
++            if (w <= 0 || h <= 0) return null;
++            int[] origin = new int[2];
++            owner.macapkWindowOrigin(origin);
++            // The framework's own per-surface key (see
++            // SurfaceView.macapkDirectLayerKey): it is what
++            // macapkSurfaceRectPacked(key) answers for, and that pull is what
++            // keeps the layer glued to the view every frame.
++            int key = owner.macapkDirectLayerKey();
++            if (key == 0) return null;
++            android.opengl.EGLSurface direct = nativeCreateDirectWindowSurface(
++                d.h, ((RealConfig) config).h, attribList, key,
++                origin[0], origin[1], w, h);
++            if (direct == null || direct.getNativeHandle() == 0) {
++                survivorLog(false, "direct window: no surface for key " + key
++                    + " (angle_glue.cpp logged why)");
++                return null;
++            }
++            survivorLog(true, "direct window surface for key " + key + " at "
++                + origin[0] + "," + origin[1] + " " + w + "x" + h);
++            return new DirectCreated(direct, key);
++        } catch (Throwable t) {
++            survivorLog(false, "direct window: " + t);
++            return null;
++        }
++    }
++
+     /** runtime/src/angle_glue.cpp: an ANGLE window surface on the SurfaceView's
+      *  native window (the dedicated native-EGL CAMetalLayer), or null. Called
+      *  with a null display it does nothing and returns null, which is how
+@@ -1029,6 +1100,22 @@
+      *  macapk::RegisterAngleGlueNatives; absent in a runtime older than this. */
+     private static native android.opengl.EGLSurface nativeCreateSurfaceViewWindow(
+         android.opengl.EGLDisplay dpy, android.opengl.EGLConfig config, int[] attribList);
++
++    // P0 (2026-10-28): an ANGLE window surface on a DEDICATED per-Surface
++    // CAMetalLayer (angle_glue.cpp CreateDirectWindowSurface). Unlike
++    // nativeCreateSurfaceViewWindow (the global native-EGL layer, one slot for
++    // the whole process) this never collides with another consumer, so the
++    // app's GL output presents straight to the screen instead of going
++    // through a pbuffer + glReadPixels + int[] + upload on every swap.
++    private static native void nativeReleaseDirectLayer(int key);
++    private static native android.opengl.EGLSurface nativeCreateDirectWindowSurface(
++        android.opengl.EGLDisplay dpy, android.opengl.EGLConfig config, int[] attribList,
++        int key, int x, int y, int w, int h);
++
++    /** MACAPK_SV_GL_DIRECT=1: EGL window surfaces on a SurfaceView's Surface
++     *  get a dedicated layer and present directly (P0). Default OFF. */
++    private static final boolean DIRECT_WINDOW =
++        "1".equals(System.getenv("MACAPK_SV_GL_DIRECT"));
+ 
+     /** 0 = not probed yet, 1 = bound, -1 = missing. */
+     private static volatile int sSurvivorNative;
+diff --git a/runtime/src/angle_glue.cpp b/runtime/src/angle_glue.cpp
+--- a/runtime/src/angle_glue.cpp
++++ b/runtime/src/angle_glue.cpp
+@@ -1088,6 +1088,68 @@
+     return reinterpret_cast<void*>(static_cast<intptr_t>(h));
+ }
+ 
++// P0 (2026-10-28): a window surface on a DEDICATED per-Surface CAMetalLayer.
++// Same shape as CreateSurfaceViewWindow below, but the layer belongs to this
++// Surface only, so a second consumer does not hit ANGLE's "layer in use" and
++// fall back to a pbuffer (which costs a full-window glReadPixels per swap).
++extern "C" void* CocoaEnsureNativeEglLayerFor(int key, int x, int y, int w, int h,
++                                              int* outW, int* outH);
++
++extern "C" void CocoaReleaseDirectLayer(int key);
++static void JNICALL ReleaseDirectLayer(JNIEnv*, jclass, jint key) {
++    CocoaReleaseDirectLayer(key);
++}
++
++static jobject JNICALL CreateDirectWindowSurface(JNIEnv* env, jclass,
++                                                  jobject dpy, jobject cfg, jintArray attribs,
++                                                  jint key, jint x, jint y, jint w, jint h) {
++    if (!dpy || !cfg) return nullptr;
++    EGLDisplay d = static_cast<EGLDisplay>(HandleOf(env, dpy));
++    EGLConfig c = static_cast<EGLConfig>(HandleOf(env, cfg));
++    if (!d || !c) return nullptr;
++    int lw = 0, lh = 0;
++    void* layer = CocoaEnsureNativeEglLayerFor(key, x, y, w, h, &lw, &lh);
++    if (!layer) {
++        std::fprintf(stderr, "[E] angle: direct window: no per-surface layer for key %d "
++                             "-> EGL_NO_SURFACE\n", (int)key);
++        std::fflush(stderr);
++        return nullptr;
++    }
++    std::vector<EGLint> al;
++    if (attribs) {
++        jsize n = env->GetArrayLength(attribs);
++        al.resize(static_cast<size_t>(n));
++        if (n > 0) env->GetIntArrayRegion(attribs, 0, n, al.data());
++    }
++    EGLSurface s = eglCreateWindowSurface(d, c, reinterpret_cast<EGLNativeWindowType>(layer),
++                                          attribs ? al.data() : nullptr);
++    if (s == EGL_NO_SURFACE) {
++        std::fprintf(stderr, "[E] angle: direct window: eglCreateWindowSurface on layer %p "
++                             "(key=%d %dx%d) failed: 0x%x\n", layer, (int)key, lw, lh,
++                     eglGetError());
++        std::fflush(stderr);
++        CocoaReleaseDirectLayer(key);
++        return nullptr;
++    }
++    std::fprintf(stderr, "[I] angle: direct window surface %p on per-surface layer %p "
++                         "(key=%d %dx%d)\n", (void*)s, layer, (int)key, lw, lh);
++    std::fflush(stderr);
++    // Same boxing the SurfaceView window path uses (android.opengl.EGLSurface(long)).
++    jclass sc = env->FindClass("android/opengl/EGLSurface");
++    jmethodID ctor = sc ? env->GetMethodID(sc, "<init>", "(J)V") : nullptr;
++    jobject boxed = ctor ? env->NewObject(sc, ctor,
++                                          static_cast<jlong>(reinterpret_cast<intptr_t>(s)))
++                         : nullptr;
++    if (sc) env->DeleteLocalRef(sc);
++    if (!boxed) {
++        if (env->ExceptionCheck()) env->ExceptionClear();
++        eglDestroySurface(d, s);
++        CocoaReleaseDirectLayer(key);
++        return nullptr;
++    }
++    return boxed;
++}
++
+ static jobject JNICALL CreateSurfaceViewWindow(JNIEnv* env, jclass,
+                                                jobject dpy, jobject cfg, jintArray attribs) {
+     if (!dpy || !cfg) return nullptr;
+@@ -1139,6 +1201,15 @@
+ }
+ 
+ static const JNINativeMethod kMethods[] = {
++    {const_cast<char*>("nativeReleaseDirectLayer"), const_cast<char*>("(I)V"),
++     reinterpret_cast<void*>(ReleaseDirectLayer)},
++    {const_cast<char*>("nativeCreateDirectWindowSurface"),
++     // "[I" is the int[] (ONE I) + five int params (key,x,y,w,h) = SIX I.
++     // With one I short the JVM rejects the WHOLE table and even the
++     // pre-existing nativeCreateSurfaceViewWindow stays unbound.
++     const_cast<char*>("(Landroid/opengl/EGLDisplay;Landroid/opengl/EGLConfig;[IIIIII)"
++                       "Landroid/opengl/EGLSurface;"),
++     reinterpret_cast<void*>(CreateDirectWindowSurface)},
+     {const_cast<char*>("nativeCreateSurfaceViewWindow"),
+      const_cast<char*>("(Landroid/opengl/EGLDisplay;Landroid/opengl/EGLConfig;[I)"
+                        "Landroid/opengl/EGLSurface;"),
+diff --git a/runtime/src/cocoa_bridge.mm b/runtime/src/cocoa_bridge.mm
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -1626,6 +1626,118 @@
+ // tree (addSublayer) and reads view.window.backingScaleFactor, neither of which
+ // is safe off-main. Callers go through CocoaEnsureNativeEglLayer below, which
+ // owns the thread policy.
++// ---- P0 (2026-10-28): per-Surface dedicated native-EGL layer ----------------
++//
++// WHY. A window surface created on a CAMetalLayer presents DIRECTLY (ANGLE's
++// Metal backend swaps into it), so the app's GL output never crosses the CPU.
++// The runtime had exactly ONE such layer (g_unity_layer), so a second consumer
++// hit ANGLE's "layer in use" and fell back to a pbuffer -- and every pbuffer
++// swap costs a full-window glReadPixels + int[] + upload (measured: ~12 ns/px,
++// i.e. ~16 ms for 1040x1334, ~35% of a core for Bilibili's player).
++//
++// A layer per Surface removes the contention: PiP, a second player, an engine
++// side-car, and the Java EGL10 path each get their own swapchain.
++//
++// KEY. The Java side passes System.identityHashCode(Surface) so the same
++// Surface always maps to the same layer (a Surface's identity is stable for
++// its lifetime, and a new Surface means a new layer).
++struct MacApkPerSurfaceLayer {
++    CAMetalLayer* layer = nil;
++    int x = 0, y = 0, w = 0, h = 0;
++    float scale = 2.0f;
++};
++static std::mutex g_per_surface_layers_mu;
++static std::map<int, MacApkPerSurfaceLayer> g_per_surface_layers;
++
++// Creates or re-geometries the layer for `key`. Main thread only (the caller
++// dispatches). Returns the CAMetalLayer, or nullptr when there is no render
++// view yet (no window -> nothing to attach to).
++static void* macapk_ensure_per_surface_layer_on_main(int key, int x, int y, int w, int h,
++                                                      int* outW, int* outH) {
++    if (outW) *outW = 0;
++    if (outH) *outH = 0;
++    // Host: the SAME view the per-frame sync below places against, i.e. the
++    // one carrying the canvas overlay. g_active_render_view is right in
++    // practice but the overlay's host is the authoritative one (a window
++    // rewire can move it), so prefer it when it exists.
++    MTKView* view = g_overlay_attached_view ? g_overlay_attached_view : g_active_render_view;
++    if (!view) return nullptr;
++    CGFloat scale = view.window ? view.window.backingScaleFactor : 2.0f;
++    if (scale <= 0) scale = 2.0f;
++    // x/y/w/h arrive in Android surface pixels with a top-left origin.
++    // Use the same coordinate conversion as MacapkApplySurfaceLayerGeometry.
++    CGRect frame = CGRectMake(x / scale,
++        view.isFlipped ? y / scale : view.bounds.size.height - (y + h) / scale,
++        w / scale, h / scale);
++    CGSize drawableSize = CGSizeMake(w, h);
++
++    {
++        std::lock_guard<std::mutex> lk(g_per_surface_layers_mu);
++        auto it = g_per_surface_layers.find(key);
++        if (it != g_per_surface_layers.end()) {
++            MacApkPerSurfaceLayer& e = it->second;
++            if (e.x != x || e.y != y || e.w != w || e.h != h || e.scale != (float)scale) {
++                // CoreAnimation would otherwise interpolate a 0.25 s implicit
++                // animation on the geometry change (video switching half/full
++                // screen then stretches, tears and shows black borders).
++                [CATransaction begin];
++                [CATransaction setDisableActions:YES];
++                e.layer.frame = frame;
++                e.layer.drawableSize = drawableSize;
++                e.layer.contentsScale = scale;
++                [CATransaction commit];
++                e.x = x; e.y = y; e.w = w; e.h = h; e.scale = (float)scale;
++            }
++            if (outW) *outW = w;
++            if (outH) *outH = h;
++            return (__bridge void*)e.layer;
++        }
++    }
++
++    CAMetalLayer* ul = [CAMetalLayer layer];
++    macapk_configure_native_egl_layer(ul, view, scale);
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    ul.frame = frame;
++    ul.drawableSize = drawableSize;
++    [CATransaction commit];
++    // z is NOT set here: the per-frame sync (MacapkApplyDirectLayersGeometry)
++    // owns it, using the same rule as every other per-surface layer (overlay
++    // - 0.25, or overlay + 0.1 when the app asked setZOrderOnTop). A hardcoded
++    // 0.25 here used to put this layer BELOW the framework's angle layer
++    // (opaque black in the GL host) and the video came out black.
++    [view.layer addSublayer:ul];
++
++    {
++        std::lock_guard<std::mutex> lk(g_per_surface_layers_mu);
++        MacApkPerSurfaceLayer e;
++        e.layer = ul; e.x = x; e.y = y; e.w = w; e.h = h; e.scale = (float)scale;
++        g_per_surface_layers[key] = e;
++    }
++    if (outW) *outW = w;
++    if (outH) *outH = h;
++    std::fprintf(stderr, "[cocoa_v2] per-surface native-EGL layer key=%d -> %p (%d,%d %dx%d)\n",
++                 key, (__bridge void*)ul, x, y, w, h);
++    std::fflush(stderr);
++    return (__bridge void*)ul;
++}
++
++// Release only the unique EGL surface's layer. The queued block runs on
++// AppKit after EGL has destroyed its surface; unique keys prevent a late
++// release from deleting a replacement layer.
++extern "C" void CocoaReleaseDirectLayer(int key) {
++    auto removeLayer = ^{
++        std::lock_guard<std::mutex> lk(g_per_surface_layers_mu);
++        auto it = g_per_surface_layers.find(key);
++        if (it == g_per_surface_layers.end()) return;
++        [it->second.layer removeFromSuperlayer];
++        g_per_surface_layers.erase(it);
++        std::fprintf(stderr, "[cocoa_v2] released direct layer key=%d remaining=%zu\n", key, g_per_surface_layers.size());
++    };
++    if ([NSThread isMainThread]) removeLayer();
++    else dispatch_async(dispatch_get_main_queue(), removeLayer);
++}
++
+ static void* macapk_create_native_egl_layer_on_main(int* outW, int* outH) {
+     if (outW) *outW = 0;
+     if (outH) *outH = 0;
+@@ -1863,6 +1975,26 @@
+ // drawInMTKView, which short-circuits at the top of this function.
+ //
+ // MACAPK_NO_OFFMAIN_EGL_LAYER=1 restores the old off-main bail (A/B lever).
++extern "C" void* CocoaEnsureNativeEglLayerFor(int key, int x, int y, int w, int h,
++                                             int* outW, int* outH) {
++    // The caller is NOT the main thread: an app's GL render thread (Bilibili's
++    // ijk_ext_render) creates the window surface. CoreAnimation layer-tree
++    // mutations off the main thread are not reliably committed to the render
++    // server (the same lesson as ANGLE patch 0003), so hop to the main queue.
++    // A dispatch_sync from the main thread would deadlock, hence the check.
++    if ([NSThread isMainThread]) {
++        return macapk_ensure_per_surface_layer_on_main(key, x, y, w, h, outW, outH);
++    }
++    __block void* res = nullptr;
++    __block int rw = 0, rh = 0;
++    dispatch_sync(dispatch_get_main_queue(), ^{
++        res = macapk_ensure_per_surface_layer_on_main(key, x, y, w, h, &rw, &rh);
++    });
++    if (outW) *outW = rw;
++    if (outH) *outH = rh;
++    return res;
++}
++
+ extern "C" void* CocoaEnsureNativeEglLayer(int* outW, int* outH) {
+     // MACAPK_SV_LAYER_AT_CREATE (default ON): a pure lookup/publish of the layer
+     // made at surface creation. Everything below this block is the pre-change
+@@ -8335,6 +8467,36 @@
+     return s;
+ }
+ 
++/** Painting order of a surface layer within the view hierarchy (root-first
++ *  index chain, see SurfaceView.macapkSurfaceOrderKey). Used to sort the
++ *  layers: a device composites overlapping SurfaceControls in layout order,
++ *  while CALayer insertion order is arbitrary -- which let a full-window video
++ *  layer cover a full-window danmaku layer completely. */
++static long long MacapkQuerySurfaceOrder(JNIEnv* env, int key) {
++    static jclass    s_cls   = nullptr;
++    static jmethodID s_mid   = nullptr;
++    static bool      s_tried = false;
++    if (!s_tried && env) {
++        s_tried = true;
++        jclass c = env->FindClass("android/view/SurfaceView");
++        if (!c) {
++            env->ExceptionClear();
++        } else {
++            s_mid = env->GetStaticMethodID(c, "macapkSurfaceOrderKey", "(I)J");
++            if (!s_mid) env->ExceptionClear();
++            else        s_cls = (jclass) env->NewGlobalRef(c);
++            env->DeleteLocalRef(c);
++        }
++        if (!s_cls)
++            std::fprintf(stderr, "[W] cocoa_v2: SurfaceView.macapkSurfaceOrderKey "
++                                 "not found -- surface layers keep insertion order\n");
++    }
++    if (!env || !s_cls || !s_mid) return 0;
++    jlong v = env->CallStaticLongMethod(s_cls, s_mid, static_cast<jint>(key));
++    if (env->ExceptionCheck()) { env->ExceptionClear(); return 0; }
++    return static_cast<long long>(v);
++}
++
+ static jlong MacapkQuerySurfaceRectPacked(JNIEnv* env, int key) {
+     const MacapkSurfacePulls& p = MacapkSurfacePullMethods(env);
+     if (!env || !p.cls || !p.rect) return -1;
+@@ -8353,7 +8515,8 @@
+ 
+ /** Place one surface layer for this frame. Returns false when it must not be
+  *  shown (hidden, gone, or no host yet). Main thread only. */
+-static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* layer) {
++static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* layer,
++                                           CGFloat zBelow) {
+     CALayer* overlay = g_canvas_overlay_layer;
+     MTKView* host = g_overlay_attached_view;
+     if (!overlay || !host) { if (!layer.hidden) layer.hidden = YES; return false; }
+@@ -8387,7 +8550,8 @@
+     want.size.width  = wpx / scale;
+     want.size.height = hpx / scale;
+     if (!CGRectEqualToRect(layer.frame, want)) layer.frame = want;
+-    const CGFloat z = overlay.zPosition + (MacapkQuerySurfaceOnTop(env, key) ? 0.1 : -0.25);
++    const CGFloat z = MacapkQuerySurfaceOnTop(env, key)
++                        ? overlay.zPosition + 0.1 : zBelow;
+     if (layer.zPosition != z) layer.zPosition = z;
+     if (layer.contentsScale != host.layer.contentsScale)
+         layer.contentsScale = host.layer.contentsScale;
+@@ -8439,14 +8603,121 @@
+     std::fflush(stderr);
+ }
+ 
++/** P0 (2026-10-28): the same per-tick placement for the DIRECT (EGL window)
++ *  layers, which are CAMetalLayers ANGLE presents into rather than layers we
++ *  hand `contents`.
++ *
++ *  Without this, a direct layer was positioned ONCE, from numbers the Java
++ *  side passed in surface pixels treated as points -- so the layer was twice
++ *  the host in points and its drawable was 4x the pixels it needed, and it
++ *  never followed the view afterwards (scroll, rotation, a re-parent). It also
++ *  never HIDDEN: once created it stayed on screen regardless of whether its
++ *  SurfaceView was still shown.
++ *
++ *  The rect comes from MacapkQuerySurfaceRectPacked -- the very pull that
++ *  positions the per-surface layer AND the canvas hole this one shows
++ *  through, so plane and hole can no longer disagree.
++ *
++ *  Main thread only (the caller runs in drawInMTKView). */
++static void MacapkApplyOneDirectLayerGeometry(JNIEnv* env, int key, CAMetalLayer* ul,
++                                              CGFloat z) {
++    CALayer* overlay = g_canvas_overlay_layer;
++    MTKView* host = g_overlay_attached_view;
++    if (!env || !overlay || !host || !ul) return;
++    CGFloat scale = host.window ? host.window.backingScaleFactor : 2.0;
++    if (scale <= 0) scale = 2.0;
++    {
++        if (ul.superlayer != host.layer) {
++            [ul removeFromSuperlayer];
++            [host.layer addSublayer:ul];
++        }
++        jlong packed = MacapkQuerySurfaceRectPacked(env, key);
++        if (packed == 0 || packed == -1) {          // view gone / not shown
++            if (!ul.hidden) ul.hidden = YES;
++            return;
++        }
++        int16_t xs  = (int16_t) ((packed >> 48) & 0xffff);
++        int16_t ys  = (int16_t) ((packed >> 32) & 0xffff);
++        int     wpx = (int)     ((packed >> 16) & 0xffff);
++        int     hpx = (int)     ( packed        & 0xffff);
++        if (wpx <= 0 || hpx <= 0) {
++            if (!ul.hidden) ul.hidden = YES;
++            return;
++        }
++        CGFloat viewHpt = host.bounds.size.height;
++        CGRect want;
++        want.origin.x    = xs / scale;
++        want.origin.y    = host.isFlipped ? (ys / scale)
++                                          : (viewHpt - (ys + hpx) / scale);
++        want.size.width  = wpx / scale;
++        want.size.height = hpx / scale;
++        CGSize wantDrawable = CGSizeMake(wpx, hpx);   // surface px, not points
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];   // else CA interpolates 0.25 s
++        if (!CGRectEqualToRect(ul.frame, want))       ul.frame = want;
++        if (!CGSizeEqualToSize(ul.drawableSize, wantDrawable)) ul.drawableSize = wantDrawable;
++        if (ul.zPosition != z)                        ul.zPosition = z;
++        [CATransaction commit];
++        if (ul.hidden) ul.hidden = NO;
++    }
++}
++
+ /** Per drawInMTKView tick: keep every surface layer glued to its view (a
+  *  paused game must still move with its layout) and drop the gone ones. */
++struct MacApkLayerEntry {
++    int      key;
++    CALayer* layer;
++    bool     direct;
++    long long order;
++};
++
+ static void MacapkApplySurfaceLayersGeometry(JNIEnv* env) {
+-    if (!g_surface_layers || g_surface_layers.count == 0) return;
+-    NSArray* keys = [g_surface_layers allKeys];
+-    for (NSNumber* nk in keys) {
+-        CALayer* layer = g_surface_layers[nk];
+-        if (layer) (void) MacapkApplySurfaceLayerGeometry(env, nk, layer);
++    CALayer* overlay = g_canvas_overlay_layer;
++    MTKView* host = g_overlay_attached_view;
++    if (!env || !overlay || !host) return;
++
++    // Collect every surface layer (bitmap-backed and direct/EGL), then apply
++    // them in VIEW-HIERARCHY order rather than insertion order. Two
++    // SurfaceViews can cover the same rect (Bilibili: video and danmaku on two
++    // full-window render.core surfaces); on a device SurfaceFlinger orders
++    // their SurfaceControls by the layout, and with a single constant z the
++    // video layer covered the danmaku layer entirely.
++    std::vector<MacApkLayerEntry> entries;
++    if (g_surface_layers && g_surface_layers.count > 0) {
++        for (NSNumber* nk in [g_surface_layers allKeys]) {
++            CALayer* layer = g_surface_layers[nk];
++            if (!layer) continue;
++            entries.push_back({nk.intValue, layer, false,
++                               MacapkQuerySurfaceOrder(env, nk.intValue)});
++        }
++    }
++    {
++        std::lock_guard<std::mutex> lk(g_per_surface_layers_mu);
++        for (auto& kv : g_per_surface_layers) {
++            if (!kv.second.layer) continue;
++            entries.push_back({kv.first, (CALayer*) kv.second.layer, true,
++                               MacapkQuerySurfaceOrder(env, kv.first)});
++        }
++    }
++    std::sort(entries.begin(), entries.end(),
++              [](const MacApkLayerEntry& a, const MacApkLayerEntry& b) {
++                  if (a.order != b.order) return a.order < b.order;
++                  return a.key < b.key;    // stable, deterministic tie-break
++              });
++
++    for (size_t i = 0; i < entries.size(); i++) {
++        // A tiny per-rank step inside the band below the overlay: enough to
++        // order the stack, far too small to reach the overlay itself (0.25)
++        // or the next band up (setZOrderOnTop at +0.1).
++        const CGFloat z = overlay.zPosition - 0.25 + (CGFloat) i * 1e-4;
++        if (entries[i].direct) {
++            MacapkApplyOneDirectLayerGeometry(env, entries[i].key,
++                                             (CAMetalLayer*) entries[i].layer, z);
++        } else {
++            (void) MacapkApplySurfaceLayerGeometry(env,
++                                                   @(entries[i].key),
++                                                   entries[i].layer, z);
++        }
+     }
+ }
+ 
+@@ -8522,7 +8793,13 @@
+                 std::fprintf(stderr, "[I] cocoa_v2: surface layer %d created (%dx%d)\n",
+                              key, width, height);
+             }
+-            if (!MacapkApplySurfaceLayerGeometry(MacapkMainThreadEnv(), nk, layer)) return;
++            // z: the per-tick pass owns ordering; on the present path use the
++            // bottom of the below-overlay band so a freshly presented layer is
++            // never above a sibling that the next tick will sort under it.
++            if (!MacapkApplySurfaceLayerGeometry(MacapkMainThreadEnv(), nk, layer,
++                                                 (g_canvas_overlay_layer
++                                                  ? g_canvas_overlay_layer.zPosition : 1.0) - 0.25))
++                return;
+             layer.contents = imageObj;
+         };
+         if ([NSThread isMainThread]) mainBlock();

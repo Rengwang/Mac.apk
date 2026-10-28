@@ -97,7 +97,6 @@ public final class MacApkGlWindow {
 
     // Readback scratch (the swapping thread only) and the recycled frames.
     private java.nio.ByteBuffer mRgba;
-    private byte[] mBytes;
     private final java.util.concurrent.ConcurrentLinkedQueue<int[]> mFree =
         new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final java.util.function.Consumer<int[]> mRecycler = mFree::offer;
@@ -139,7 +138,21 @@ public final class MacApkGlWindow {
 
     private static int[] defaultSize(SurfaceTexture st) {
         int w = st.macapkGetDefaultWidth(), h = st.macapkGetDefaultHeight();
-        if (w <= 0 || h <= 0) { w = 1; h = 1; }   // BufferQueueCore's default
+        if (w <= 1 || h <= 1) {
+            try {
+                android.util.DisplayMetrics dm = android.content.res.Resources.getSystem().getDisplayMetrics();
+                if (dm != null && dm.widthPixels > 0 && dm.heightPixels > 0) {
+                    w = dm.widthPixels;
+                    h = dm.heightPixels;
+                } else {
+                    w = 1280;
+                    h = 720;
+                }
+            } catch (Throwable t) {
+                w = 1280;
+                h = 720;
+            }
+        }
         return new int[] { w, h };
     }
 
@@ -177,7 +190,6 @@ public final class MacApkGlWindow {
             mRgba = java.nio.ByteBuffer.allocateDirect(n * 4)
                 .order(java.nio.ByteOrder.nativeOrder());
         }
-        if (mBytes == null || mBytes.length < n * 4) mBytes = new byte[n * 4];
 
         final boolean es3 = clientVersion >= 3;
         final int[] v = new int[1];
@@ -215,30 +227,41 @@ public final class MacApkGlWindow {
         if (savedFb != 0) GLES20.glBindFramebuffer(fbTarget, savedFb);
 
         mRgba.position(0);
-        mRgba.get(mBytes, 0, n * 4);
-        final byte[] b = mBytes;
-
         int[] argb = mFree.poll();
         while (argb != null && argb.length != n) argb = mFree.poll();  // a stale size: drop it
         if (argb == null) argb = new int[n];
 
-        for (int y = 0; y < h; y++) {
-            int srcRow = h - 1 - y; /*FLIP*/
-            int src = srcRow * w * 4;
-            int dst = y * w;
-            for (int x = 0; x < w; x++, src += 4) {
-                int r = b[src] & 0xff, g = b[src + 1] & 0xff;
-                int bl = b[src + 2] & 0xff, a = b[src + 3] & 0xff;
-                if (a != 0xff) {
-                    if (a == 0) {
-                        r = 0; g = 0; bl = 0;
-                    } else {
-                        r = unpremul(r, a);
-                        g = unpremul(g, a);
-                        bl = unpremul(bl, a);
+        boolean fastDone = false;
+        try {
+            fastDone = com.macapk.loader.NativeCocoa.convertGlPbufferToArgb(mRgba, argb, w, h);
+        } catch (Throwable ignored) {}
+
+        if (!fastDone) {
+            java.nio.IntBuffer intBuf = mRgba.asIntBuffer();
+            int[] rowBuf = new int[w];
+            for (int y = 0; y < h; y++) {
+                int srcRow = h - 1 - y;
+                intBuf.position(srcRow * w);
+                intBuf.get(rowBuf, 0, w);
+                int dst = y * w;
+                for (int x = 0; x < w; x++) {
+                    int word = rowBuf[x];
+                    int a = word >>> 24;
+                    int r = word & 0xff;
+                    int b = (word >> 16) & 0xff;
+                    if (a != 0xff) {
+                        if (a == 0) {
+                            r = 0; b = 0; word = 0;
+                        } else {
+                            int g = (word >> 8) & 0xff;
+                            r = (r * 255 + (a >> 1)) / a;
+                            g = (g * 255 + (a >> 1)) / a;
+                            b = (b * 255 + (a >> 1)) / a;
+                            word = (a << 24) | (g << 8);
+                        }
                     }
+                    argb[dst + x] = (word & 0xff00ff00) | (r << 16) | b;
                 }
-                argb[dst + x] = (a << 24) | (r << 16) | (g << 8) | bl;
             }
         }
         // premultipliedSource=true: a GL consumer (updateTexImage) must see the
@@ -266,6 +289,8 @@ public final class MacApkGlWindow {
         if (size[0] == mW && size[1] == mH) return null;
         android.opengl.EGLSurface s = newPbuffer(mDpy, mCfg, size[0], size[1]);
         if (s == null) return null;
+        mFree.clear();
+        mRgba = null;
         android.opengl.EGLSurface old = mPbuffer;
         mPbuffer = s;
         mW = size[0];
@@ -282,6 +307,7 @@ public final class MacApkGlWindow {
         mDestroyed = true;
         mSt.macapkDisconnectProducer(this);
         mFree.clear();
+        mRgba = null;
         return EGL14.eglDestroySurface(mDpy, mPbuffer);
     }
 

@@ -563,13 +563,17 @@ public final class MacApkEGL10 implements EGL10 {
         }
         // EGLImpl.eglCreateWindowSurface's dispatch, in its order.
         SurfaceTexture st;
-        if (nativeWindow instanceof android.view.SurfaceView
-                || nativeWindow instanceof android.view.SurfaceHolder) {
-            // The MTKView driver owns SurfaceView surfaces; unchanged.
-            return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
+        if (nativeWindow instanceof android.view.SurfaceView) {
+            android.view.Surface s = ((android.view.SurfaceView) nativeWindow).getHolder().getSurface();
+            st = s != null ? s.macapkEnsureEglStream() : null;
+            if (st == null) return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
+        } else if (nativeWindow instanceof android.view.SurfaceHolder) {
+            android.view.Surface s = ((android.view.SurfaceHolder) nativeWindow).getSurface();
+            st = s != null ? s.macapkEnsureEglStream() : null;
+            if (st == null) return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
         } else if (nativeWindow instanceof android.view.Surface) {
             android.view.Surface s = (android.view.Surface) nativeWindow;
-            st = s.macapkGetSurfaceTexture();
+            st = s.macapkEnsureEglStream();
             if (st == null) return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
             if (!s.isValid()) {
                 // jni_eglCreateWindowSurface's not_valid_surface branch.

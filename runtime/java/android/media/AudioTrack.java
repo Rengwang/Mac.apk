@@ -274,6 +274,18 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         return this.effectiveBufferInFrames;
     }
 
+    /**
+     * Returns this track's estimated latency in milliseconds, including hardware latency
+     * and buffer latency.
+     * @return latency in milliseconds
+     * @hide
+     */
+    public int getLatency() {
+        int sr = sampleRate > 0 ? sampleRate : 44100;
+        int frames = effectiveBufferInFrames > 0 ? effectiveBufferInFrames : bufferSizeInFrames;
+        return Math.max(20, (int) ((long) frames * 1000L / sr));
+    }
+
     public void play()  { com.macapk.loader.AudioTrace.hit("AudioTrack.play");
         if (honestUninitialized())
             throw new IllegalStateException("play() called on uninitialized AudioTrack.");

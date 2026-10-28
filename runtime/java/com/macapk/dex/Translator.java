@@ -421,6 +421,46 @@ public final class Translator {
      *  other methods linkable. A caller that never invokes this method is
      *  unaffected; one that does gets an accurate diagnosis instead of a
      *  missing type. */
+
+    /** DexVMP/nop methods translate to zero JVM code units. Do not drop the
+     *  class and do not throw on the common path: emit an AOSP-shaped default
+     *  body (constructor chains to super, value returns default). */
+    public static void emitEmptyBody(ClassFileWriter.MethodWriter mw,
+                                     DexClass cls, DexMethod method) {
+        CodeWriter c = mw.newCode();
+        String name = method.name();
+        if ("<init>".equals(name)) {
+            c.op(CodeWriter.ALOAD_0);
+            String sup = cls.superclassName();
+            c.methodOp(CodeWriter.INVOKESPECIAL,
+                       sup == null ? "java/lang/Object" : sup,
+                       "<init>", "()V", false);
+            c.op(CodeWriter.RETURN);
+            return;
+        }
+        if ("<clinit>".equals(name)) {
+            c.op(CodeWriter.RETURN);
+            return;
+        }
+        String d = method.descriptor();
+        String r = d.substring(d.indexOf(')') + 1);
+        switch (r.charAt(0)) {
+            case 'V': c.op(CodeWriter.RETURN); break;
+            case 'L': case '[':
+                c.op(CodeWriter.ACONST_NULL); c.op(CodeWriter.ARETURN); break;
+            case 'Z': case 'B': case 'S': case 'C': case 'I':
+                c.op(CodeWriter.ICONST_0); c.op(CodeWriter.IRETURN); break;
+            case 'J':
+                c.op(CodeWriter.LCONST_0); c.op(CodeWriter.LRETURN); break;
+            case 'F':
+                c.op(CodeWriter.FCONST_0); c.op(CodeWriter.FRETURN); break;
+            case 'D':
+                c.op(CodeWriter.DCONST_0); c.op(CodeWriter.DRETURN); break;
+            default:
+                c.op(CodeWriter.ACONST_NULL); c.op(CodeWriter.ARETURN); break;
+        }
+    }
+
     public static void emitUnsupportedBody(ClassFileWriter.MethodWriter mw,
                                            DexMethod method, String msg) {
         CodeWriter c = mw.newCode();

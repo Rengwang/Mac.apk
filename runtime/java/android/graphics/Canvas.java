@@ -2402,12 +2402,30 @@ public class Canvas {
     }
 
     // --- Text ---------------------------------------------------------
+    /** The text entry point every TextView line goes through, so it carries the
+     *  same MACAPK_TRACE_DRAWCOST wrapper the blits and shapes do. Text was the
+     *  one primitive the [draw-cost] report could not see, which made the
+     *  renderer's own breakdown look complete when it was not: MEASURED
+     *  (Bilibili feed, 2026-10-27) the traced primitives accounted for ~21 of
+     *  the 45 ms a frame spent in rootView.draw() -- the rest was text. Nothing
+     *  about the draw changes when the trace is off (one boolean test). */
     public void drawText(String text, float x, float y, Paint p) {
+        if (!TRACE_DRAWCOST) { drawTextUntraced(text, x, y, p); return; }
+        final long t0 = System.nanoTime();
+        try { drawTextUntraced(text, x, y, p); }
+        finally { drawCost(t0, "text len=" + (text == null ? 0 : text.length()), p); }
+    }
+    private static boolean sPuaStack;
+    private void drawTextUntraced(String text, float x, float y, Paint p) {
         if (g == null || p == null || text == null) return;
         sGlobalText++;
         com.macapk.loader.GfxTrace.real("Canvas.drawText");
         applyPaint(p);
         Font macapkPrimaryFont = deriveFont(p);
+        if ("1".equals(System.getenv("MACAPK_TRACE_PUA")) && text.length() == 1 && Character.getType(text.charAt(0)) == Character.PRIVATE_USE) {
+            com.macapk.loader.NativeLog.i("Mac.apk.PUA", "cp=" + Integer.toHexString(text.charAt(0)) + " font=" + macapkPrimaryFont.getFontName() + " glyph=" + macapkPrimaryFont.createGlyphVector(MacApkFont.textFrc(), text).getGlyphCode(0) + " tf=" + p.getTypeface() + " pos=" + x + "," + y);
+            if (text.charAt(0) == '\ueb3f' && !sPuaStack) { sPuaStack = true; com.macapk.loader.NativeLog.i("Mac.apk.PUA", "stack=" + java.util.Arrays.toString(Thread.currentThread().getStackTrace())); }
+        }
         g.setFont(macapkPrimaryFont);
         // Paint.Align and the text decorations both need the run's advance, and
         // hwui uses ONE number for both: layout.getAdvance(). Computed only when
@@ -2644,7 +2662,7 @@ public class Canvas {
             // of up to half a pixel per glyph, which is the exact class of
             // measure-vs-draw disagreement this file has now been bitten by
             // twice (the unspaced letter-spacing draw, and the metrics mode).
-            MacApkFont.Quantized q = MacApkFont.quantize(g.getFont(), text);
+            MacApkFont.Quantized q = MacApkFont.quantize(primary, text);
             if (q != null) g.drawGlyphVector(q.glyphs, x, y);
             else           g.drawString(text, x, y);
             return;
@@ -2981,8 +2999,14 @@ public class Canvas {
                 // it blits, so storing the CTM-mapped shape needs no extra
                 // bookkeeping at replay time.
                 try {
+                    // A recording's bitmap fill respected its current clip.
+                    // Carry the SAME clipped region upward: storing the raw
+                    // shape would clear pixels outside the player on replay.
+                    java.awt.geom.Area clipped = new java.awt.geom.Area(shape);
+                    java.awt.Shape clip = g.getClip();
+                    if (clip != null) clipped.intersect(new java.awt.geom.Area(clip));
                     owner.macapkAddPunch(
-                        g.getTransform().createTransformedShape(shape), a);
+                        g.getTransform().createTransformedShape(clipped), a);
                 } catch (Throwable ignored) {}
             }
         }
@@ -3364,6 +3388,17 @@ public class Canvas {
      *  SkDraw::drawBitmap does with `matrix.setConcat(*fMatrix, prematrix)`
      *  (SkDraw.cpp:1083). A null Paint means no Java Paint reached the native
      *  layer at all, so Skia uses a default SkPaint with filtering off. */
+    /** True when the device transform is an integer TRANSLATE (identity
+     *  included): the condition under which a 1:1 blit is a plain copy. Any
+     *  scale, rotation or skew disqualifies it, and so does a fractional
+     *  position -- see the exactCopy note in drawBitmap(Rect, Rect, Paint). */
+    private boolean macapkIntegerTranslate() {
+        final AffineTransform t = g.getTransform();
+        final int type = t.getType();
+        if ((type & ~AffineTransform.TYPE_TRANSLATION) != 0) return false;
+        final double tx = t.getTranslateX(), ty = t.getTranslateY();
+        return tx == Math.rint(tx) && ty == Math.rint(ty);
+    }
     private boolean macapkFilterBlit(Paint p, AffineTransform blit, int w, int h) {
         if (!MACAPK_FILTER_BITMAP || p == null || w <= 0 || h <= 0) return false;
         if (!p.isFilterBitmap()) return false;
@@ -3508,7 +3543,24 @@ public class Canvas {
             blit.scale(dstR.width() / (double) sw, dstR.height() / (double) sh);
         }
         final boolean filt = macapkFilterBlit(p, blit, sw, sh);
-        if (filt && sw > 0 && sh > 0
+        // EXACT-COPY FAST PATH (v1.0.2303-1, 2026-10-27). A 1:1 blit whose
+        // effective transform is an integer translate is a row copy, but with
+        // MACAPK_FILTER_BITMAP's sprite answer saying "no filtering needed" it
+        // fell straight through to Java2D's general compositing loop.
+        // MEASURED (Bilibili feed, [draw-cost] 5 s window): 145 calls of
+        // `bmp-rect 720x1280 dst=720x1280` cost 1727 ms -- 11.9 ms each, 54 %
+        // of the whole traced draw budget, and the app was pinned at ~20 fps
+        // (draw=45-58 ms/frame) precisely because of it.
+        // macapkScaledBlit's bilinear weights are all ZERO for a 1:1 integer
+        // mapping (kx=ky=1, xl lands on a whole texel), so it produces the
+        // sprite pixels exactly while staying in our flat int[] loop. The
+        // integer-translate requirement is what keeps a fractional position on
+        // Java2D's nearest-neighbour path: there the blitter would blend two
+        // texels, which a non-filtered paint must not do.
+        final boolean exactCopy = !filt && sw > 0 && sh > 0
+                && dstR.width() == sw && dstR.height() == sh
+                && macapkIntegerTranslate();
+        if ((filt || exactCopy) && sw > 0 && sh > 0
                 && macapkScaledBlit(src, srcR != null ? srcR.left : 0, srcR != null ? srcR.top : 0,
                                     (srcR != null ? srcR.left : 0) + sw, (srcR != null ? srcR.top : 0) + sh,
                                     dstR.left, dstR.top, dstR.right, dstR.bottom)) return;
@@ -4806,14 +4858,25 @@ public class Canvas {
     // (drawBitmap -> applyColorFilterToImage). Returns null when the filter
     // should leave the base color unchanged (DST modes / unknown), so the caller
     // keeps the original paint color rather than blanking.
+    //
+    // A solid fill has ONE colour and ONE alpha, so the whole Skia blend
+    // collapses to a single pixel operation -- and that operation must be the
+    // same one the image path uses (pdfPixel/blendPixel). It used to take a
+    // per-mode shortcut instead: SRC_IN/SRC_ATOP/SRC returned the filter colour
+    // outright, throwing away the base alpha. A Compose ColorPainter (a
+    // transparent rect + BlendModeColorFilter) then painted an opaque square --
+    // measured on Bilibili's partition / edit "+" icons, and generic to any
+    // app that tints a transparent painter. SRC_IN must keep the DESTINATION's
+    // coverage and only replace its colour (recolorPixel), which is what
+    // blendPixel does.
     private Integer solidColorForFilter(ColorFilter cf, int baseColor) {
         if (cf instanceof PorterDuffColorFilter) {
             PorterDuffColorFilter f = (PorterDuffColorFilter) cf;
-            return tintForPorterDuff(f.getMode(), f.getColor(), baseColor);
+            return pdfPixel(f.getMode(), f.getColor(), baseColor);
         }
         if (cf instanceof BlendModeColorFilter) {
             BlendModeColorFilter f = (BlendModeColorFilter) cf;
-            return tintForBlend(f.getMode(), f.getColor(), baseColor);
+            return blendPixel(f.getMode(), f.getColor(), baseColor);
         }
         if (cf instanceof LightingColorFilter) {
             LightingColorFilter f = (LightingColorFilter) cf;
@@ -4823,28 +4886,6 @@ public class Canvas {
             return applyColorMatrix(baseColor, ((ColorMatrixColorFilter) cf).macapkArray());
         }
         return null;
-    }
-    private static Integer tintForPorterDuff(PorterDuff.Mode m, int filter, int base) {
-        if (m == null) return filter;
-        switch (m) {
-            case SRC: case SRC_IN: case SRC_ATOP: case SRC_OVER: return filter;
-            case DST: case DST_IN: case DST_OUT: case DST_ATOP: case DST_OVER: return null;
-            case MULTIPLY: return multiplyColors(base, filter);
-            case SCREEN:   return screenColors(base, filter);
-            case ADD:      return addColors(base, filter);
-            case CLEAR:    return 0x00000000;
-            default:       return filter;  // best-effort recolor (LIGHTEN/DARKEN/OVERLAY)
-        }
-    }
-    private static Integer tintForBlend(BlendMode m, int filter, int base) {
-        if (m == null) return filter;
-        if (m == BlendMode.SRC || m == BlendMode.SRC_IN || m == BlendMode.SRC_ATOP || m == BlendMode.SRC_OVER) return filter;
-        if (m == BlendMode.DST || m == BlendMode.DST_IN || m == BlendMode.DST_OUT || m == BlendMode.DST_ATOP || m == BlendMode.DST_OVER) return null;
-        if (m == BlendMode.MODULATE || m == BlendMode.MULTIPLY) return multiplyColors(base, filter);
-        if (m == BlendMode.SCREEN) return screenColors(base, filter);
-        if (m == BlendMode.PLUS)   return addColors(base, filter);
-        if (m == BlendMode.CLEAR)  return 0x00000000;
-        return filter;
     }
     /** Apply a color filter to one whole image (drawBitmap path), after scaling every pixel's
      *  alpha by `preAlpha` (255 = leave it; see blendPreFilterAlpha). */

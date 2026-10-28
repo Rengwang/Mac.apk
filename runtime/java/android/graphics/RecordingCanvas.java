@@ -625,6 +625,7 @@ public class RecordingCanvas extends Canvas {
     // ---- Text ----------------------------------------------------------------
     @Override public void drawText(String text, float x0, float y0, Paint p) {
         if (rec == null) { super.drawText(text, x0, y0, p); return; }
+        if ("1".equals(System.getenv("MACAPK_TRACE_PUA")) && "\ueb3f".equals(text)) com.macapk.loader.NativeLog.i("Mac.apk.PUA", "record font=" + (p != null ? p.getTypeface() : null) + " stack=" + java.util.Arrays.toString(Thread.currentThread().getStackTrace()));
         draw("drawText", p, (c, q) -> c.drawText(text, x0, y0, q));
     }
     @Override public void drawText(String text, int start, int end, float x0, float y0, Paint p) {

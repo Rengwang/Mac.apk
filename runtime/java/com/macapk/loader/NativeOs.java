@@ -16,6 +16,9 @@ public final class NativeOs {
     public static native int  memfdCreate(String name, int flags);      // new fd, else -errno
     public static native long[] fstat(int fd);                          // stat fields, or null
     public static native int  ftruncate(int fd, long length);           // 0, else -errno
+    public static native long mmap(long address, long length, int prot, int flags, int fd, long offset); // addr, else -1
+    public static native int  munmap(long address, long length);              // 0, else -errno
+    public static native int  msync(long address, long length, int flags);    // 0, else -errno (bionic MS_*)
     public static native int  takeRunLock(String path);                 // held fd, else -errno (RunLock)
     public static native int  read(int fd, byte[] buf, int off, int count);   // bytes read (0=EOF), else -errno
     public static native int  write(int fd, byte[] buf, int off, int count);  // bytes written, else -errno

@@ -39,6 +39,7 @@
 #include <cwchar>           // wcscoll/wcsxfrm (wcscoll_l/wcsxfrm_l's non-"_l" fallback)
 #include <strings.h>        // strcasecmp/strncasecmp (POSIX <strings.h>, NOT <string.h>)
 #include <sys/time.h>       // gettimeofday
+#include <sys/times.h>      // times (arm64 shim: Darwin does not accept NULL)
 #include <sys/event.h>      // kqueue/kevent -- backs the Bionic epoll_* shims
 #include <mach/mach_time.h> // mach_absolute_time for CNTVCT_EL0 emulation
 #include <mach/thread_switch.h> // thread_switch/SWITCH_OPTION_DEPRESS for faithful sched_yield
@@ -3076,6 +3077,46 @@ extern "C" int __macapk_arm64_raise(int sig) {
 extern "C" int __macapk_arm64_killpg(int pgrp, int sig) {
     if (macapk_sig_is_fatal(sig)) macapk_log_native_exit("killpg", sig);
     return ::killpg(pgrp, sig);
+}
+
+// ---- libc/libm gaps that ARM64 guests import (2026-10-27) -------------------
+//
+// Unlike a missing Java method, a missing NATIVE symbol does not fail the call:
+// our loader points the import at macapk_unresolved_trap, which prints and
+// aborts. abort() from a JVM-attached guest thread then reaches HotSpot's
+// VMError path, which asks for a safepoint -- and the crashing thread never
+// takes one, so the WHOLE JVM freezes instead of the one call failing.
+//
+// MEASURED (Bilibili 9.16.1): libijkplayer.so's FFmpeg decode thread
+// ("ijk_ff_videodec") called isnanf, Mac.apk had no shim, the trap aborted, and
+// the JVM wedged at a safepoint for as long as the app ran. The JVM itself named
+// the thread in its timeout report:
+//     # SafepointSynchronize::begin: Timed out while spinning to reach a safepoint.
+//     # "ijk_ff_videodec" #344 ... cpu=3091.47ms elapsed=3.12s runnable
+//     #    java.lang.Thread.State: RUNNABLE
+// and the shim's own log showed the cause one line earlier:
+//     *** UNRESOLVED NATIVE SYMBOL CALLED ***  unresolved in libijkplayer.so: isnanf
+//
+// isnanf: bionic libm exports it (libcore/math, `int isnanf(float)`); Darwin
+// dropped it when C99 made isnan() generic. Same answer, same int return.
+extern "C" int __macapk_arm64_isnanf(float x) {
+    return std::isnan(x) ? 1 : 0;
+}
+
+// posix_fallocate: bionic libc exports it; Darwin does not. libblog.so imports
+// it (unresolved but not called in the measured run, so this is the cheap
+// insurance rather than a fix for a live crash). POSIX says it returns an errno
+// value and must PRE-ALLOCATE; best effort with ftruncate-then-touch is what a
+// guest can observe here, and the return is the contract callers test.
+extern "C" int __macapk_arm64_posix_fallocate(int fd, long long offset, long long len) {
+    if (fd < 0 || offset < 0 || len < 0) return EINVAL;
+    struct stat st;
+    if (::fstat(fd, &st) != 0) return errno;
+    const long long end = offset + len;
+    if (end > (long long) st.st_size) {
+        if (::ftruncate(fd, (off_t) end) != 0) return errno;
+    }
+    return 0;
 }
 // (pthread_kill already has a __macapk_arm64_ shim elsewhere; not re-interposed here.)
 extern "C" void __macapk_arm64_abort(void) { macapk_log_native_exit("abort", SIGABRT); ::abort(); }
@@ -27797,6 +27838,28 @@ extern "C" int __macapk_arm64_gettimeofday(MacapkBionicTimeval64* tv,
     return r;
 }
 
+// times(2). Bionic explicitly allows a NULL buffer ("If buf is NULL, the return
+// value cannot be stored, but the call still returns the elapsed ticks"), and
+// libbili.so's background threads rely on it. Darwin's libsystem_c does NOT
+// null-check: it computes the tick count and stores it through `buf`, so a NULL
+// argument writes to address 0.
+//
+// MEASURED (Bilibili 9.16.1, 2026-10-27): hs_err_pid54438.log
+//     Problematic frame: C [libsystem_c.dylib+0x55c14] times+0x84
+//     siginfo: si_signo: 11 (SIGSEGV), si_addr: 0x0000000000000000
+//     Native frames: times+0x84 <- guest libbili.so+0x2494c
+// i.e. the app's own thread called times(NULL), which is legal on every Android
+// device and fatal here. The guest struct tms is layout-identical (4 x 8-byte
+// clock_t on both aarch64 Bionic and Darwin), so only the NULL case needs work:
+// hand libsystem a scratch struct and return the ticks as usual.
+//
+// Reached through the arm64 import resolver, which probes __macapk_arm64_<name>
+// (arm64_native.cpp resolve_external_silent), so no allow-list entry is needed.
+extern "C" clock_t __macapk_arm64_times(struct tms* buf) {
+    struct tms scratch;
+    return ::times(buf != nullptr ? buf : &scratch);
+}
+
 extern "C" int __macapk_arm64_pthread_once(int* once, void (*init)(void)) {
     if (!once || !init) return 22;
     // 0 = uninitialized, 2 = in-progress, 1 = done. Spin while another
@@ -36119,13 +36182,41 @@ struct MacApkNativeWindow {
     int32_t  height;    // pixels
     int32_t  format;    // WINDOW_FORMAT_RGBA_8888 = 1
     void*    layer;     // CAMetalLayer* from CocoaGetUnityRenderLayer
+    int32_t  surface_key; // 0 for legacy/non-SurfaceView windows
     uint8_t  reserved[96];
 };
 static constexpr uint32_t kMacApkNWMagic = 0x4D444E57; // 'MDNW'
 alignas(16) static MacApkNativeWindow g_macapk_unity_window = {};
+struct MacApkNativeWindowRecord {
+    jobject surface = nullptr; // retained only while native owners hold references
+    MacApkNativeWindow window{};
+    size_t references = 1;     // protected by g_macapk_nw_surface_mu
+};
+static std::mutex g_macapk_nw_surface_mu;
+static std::vector<std::unique_ptr<MacApkNativeWindowRecord>> g_macapk_nw_records;
+// The legacy window is a singleton: retain only its most recent Java Surface,
+// replacing/releasing the previous reference as before the keyed experiment.
+static jobject g_macapk_nw_surface_gref = nullptr;
+static bool macapk_keyed_native_windows_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+static MacApkNativeWindow* macapk_native_window_for_ptr(void* p) {
+    if (!p) return nullptr;
+    if (p == &g_macapk_unity_window
+        && g_macapk_unity_window.magic == kMacApkNWMagic)
+        return &g_macapk_unity_window;
+    std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+    for (const auto& r : g_macapk_nw_records)
+        if (r && p == &r->window && r->window.magic == kMacApkNWMagic)
+            return &r->window;
+    return nullptr;
+}
 static inline bool macapk_is_unity_window(void* w) {
-    return w == &g_macapk_unity_window
-        && g_macapk_unity_window.magic == kMacApkNWMagic;
+    return macapk_native_window_for_ptr(w) != nullptr;
 }
 
 // v1.0.162: Surface->CAMetalLayer bridge for Unity's eglCreateWindowSurface.
@@ -36163,6 +36254,7 @@ std::atomic<bool> g_decouple_active{false};
 // Fwd decl: MACAPK_TRACE_VIEWPORT gate, defined with the glViewport tracer below.
 static bool macapk_trace_viewport_on();
 void* g_unity_egl_surface = nullptr;
+static std::atomic<void*> g_experimental_keyed_egl_surface{nullptr};
 
 extern "C" void* __macapk_arm64_egl_create_window_surface_bridge(
         void* dpy, void* config, void* win, const int32_t* attribs) {
@@ -36287,7 +36379,32 @@ extern "C" void* __macapk_arm64_egl_create_window_surface_bridge(
         }
     }
     void* surf = real(dpy, config, native, attribs);
+    if (!surf) {
+        // When native (the CAMetalLayer) is already bound to an active swapchain (or bad alloc),
+        // fall back to an offscreen pbuffer surface so secondary consumers (e.g. Chronos overlay engine)
+        // do not fail eglCreateWindowSurface and hang the Android main UI thread.
+        int W = 0, H = 0;
+        static auto getLayer = reinterpret_cast<void* (*)(int*, int*)>(
+            dlsym(RTLD_DEFAULT, "CocoaGetUnityRenderLayer"));
+        if (getLayer) getLayer(&W, &H);
+        if (W <= 0 || H <= 0) { W = 1920; H = 1080; }
+        static auto createPb = reinterpret_cast<void* (*)(void*, void*, const int32_t*)>(
+            dlsym(RTLD_DEFAULT, "eglCreatePbufferSurface"));
+        const int32_t pb_attribs[] = { 0x3057 /*EGL_WIDTH*/, W, 0x3056 /*EGL_HEIGHT*/, H,
+                                       0x3038 /*EGL_NONE*/ };
+        surf = createPb ? createPb(dpy, config, pb_attribs) : nullptr;
+        if (surf) {
+            std::fprintf(stderr,
+                "[arm64-shim] eglCreateWindowSurface: window surface failed (layer in use), "
+                "fell back to pbuffer surface %p (%dx%d) for secondary consumer\n",
+                surf, W, H);
+            std::fflush(stderr);
+            return surf;
+        }
+    }
     if (surf) {
+        if (auto* nw = macapk_native_window_for_ptr(win); nw && nw->surface_key > 0)
+            g_experimental_keyed_egl_surface.store(surf, std::memory_order_relaxed);
         g_unity_egl_display = dpy; g_unity_egl_surface = surf;
         // v1.0.572: the guest engine now owns a window surface on the
         // dedicated layer -- tell the runtime to hide the framework
@@ -37136,6 +37253,30 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
     using SwapFn = unsigned (*)(void*, void*);
     static SwapFn real =
         reinterpret_cast<SwapFn>(dlsym(RTLD_DEFAULT, "eglSwapBuffers"));
+    if (std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE") &&
+        surf == g_experimental_keyed_egl_surface.load(std::memory_order_relaxed)) {
+        static std::atomic<unsigned> alphaSamples{0};
+        unsigned count = alphaSamples.fetch_add(1, std::memory_order_relaxed);
+        if (count < 3 || count == 100) {
+            using GetFn = void (*)(unsigned, int*);
+            using ReadFn = void (*)(int, int, int, int, unsigned, unsigned, void*);
+            using BindFn = void (*)(unsigned, unsigned);
+            static GetFn get = reinterpret_cast<GetFn>(dlsym(RTLD_DEFAULT, "glGetIntegerv"));
+            static ReadFn read = reinterpret_cast<ReadFn>(dlsym(RTLD_DEFAULT, "glReadPixels"));
+            static BindFn bind = reinterpret_cast<BindFn>(dlsym(RTLD_DEFAULT, "glBindFramebuffer"));
+            int fbo = 0, viewport[4] = {0, 0, 0, 0};
+            if (get && read && bind) {
+                get(0x8CA6, &fbo); get(0x0BA2, viewport);
+                bind(0x8D40, 0);
+                unsigned char pixel[4] = {0, 0, 0, 0};
+                read(viewport[0] + viewport[2] / 2, viewport[1] + viewport[3] / 2,
+                     1, 1, 0x1908, 0x1401, pixel);
+                bind(0x8D40, (unsigned)fbo);
+                std::fprintf(stderr, "[surface-alpha-probe] surface=%p sample=%u viewport=%dx%d rgba=%u,%u,%u,%u\n",
+                    surf, count, viewport[2], viewport[3], pixel[0], pixel[1], pixel[2], pixel[3]);
+            }
+        }
+    }
     if (macapk_swap_trace_on()) t_swap_trace_entry = macapk_swap_trace_uptime_s();
     macapk_gl_note_present();   // alias-free draws-per-present report (MACAPK_GL_TRACE)
     // v1.0.996 AOSP FRAME PACING. The frame is rendered; this is where a real
@@ -37851,6 +37992,74 @@ static void macapk_gl_note_present() {
 // out of N" is meaningful. Generic, no per-package code; MACAPK_SHADER_TRACE=1.
 static std::atomic<int> g_shader_compiles{0}, g_shader_compile_fail{0};
 static std::atomic<int> g_program_links{0}, g_program_link_fail{0};
+
+extern "C" void __macapk_arm64_glBindTexture(unsigned target, unsigned tex) {
+    if (target == 0x8D65 /* GL_TEXTURE_EXTERNAL_OES */) {
+        target = 0x0DE1 /* GL_TEXTURE_2D */;
+    }
+    static void (*real)(unsigned, unsigned) = reinterpret_cast<void(*)(unsigned, unsigned)>(
+        dlsym(RTLD_DEFAULT, "glBindTexture"));
+    if (real) real(target, tex);
+}
+
+extern "C" void __macapk_arm64_glTexParameteri(unsigned target, unsigned pname, int param) {
+    if (target == 0x8D65 /* GL_TEXTURE_EXTERNAL_OES */) {
+        target = 0x0DE1 /* GL_TEXTURE_2D */;
+    }
+    static void (*real)(unsigned, unsigned, int) = reinterpret_cast<void(*)(unsigned, unsigned, int)>(
+        dlsym(RTLD_DEFAULT, "glTexParameteri"));
+    if (real) real(target, pname, param);
+}
+
+extern "C" void __macapk_arm64_glShaderSource(unsigned shader, int count, const char* const* string, const int* length) {
+    static void (*real)(unsigned, int, const char* const*, const int*) =
+        reinterpret_cast<void(*)(unsigned, int, const char* const*, const int*)>(
+            dlsym(RTLD_DEFAULT, "glShaderSource"));
+    if (!real) return;
+    if (!string || count <= 0) {
+        real(shader, count, string, length);
+        return;
+    }
+    std::vector<std::string> copies;
+    std::vector<const char*> ptrs;
+    std::vector<int> lens;
+    copies.reserve(count);
+    ptrs.reserve(count);
+    lens.reserve(count);
+    bool modified = false;
+    for (int i = 0; i < count; ++i) {
+        const char* s = string[i];
+        int l = (length && length[i] >= 0) ? length[i] : (s ? (int)std::strlen(s) : 0);
+        std::string src(s ? s : "", l);
+        size_t extPos = src.find("GL_OES_EGL_image_external");
+        if (extPos != std::string::npos) {
+            size_t lineStart = src.rfind('\n', extPos);
+            lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+            size_t lineEnd = src.find('\n', extPos);
+            std::string line = src.substr(lineStart, (lineEnd == std::string::npos ? src.size() : lineEnd) - lineStart);
+            if (line.find("#extension") != std::string::npos) {
+                src.insert(lineStart, "// (rewritten) ");
+                modified = true;
+            }
+        }
+        size_t pos = 0;
+        while ((pos = src.find("samplerExternalOES", pos)) != std::string::npos) {
+            src.replace(pos, 18, "sampler2D");
+            pos += 9;
+            modified = true;
+        }
+        copies.push_back(std::move(src));
+    }
+    if (modified) {
+        std::fprintf(stderr, "[I] bionic-shim: rewritten GL_OES_EGL_image_external shader %u to sampler2D\n", shader);
+    }
+    for (size_t i = 0; i < copies.size(); ++i) {
+        ptrs.push_back(copies[i].c_str());
+        lens.push_back((int)copies[i].length());
+    }
+    real(shader, count, ptrs.data(), lens.data());
+}
+
 extern "C" void __macapk_arm64_glCompileShader(unsigned shader) {
     static void (*real)(unsigned) = reinterpret_cast<void(*)(unsigned)>(
         dlsym(RTLD_DEFAULT, "glCompileShader"));
@@ -38621,6 +38830,14 @@ extern "C" void* __macapk_arm64_eglGetProcAddress(const char* name) {
         if (std::strcmp(name, "glTexImage2D") == 0)
             return reinterpret_cast<void*>(&__macapk_arm64_glTexImage2D);
     }
+    if (name) {
+        if (std::strcmp(name, "glBindTexture") == 0)
+            return reinterpret_cast<void*>(&__macapk_arm64_glBindTexture);
+        if (std::strcmp(name, "glTexParameteri") == 0)
+            return reinterpret_cast<void*>(&__macapk_arm64_glTexParameteri);
+        if (std::strcmp(name, "glShaderSource") == 0)
+            return reinterpret_cast<void*>(&__macapk_arm64_glShaderSource);
+    }
     return real ? real(name) : nullptr;
 }
 
@@ -39017,6 +39234,14 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
             return reinterpret_cast<void*>(&__macapk_arm64_glLinkProgram);
         if (std::strcmp(name, "glProgramBinary") == 0)
             return reinterpret_cast<void*>(&__macapk_arm64_glProgramBinary);
+    }
+    if (name) {
+        if (std::strcmp(name, "glBindTexture") == 0)
+            return reinterpret_cast<void*>(&__macapk_arm64_glBindTexture);
+        if (std::strcmp(name, "glTexParameteri") == 0)
+            return reinterpret_cast<void*>(&__macapk_arm64_glTexParameteri);
+        if (std::strcmp(name, "glShaderSource") == 0)
+            return reinterpret_cast<void*>(&__macapk_arm64_glShaderSource);
     }
     // (Tombstone, 2026-09-27: the v1.0.155 MACAPK_STUB_UNITY_ONLOAD intercept
     // that answered dlsym(h, "JNI_OnLoad") with a stub is DELETED. Bionic's
@@ -40211,8 +40436,10 @@ static std::string macapk_arm64_task_path(const std::string& tail) {
     if (!macapk_mkdirs(root)) return root;
 
     if (rest.empty()) {
-        // (a) whole-directory open: rebuild the live tid set.
-        macapk_clear_dir(root, false);
+        // (a) whole-directory open: ensure directories exist for all live threads.
+        // Container safety: DO NOT wipe the directory with macapk_clear_dir: deleting 40+ subdirectories
+        // and recreating them on every opendir() caused 2+ GB of disk writes on APFS and triggered
+        // system watchdog timeouts. Live thread directories are kept in place.
         for (const MacApkThread& t : threads)
             ::mkdir((root + "/" + std::to_string((long)t.ltid)).c_str(), 0755);
         return root;
@@ -40234,15 +40461,6 @@ static std::string macapk_arm64_task_path(const std::string& tail) {
     // predecessor that held this pid may have left task/<tid>/<file> behind, and
     // serving it would describe a thread this process never had (same pattern as
     // macapk_arm64_fd_path's closed-fd case).
-    //
-    // The unlink is RESTRICTED to the three names this function itself writes, under
-    // an all-digits tid. `tail` is a substring of the guest's path and is never
-    // normalised (macapk_arm64_remap_path / macapk_proc_pid_tail do no ".." folding),
-    // so `file` can be "../../../<anything>" and `out` can resolve outside the synth
-    // tree; that runs at REMAP time, so a guest stat() or access() alone would be
-    // enough to delete a real file. fd_path's precedent is safe only because its tail
-    // is a parsed integer. A dead predecessor can only have left comm/stat/status
-    // under a numeric tid, so nothing it wrote survives this restriction.
     if (!th) {
         const bool tid_numeric = !tid_s.empty() &&
             tid_s.find_first_not_of("0123456789") == std::string::npos;
@@ -40255,16 +40473,36 @@ static std::string macapk_arm64_task_path(const std::string& tail) {
     // so falling back to the package name here is faithful, not a fabrication.
     std::string comm = th->name[0] ? std::string(th->name) : macapk_get_package_name();
     if (comm.empty()) comm = "macapk";
-    // LAST 15, not first 15 -- all three comm surfaces come from ONE task_struct.comm,
-    // so status Name, /proc/self/comm and stat field 2 disagreeing is a state no Linux
-    // kernel can produce. Measured on the device: com.mojang.minecraftpe -> "ang.minecraftpe".
     if (comm.size() > 15) comm = comm.substr(comm.size() - 15);   // TASK_COMM_LEN - 1
 
     if (file == "comm") {
-        FILE* f = std::fopen(out.c_str(), "w");
-        if (f) { std::fprintf(f, "%s\n", comm.c_str()); std::fclose(f); }
+        if (::access(out.c_str(), F_OK) != 0) {
+            FILE* f = std::fopen(out.c_str(), "w");
+            if (f) { std::fprintf(f, "%s\n", comm.c_str()); std::fclose(f); }
+        }
         return out;
     }
+
+    // Rate-limit disk writes for thread stat/status to avoid pounding APFS with thousands of
+    // file creations per second. If the file exists and was written within the last 1000ms, reuse it.
+    static std::unordered_map<std::string, uint64_t> s_last_write_ms;
+    uint64_t now_ms = (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (s_last_write_ms.size() > 512) {
+        for (auto it_clean = s_last_write_ms.begin(); it_clean != s_last_write_ms.end(); ) {
+            if (now_ms - it_clean->second > 5000) it_clean = s_last_write_ms.erase(it_clean);
+            else ++it_clean;
+        }
+    }
+    auto it = s_last_write_ms.find(out);
+    bool should_write = (it == s_last_write_ms.end()) ||
+                        (now_ms - it->second >= 1000) ||
+                        (::access(out.c_str(), F_OK) != 0);
+    if (!should_write) {
+        return out;
+    }
+    s_last_write_ms[out] = now_ms;
+
     const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
     const unsigned long long ut = th->user_ns   / (1000000000ull / (unsigned long long)hz);
     const unsigned long long st = th->system_ns / (1000000000ull / (unsigned long long)hz);
@@ -53601,6 +53839,9 @@ uint32_t __macapk_shim_glBindRenderbuffer(uint32_t target, uint32_t rb, uint32_t
 }
 uint32_t __macapk_shim_glBindTexture(uint32_t target, uint32_t tex, uint32_t, uint32_t) {
     note_gl_call("glBindTexture");
+    if (target == 0x8D65 /* GL_TEXTURE_EXTERNAL_OES */) {
+        target = 0x0DE1 /* GL_TEXTURE_2D */;
+    }
     // Diagnostic: log the unique texture IDs the lifted code is binding.
     // Helps spot "draw with empty texture" cases where glDrawArrays
     // happens against tex=0 (no texture) and produces invisible output.
@@ -64151,7 +64392,7 @@ alignas(16) static uint8_t g_macapk_dummy_ANativeWindow[4096] = {0};
 // render targets from. The literal is only a last resort for a query that
 // arrives before any window exists at all.
 extern "C" int32_t __macapk_arm64_ANativeWindow_getWidth(void* w) {
-    if (macapk_is_unity_window(w)) return g_macapk_unity_window.width;
+    if (MacApkNativeWindow* nw = macapk_native_window_for_ptr(w)) return nw->width;
     if (g_macapk_unity_window.magic == kMacApkNWMagic
         && g_macapk_unity_window.width > 0) {
         return g_macapk_unity_window.width;
@@ -64159,7 +64400,7 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_getWidth(void* w) {
     return 1080;
 }
 extern "C" int32_t __macapk_arm64_ANativeWindow_getHeight(void* w) {
-    if (macapk_is_unity_window(w)) return g_macapk_unity_window.height;
+    if (MacApkNativeWindow* nw = macapk_native_window_for_ptr(w)) return nw->height;
     if (g_macapk_unity_window.magic == kMacApkNWMagic
         && g_macapk_unity_window.height > 0) {
         return g_macapk_unity_window.height;
@@ -64177,8 +64418,9 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_setBuffersGeometry(
     // window's DEFAULT size (NATIVE_WINDOW_WIDTH reaches BufferQueueProducer::
     // query -> mCore->mDefaultWidth), which Unreal divides touch X/Y by.
     if (width < 0 || height < 0 || (width == 0) != (height == 0)) return -EINVAL;
-    if (!macapk_is_unity_window(w)) return 0;
-    if (format != 0) g_macapk_unity_window.format = format;
+    MacApkNativeWindow* nw = macapk_native_window_for_ptr(w);
+    if (!nw) return 0;
+    if (format != 0) nw->format = format;
     using GeoFn = void (*)(int, int);
     static GeoFn set_geo = reinterpret_cast<GeoFn>(
         dlsym(RTLD_DEFAULT, "CocoaSetNativeEglBufferGeometry"));
@@ -64190,8 +64432,40 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_setBuffersGeometry(
                      set_geo ? "" : " -- no Cocoa bridge, ignored");
     return 0;
 }
-extern "C" void __macapk_arm64_ANativeWindow_release(void* /*w*/) {}
-extern "C" void __macapk_arm64_ANativeWindow_acquire(void* /*w*/) {}
+extern "C" void __macapk_arm64_ANativeWindow_release(void* w) {
+    if (!macapk_keyed_native_windows_enabled()) return;
+    AttachGuard ag;
+    // Keep the last reference rather than dropping its JNI handle on a thread
+    // that could not attach. A later valid release can still clean it up.
+    if (!ag.env) return;
+    std::unique_ptr<MacApkNativeWindowRecord> retired;
+    {
+        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+        for (auto it = g_macapk_nw_records.begin(); it != g_macapk_nw_records.end(); ++it) {
+            if (*it && w == &(*it)->window) {
+                if ((*it)->references == SIZE_MAX) break; // saturated: never free early
+                if (--(*it)->references == 0) {
+                    retired = std::move(*it);
+                    g_macapk_nw_records.erase(it);
+                }
+                break;
+            }
+        }
+    }
+    // Do not remove/release the CAMetalLayer here: the Cocoa compositor and
+    // any EGLSurface retain it independently of this ANativeWindow handle.
+    if (retired && retired->surface) ag.env->DeleteGlobalRef(retired->surface);
+}
+extern "C" void __macapk_arm64_ANativeWindow_acquire(void* w) {
+    if (!macapk_keyed_native_windows_enabled()) return;
+    std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+    for (const auto& r : g_macapk_nw_records) {
+        if (r && w == &r->window) {
+            if (r->references < SIZE_MAX) ++r->references;
+            break;
+        }
+    }
+}
 // The Java Surface the guest handed to ANativeWindow_fromSurface, kept as a
 // JNI GLOBAL ref so ANativeWindow_toSurface can hand the SAME object back.
 // NDK native_window_jni.h documents toSurface as the exact inverse of
@@ -64199,21 +64473,57 @@ extern "C" void __macapk_arm64_ANativeWindow_acquire(void* /*w*/) {}
 // so preserving object identity is the faithful behavior -- fabricating an
 // unrelated Surface would break any caller that passes it back into
 // MediaCodec.configure or compares it against the one it started with.
-static std::mutex g_macapk_nw_surface_mu;
-static jobject    g_macapk_nw_surface_gref = nullptr;
-static void macapk_remember_native_window_surface(jobject surface) {
-    if (!surface) return;
+static MacApkNativeWindowRecord* macapk_remember_native_window_surface(jobject surface) {
+    if (!surface) return nullptr;
     AttachGuard ag;
-    if (!ag.env) return;
-    jobject fresh = ag.env->NewGlobalRef(surface);
-    if (!fresh) { if (ag.env->ExceptionCheck()) ag.env->ExceptionClear(); return; }
-    jobject old = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
-        old = g_macapk_nw_surface_gref;
-        g_macapk_nw_surface_gref = fresh;
+    if (!ag.env) return nullptr;
+    MacApkNativeWindowRecord* rec = nullptr;
+    const bool keyed = macapk_keyed_native_windows_enabled();
+    jint surfaceKey = 0;
+    if (keyed && !ag.env->ExceptionCheck()) {
+        jclass sc = ag.env->GetObjectClass(surface);
+        jmethodID keyMid = sc ? ag.env->GetMethodID(sc, "macapkGetNativeWindowSurfaceKey", "()I")
+                              : nullptr;
+        if (keyMid) surfaceKey = ag.env->CallIntMethod(surface, keyMid);
+        if (ag.env->ExceptionCheck()) { ag.env->ExceptionClear(); surfaceKey = 0; }
+        if (sc) ag.env->DeleteLocalRef(sc);
     }
-    if (old) ag.env->DeleteGlobalRef(old);
+    if (keyed) {
+        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+        for (const auto& r : g_macapk_nw_records) {
+            if (r && r->surface && ag.env->IsSameObject(r->surface, surface)) {
+                if (r->references == SIZE_MAX) return nullptr;
+                ++r->references; // fromSurface returns an acquired reference
+                rec = r.get();
+                break;
+            }
+        }
+        if (!rec) {
+            jobject fresh = ag.env->NewGlobalRef(surface);
+            if (!fresh) {
+                if (ag.env->ExceptionCheck()) ag.env->ExceptionClear();
+                return nullptr;
+            }
+            auto freshRec = std::make_unique<MacApkNativeWindowRecord>();
+            freshRec->surface = fresh;
+            freshRec->window.surface_key = (int32_t)surfaceKey;
+            rec = freshRec.get();
+            g_macapk_nw_records.push_back(std::move(freshRec));
+        }
+    } else {
+        jobject fresh = ag.env->NewGlobalRef(surface);
+        if (!fresh) {
+            if (ag.env->ExceptionCheck()) ag.env->ExceptionClear();
+            return nullptr;
+        }
+        jobject old = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+            old = g_macapk_nw_surface_gref;
+            g_macapk_nw_surface_gref = fresh;
+        }
+        if (old) ag.env->DeleteGlobalRef(old);
+    }
     // Tell the framework which SurfaceView's Surface a native producer now
     // feeds (Surface.macapkNoteNativeWindowConsumer). AOSP composites that
     // surface BELOW its window and the SurfaceView punches a hole for it
@@ -64228,18 +64538,31 @@ static void macapk_remember_native_window_surface(jobject surface) {
         const char* e = std::getenv("MACAPK_SV_GUEST_BELOW");
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
-    if (kGuestBelow && !ag.env->ExceptionCheck()) {
+    if ((keyed || kGuestBelow) && !ag.env->ExceptionCheck()) {
         jclass sc = ag.env->GetObjectClass(surface);
-        jmethodID note = sc ? ag.env->GetMethodID(sc, "macapkNoteNativeWindowConsumer", "()V")
-                            : nullptr;
-        if (note) ag.env->CallVoidMethod(surface, note);
+        if (kGuestBelow && !ag.env->ExceptionCheck()) {
+            jmethodID note = sc ? ag.env->GetMethodID(sc, "macapkNoteNativeWindowConsumer", "()V")
+                                : nullptr;
+            if (note) ag.env->CallVoidMethod(surface, note);
+        }
         if (ag.env->ExceptionCheck()) ag.env->ExceptionClear();
         if (sc) ag.env->DeleteLocalRef(sc);
     }
+    return rec;
 }
 extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
         void* /*env*/, void* surface) {
-    macapk_remember_native_window_surface(reinterpret_cast<jobject>(surface));
+    MacApkNativeWindowRecord* rec =
+        macapk_remember_native_window_surface(reinterpret_cast<jobject>(surface));
+    int nativeSurfaceKey = 0;
+    if (macapk_keyed_native_windows_enabled()) {
+        if (!rec) return g_macapk_dummy_ANativeWindow;
+        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+        // Repeated fromSurface calls acquire the same already-bound window;
+        // never mutate a live handle while another native owner is using it.
+        if (rec->window.magic == kMacApkNWMagic) return &rec->window;
+        nativeSurfaceKey = rec->window.surface_key;
+    }
     // v1.0.162: return a real ANativeWindow backed by the Cocoa
     // CAMetalLayer (pre-created on the main thread in drawInMTKView for
     // Unity). v1.0.572: prefer the GENERIC ensure-entry, which also
@@ -64257,15 +64580,61 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
             dlsym(RTLD_DEFAULT, "CocoaGetUnityRenderLayer"));
     }();
     int w = 0, h = 0;
-    void* layer = get_layer ? get_layer(&w, &h) : nullptr;
+    void* layer = nullptr;
+    // Experimental only: the keyed compositor is not yet safe for general
+    // applications.  Leave the proven legacy path untouched unless a test
+    // process explicitly opts in.
+    if (macapk_keyed_native_windows_enabled()
+        && rec && nativeSurfaceKey > 0) {
+        using GetKeyLayerFn = void* (*)(int, int*, int*);
+        static GetKeyLayerFn get_key_layer = reinterpret_cast<GetKeyLayerFn>(
+            dlsym(RTLD_DEFAULT, "CocoaEnsureNativeEglLayerForSurfaceKey"));
+        layer = get_key_layer ? get_key_layer(nativeSurfaceKey, &w, &h) : nullptr;
+        if (layer && w > 0 && h > 0) {
+            {
+                std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+                if (rec->window.magic != kMacApkNWMagic) {
+                    rec->window.width = w;
+                    rec->window.height = h;
+                    rec->window.format = 1;
+                    rec->window.layer = layer;
+                    rec->window.magic = kMacApkNWMagic;
+                }
+            }
+            static std::atomic<int> keyedLog{0};
+            if (keyedLog.fetch_add(1) < 8)
+                std::fprintf(stderr,
+                    "[arm64-shim] ANativeWindow_fromSurface -> keyed window %p "
+                    "surfaceKey=%d layer=%p %dx%d\n",
+                    (void*)&rec->window, nativeSurfaceKey, layer, w, h);
+            return &rec->window;
+        }
+    }
+    layer = get_layer ? get_layer(&w, &h) : nullptr;
     static std::atomic<int> n{0};
     int c = n.fetch_add(1);
     if (layer && w > 0 && h > 0) {
+        if (macapk_keyed_native_windows_enabled() && rec) {
+            // A keyless Surface (or a keyed layer whose creation failed) still
+            // needs its own acquired handle and Java identity on the fallback
+            // layer. Returning the legacy singleton here would lose both.
+            std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+            if (rec->window.magic != kMacApkNWMagic) {
+                rec->window.width = w;
+                rec->window.height = h;
+                rec->window.format = 1;
+                rec->window.layer = layer;
+                rec->window.surface_key = 0;
+                rec->window.magic = kMacApkNWMagic;
+            }
+            return &rec->window;
+        }
         g_macapk_unity_window.magic  = kMacApkNWMagic;
         g_macapk_unity_window.width  = w;
         g_macapk_unity_window.height = h;
         g_macapk_unity_window.format = 1; // RGBA_8888
         g_macapk_unity_window.layer  = layer;
+        g_macapk_unity_window.surface_key = 0;
         if (c < 8) {
             std::fprintf(stderr,
                 "[arm64-shim] ANativeWindow_fromSurface -> real window %p "
@@ -64281,15 +64650,18 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
             "(get_layer=%p) -> dummy\n", (void*)get_layer);
         std::fflush(stderr);
     }
+    if (macapk_keyed_native_windows_enabled() && rec)
+        __macapk_arm64_ANativeWindow_release(&rec->window);
     return g_macapk_dummy_ANativeWindow;
 }
 // The CAMetalLayer behind an ANativeWindow ANativeWindow_fromSurface returned
 // (NULL for the dummy): what vkCreateAndroidSurfaceKHR presents to.
 extern "C" void* __macapk_native_window_layer(void* w) {
-    return macapk_is_unity_window(w) ? g_macapk_unity_window.layer : nullptr;
+    MacApkNativeWindow* nw = macapk_native_window_for_ptr(w);
+    return nw ? nw->layer : nullptr;
 }
 extern "C" int32_t __macapk_arm64_ANativeWindow_getFormat(void* w) {
-    if (macapk_is_unity_window(w)) return g_macapk_unity_window.format;
+    if (MacApkNativeWindow* nw = macapk_native_window_for_ptr(w)) return nw->format;
     return 1; // WINDOW_FORMAT_RGBA_8888
 }
 // ANativeWindow_toSurface(env, window) -- NDK native_window_jni.h (API 26+):
@@ -64302,16 +64674,26 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_getFormat(void* w) {
 // NULL when no real Surface ever arrived, which is the documented answer for a
 // window that has no Java counterpart.
 extern "C" void* __macapk_arm64_ANativeWindow_toSurface(void* /*env*/,
-                                                        void* /*w*/) {
-    jobject gref = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
-        gref = g_macapk_nw_surface_gref;
-    }
-    if (!gref) return nullptr;
+                                                        void* w) {
     AttachGuard ag;
     if (!ag.env) return nullptr;
-    jobject local = ag.env->NewLocalRef(gref);
+    jobject local = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+        jobject gref = nullptr;
+        if (!macapk_keyed_native_windows_enabled()) {
+            // Preserve the original singleton lookup (including dummy-window
+            // fallback) when the keyed compositor is not explicitly enabled.
+            gref = g_macapk_nw_surface_gref;
+        } else {
+            for (const auto& r : g_macapk_nw_records) {
+                if (r && w == &r->window) { gref = r->surface; break; }
+            }
+        }
+        // Pin the local reference before the legacy slot may be replaced by
+        // another fromSurface call and its old global reference released.
+        if (gref) local = ag.env->NewLocalRef(gref);
+    }
     if (!local && ag.env->ExceptionCheck()) ag.env->ExceptionClear();
     return local;
 }
@@ -64945,6 +65327,12 @@ struct MacApkLooper {
     // callback runs only on the thread polling its looper, so an owner-polled
     // looper must never be adopted as an orphan by the vsync feeder thread.
     std::atomic<bool> owner_polls{false};
+    // Diagnostics only: never incremented unless native choreographer tracing
+    // is explicitly enabled. Kept per looper so unrelated renderers cannot
+    // consume each other's first few trace samples.
+    std::atomic<uint64_t> trace_registered{0}, trace_fired{0};
+    std::atomic<uint64_t> trace_entered{0}, trace_returned{0};
+    std::atomic<int64_t> trace_last_enter_ns{0};
     // Lazily create the wake self-pipe (macOS has no eventfd; a non-blocking
     // self-pipe is the portable equivalent we poll() alongside the looper fds).
     void ensure_wake_pipe() {
@@ -64963,6 +65351,54 @@ thread_local MacApkLooper* t_looper = nullptr;
 std::mutex                 g_loopers_mu;
 std::vector<MacApkLooper*> g_loopers;     // registry for the vsync broadcast
 
+static bool macapk_native_choreo_trace_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("MACAPK_NATIVE_CHOREO_TRACE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+static int64_t macapk_native_choreo_trace_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void macapk_choreo_invoke(MacApkLooper* L, const MacApkChoreoCb& c,
+                                 int64_t ft, const char* via) {
+    if (!c.fn) return;
+    const bool trace = macapk_native_choreo_trace_enabled();
+    uint64_t entered = 0;
+    int64_t started = 0;
+    bool sample = false;
+    if (trace) {
+        entered = L->trace_entered.fetch_add(1, std::memory_order_relaxed) + 1;
+        started = macapk_native_choreo_trace_now_ns();
+        const int64_t previous = L->trace_last_enter_ns.exchange(
+            started, std::memory_order_relaxed);
+        sample = entered <= 3 || entered % 120 == 0;
+        if (sample) {
+            uint64_t tid = 0; pthread_threadid_np(nullptr, &tid);
+            std::fprintf(stderr,
+                "[native-choreo] enter looper=%p via=%s tid=%llu count=%llu "
+                "cb=%p data=%p frame_ns=%lld now_ns=%lld interval_ms=%.3f\n",
+                (void*)L, via, (unsigned long long)tid,
+                (unsigned long long)entered, c.fn, c.data, (long long)ft,
+                (long long)started, previous ? (started - previous) / 1e6 : -1.0);
+        }
+    }
+    if (c.is64) reinterpret_cast<void(*)(int64_t,void*)>(c.fn)(ft, c.data);
+    else        reinterpret_cast<void(*)(long,void*)>(c.fn)((long)ft, c.data);
+    if (trace) {
+        const uint64_t returned = L->trace_returned.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (sample)
+            std::fprintf(stderr,
+                "[native-choreo] return looper=%p via=%s entered=%llu "
+                "returned=%llu duration_ms=%.3f\n", (void*)L, via,
+                (unsigned long long)entered, (unsigned long long)returned,
+                (macapk_native_choreo_trace_now_ns() - started) / 1e6);
+    }
+}
+
 MacApkLooper* macapk_looper_ensure() {
     if (!t_looper) {
         t_looper = new MacApkLooper();
@@ -64972,7 +65408,8 @@ MacApkLooper* macapk_looper_ensure() {
     }
     return t_looper;
 }
-void macapk_choreo_register_on(void* inst, void* fn, void* data, bool is64) {
+void macapk_choreo_register_on(void* inst, void* fn, void* data, bool is64,
+                               long requestedDelayMs = 0) {
     if (!fn) return;
     MacApkLooper* L = inst ? static_cast<MacApkLooper*>(inst)
                              : macapk_looper_ensure();
@@ -64983,7 +65420,22 @@ void macapk_choreo_register_on(void* inst, void* fn, void* data, bool is64) {
         "[choreo] register #%d cb=%p data=%p is64=%d REGTID=%llu looper=%p\n",
         c, fn, data, is64, (unsigned long long)tid, (void*)L); }
     std::lock_guard<std::mutex> lk(L->mu);
-    if (L->pending.size() < 256) L->pending.push_back({fn, data, is64});
+    const bool queued = L->pending.size() < 256;
+    if (queued) L->pending.push_back({fn, data, is64});
+    if (macapk_native_choreo_trace_enabled()) {
+        const uint64_t count = L->trace_registered.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (count <= 3 || count % 120 == 0) {
+            uint64_t tid = 0; pthread_threadid_np(nullptr, &tid);
+            std::fprintf(stderr,
+                "[native-choreo] register looper=%p tid=%llu count=%llu cb=%p "
+                "data=%p is64=%d requested_delay_ms=%ld queued=%d pending=%zu "
+                "ready=%zu now_ns=%lld\n", (void*)L, (unsigned long long)tid,
+                (unsigned long long)count, fn, data, (int)is64,
+                requestedDelayMs, (int)queued, L->pending.size(), L->ready.size(),
+                (long long)macapk_native_choreo_trace_now_ns());
+        }
+    }
 }
 
 // --- EXPERIMENTAL Unity native-vsync pump (env-gated MACAPK_UNITY_VSYNC_PUMP) ---
@@ -65369,8 +65821,7 @@ static int macapk_alooper_poll_slice(
         { std::lock_guard<std::mutex> lk(L->mu); cbs.swap(L->ready); ft = L->ready_ft; }
         for (const MacApkChoreoCb& c : cbs) {
             if (!c.fn) continue;
-            if (c.is64) reinterpret_cast<void(*)(int64_t,void*)>(c.fn)(ft, c.data);
-            else        reinterpret_cast<void(*)(long,void*)>(c.fn)((long)ft, c.data);
+            macapk_choreo_invoke(L, c, ft, "ndk-poll-fds");
             ret = -2;
         }
         return ret;
@@ -65400,12 +65851,7 @@ static int macapk_alooper_poll_slice(
         // Run frame callbacks ON THIS (the polling) thread, OUTSIDE the lock —
         // Unity's callback re-registers (postFrameCallback) from inside.
         for (const MacApkChoreoCb& c : cbs) {
-            if (!c.fn) continue;
-            if (c.is64)
-                reinterpret_cast<void (*)(int64_t, void*)>(c.fn)(ft, c.data);
-            else
-                reinterpret_cast<void (*)(long, void*)>(c.fn)(
-                    static_cast<long>(ft), c.data);
+            macapk_choreo_invoke(L, c, ft, "ndk-poll-cv");
         }
         return -2; // ALOOPER_POLL_CALLBACK
     }
@@ -65842,9 +66288,7 @@ extern "C" void __macapk_looper_native_poll(void* looperPtr, int timeoutMs) {
     std::vector<MacApkChoreoCb> cbs; int64_t ft = 0;
     { std::lock_guard<std::mutex> lk(L->mu); cbs.swap(L->ready); ft = L->ready_ft; }
     for (const MacApkChoreoCb& c : cbs) {
-        if (!c.fn) continue;
-        if (c.is64) reinterpret_cast<void(*)(int64_t,void*)>(c.fn)(ft, c.data);
-        else        reinterpret_cast<void(*)(long,void*)>(c.fn)((long)ft, c.data);
+        macapk_choreo_invoke(L, c, ft, "java-native-poll");
     }
 }
 
@@ -65930,12 +66374,12 @@ extern "C" void __macapk_arm64_AChoreographer_postFrameCallback64(
     macapk_choreo_register_on(c, reinterpret_cast<void*>(cb), data, true);
 }
 extern "C" void __macapk_arm64_AChoreographer_postFrameCallbackDelayed(
-        void* c, void (*cb)(long, void*), void* data, long /*delayMs*/) {
-    macapk_choreo_register_on(c, reinterpret_cast<void*>(cb), data, false);
+        void* c, void (*cb)(long, void*), void* data, long delayMs) {
+    macapk_choreo_register_on(c, reinterpret_cast<void*>(cb), data, false, delayMs);
 }
 extern "C" void __macapk_arm64_AChoreographer_postFrameCallbackDelayed64(
-        void* c, void (*cb)(int64_t, void*), void* data, long /*delayMs*/) {
-    macapk_choreo_register_on(c, reinterpret_cast<void*>(cb), data, true);
+        void* c, void (*cb)(int64_t, void*), void* data, long delayMs) {
+    macapk_choreo_register_on(c, reinterpret_cast<void*>(cb), data, true, delayMs);
 }
 // Display vsync tick (once per frame, from cocoa_bridge.mm MacapkDriveTickAt --
 // see MACAPK_VSYNC_THREAD there for which thread that is). Move every looper's
@@ -65961,12 +66405,7 @@ static void macapk_choreo_run_ready_on(MacApkLooper* self, int64_t fallback_ft) 
         ft = self->ready_ft;
     }
     for (const MacApkChoreoCb& c : cbs) {
-        if (!c.fn) continue;
-        if (c.is64)
-            reinterpret_cast<void (*)(int64_t, void*)>(c.fn)(ft, c.data);
-        else
-            reinterpret_cast<void (*)(long, void*)>(c.fn)(
-                static_cast<long>(ft), c.data);
+        macapk_choreo_invoke(self, c, ft, "tick-thread-drain");
     }
 }
 // Exported for drawInMTKView when the vsync thread owns the tick: runs the calling
@@ -66000,6 +66439,23 @@ extern "C" void __macapk_arm64_choreographer_fire(int64_t /*frameTimeNanos_raw*/
         for (MacApkLooper* L : g_loopers) {
             std::lock_guard<std::mutex> lk(L->mu);
             if (L->pending.empty()) continue;
+            if (macapk_native_choreo_trace_enabled()) {
+                const uint64_t previous = L->trace_fired.fetch_add(
+                    L->pending.size(), std::memory_order_relaxed);
+                const uint64_t count = previous + L->pending.size();
+                if (previous < 3 || previous / 120 != count / 120) {
+                    uint64_t tid = 0; pthread_threadid_np(nullptr, &tid);
+                    std::fprintf(stderr,
+                        "[native-choreo] fire looper=%p tick_tid=%llu "
+                        "count=%llu batch=%zu ready_before=%zu owner_polls=%d "
+                        "frame_ns=%lld now_ns=%lld\n", (void*)L,
+                        (unsigned long long)tid, (unsigned long long)count,
+                        L->pending.size(), L->ready.size(),
+                        (int)L->owner_polls.load(std::memory_order_relaxed),
+                        (long long)frameTimeNanos,
+                        (long long)macapk_native_choreo_trace_now_ns());
+                }
+            }
             moved += L->pending.size();
             for (const MacApkChoreoCb& c : L->pending) L->ready.push_back(c);
             L->pending.clear();
