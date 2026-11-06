@@ -1,0 +1,713 @@
+// javax.microedition.khronos.egl.MacApkGlWindow -- an EGL WINDOW surface whose
+// native window is a SurfaceTexture (a TextureView's, or one the app made).
+//
+// WHY THIS EXISTS (2026-09-26, docs/telegram-intro-logo_2026-09-26.md §6-7).
+// On Android, eglCreateWindowSurface(dpy, cfg, surfaceTexture, attrs) builds a
+// real window on that stream's BufferQueue producer
+// (frameworks/base core/jni/com_google_android_gles_jni_EGLImpl.cpp
+// jni_eglCreateWindowSurfaceTexture, android14-release :284-310:
+// `window = new Surface(producer, true)`), and every eglSwapBuffers queues one
+// buffer that the consumer latches -- for a TextureView, HWUI's render thread.
+// ANGLE on macOS has no ANativeWindow to bind to a Java SurfaceTexture, and the
+// consumer here is the Canvas pipeline (TextureView.draw ->
+// SurfaceTexture.macapkLatchBitmap), not a GL texture. So this surface is:
+//
+//   - an ANGLE PBUFFER the app's context renders into, sized to the stream's
+//     default buffer size (SurfaceTexture.setDefaultBufferSize, which
+//     TextureView sets to the view size), 1x1 when nobody set one
+//     (frameworks/native libs/gui/BufferQueueCore.cpp: mDefaultWidth(1),
+//     mDefaultHeight(1));
+//   - at each swap, a glReadPixels of that pbuffer on the CALLER's thread (its
+//     context is current, which EGL requires for a swap anyway), flipped to
+//     top-down rows (GL's origin is bottom-left; a BufferQueue buffer's memory
+//     is top-down) and un-premultiplied into the non-premultiplied ARGB our
+//     Bitmap stores (HWUI composites the buffer as premultiplied; a GL
+//     consumer's updateTexImage premultiplies it back), then queued
+//     into THAT SurfaceTexture through its per-instance producer entry
+//     (SurfaceTexture.macapkQueueProducerFrame) with GLConsumer's own
+//     transform matrix (frameworks/native libs/gui/GLConsumerUtils.cpp:
+//     `xform = mtxFlipV * xform`, mtxFlipV = {1,0,0,0, 0,-1,0,0, 0,0,1,0,
+//     0,1,0,1});
+//   - resized at the swap AFTER setDefaultBufferSize changes, which is when a
+//     real window surface picks up a new size (its next dequeueBuffer). The
+//     app's EGLSurface object stays the same; only the pbuffer behind it is
+//     replaced and re-bound current on the swapping thread.
+//
+// The pbuffer lives on MacApkEGL10's OWN ANGLE display, never the framework
+// display angle_glue.cpp renders the window with: ANGLE-Metal has ONE command
+// queue per display, and a glReadPixels on a context sharing the framework
+// display can park on the framework's uncommitted command buffer
+// (docs/angle-metal-per-display-command-queue-deadlock_2026-07-04.md).
+//
+// Cost, measured nowhere yet (the note's OPEN Q2): one synchronous readback
+// and one w*h ARGB conversion per swap, plus a Canvas-tier repaint of the
+// TextureView. Buffers are recycled (at most three in flight: filling, queued,
+// latching), so a steady stream allocates nothing. Correctness first; an async
+// PBO ring like the NDK offscreen-decouple is the upgrade path.
+//
+// TWO CLIENTS (2026-09-26). The javax EGL10 facade (MacApkEGL10) holds its
+// windows in its own EGLSurface objects. android.opengl.EGL14 cannot: its
+// handle IS the native EGLSurface, so runtime/src/egl14_bridges.inc keeps the
+// handle-to-pbuffer registry and reaches this class through the egl14*
+// static upcalls at the bottom (docs/egl14-window-surface_2026-09-26.md).
+// On that path the pbuffer lives on the display the APP chose, which for
+// EGL14 is ANGLE's default display; that MEASURES as the framework display
+// itself (ANGLE resolves TYPE_DEFAULT to Metal before keying its display map).
+// Why this readback still cannot park on the framework's uncommitted buffer is
+// in the bridge's header, and the egl14window gate's SHARED-DPY row watches it.
+package javax.microedition.khronos.egl;
+
+import android.graphics.SurfaceTexture;
+import android.opengl.EGL14;
+import android.opengl.GLES20;
+
+public final class MacApkGlWindow {
+    // GLES 2.0 / 3.0 enums (Khronos gl2.h / gl3.h).
+    private static final int GL_RGBA = 0x1908;
+    private static final int GL_UNSIGNED_BYTE = 0x1401;
+    private static final int GL_FRAMEBUFFER = 0x8D40;
+    private static final int GL_FRAMEBUFFER_BINDING = 0x8CA6;
+    private static final int GL_READ_FRAMEBUFFER = 0x8CA8;
+    private static final int GL_READ_FRAMEBUFFER_BINDING = 0x8CAA;
+    private static final int GL_PACK_ALIGNMENT = 0x0D05;
+    private static final int GL_PACK_ROW_LENGTH = 0x0D02;
+    private static final int GL_PACK_SKIP_ROWS = 0x0D03;
+    private static final int GL_PACK_SKIP_PIXELS = 0x0D04;
+    private static final int GL_PIXEL_PACK_BUFFER = 0x88EB;
+    private static final int GL_PIXEL_PACK_BUFFER_BINDING = 0x88ED;
+    private static final int EGL_WIDTH = 0x3057;
+    private static final int EGL_HEIGHT = 0x3056;
+    private static final int EGL_NONE = 0x3038;
+
+    /** GLConsumer's mtxFlipV, column-major (GLConsumerUtils.cpp). */
+    private static final float[] FLIP_V = {
+        1f, 0f, 0f, 0f,
+        0f, -1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 1f, 0f, 1f,
+    };
+
+    private final android.opengl.EGLDisplay mDpy;
+    private final android.opengl.EGLConfig mCfg;
+    private final SurfaceTexture mSt;
+    private final boolean mAllowShared;
+    private volatile android.opengl.EGLSurface mPbuffer;
+    private volatile int mW, mH;
+    private volatile boolean mDestroyed;
+    private long mFrames;
+    private long mSharedPool, mSharedToken;
+    private long mRetiredPool, mRetiredToken;
+    private boolean mDirectLayerActive;
+    private static final boolean SHARED_EXPERIMENT =
+        "1".equals(System.getenv("MACAPK_GL_WINDOW_SHARED_EXPERIMENT"));
+    private static final boolean NATIVE_LAYER_EXPERIMENT =
+        "1".equals(System.getenv("MACAPK_GL_WINDOW_NATIVE_LAYER_EXPERIMENT"));
+    // Opt-in measurement for this producer only; no per-frame logging.
+    private static final boolean TRACE_READBACK =
+        "1".equals(System.getenv("MACAPK_GL_WINDOW_READBACK_TRACE"));
+    private long mTraceFrames, mTraceBytes, mTraceReadNanos, mTraceTotalNanos;
+    private static final boolean TRACE_GEOMETRY =
+        "1".equals(System.getenv("MACAPK_GFX_TRACE"));
+    private int mTraceWidth, mTraceHeight, mTraceDefaultWidth, mTraceDefaultHeight;
+
+    // Readback scratch (the swapping thread only) and the recycled frames.
+    private java.nio.ByteBuffer mRgba;
+    private final java.util.concurrent.ConcurrentLinkedQueue<int[]> mFree =
+        new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.function.Consumer<int[]> mRecycler = mFree::offer;
+
+    private MacApkGlWindow(android.opengl.EGLDisplay dpy, android.opengl.EGLConfig cfg,
+                           SurfaceTexture st, boolean allowShared) {
+        mDpy = dpy;
+        mCfg = cfg;
+        mSt = st;
+        mAllowShared = allowShared;
+    }
+
+    static boolean traceNativeLayer() {
+        return NATIVE_LAYER_EXPERIMENT && TRACE_READBACK;
+    }
+
+    /** Result of {@link #create}: the window, or the EGL error the caller must
+     *  report when it is null (0 = leave the native error ANGLE set). */
+    static final class Created {
+        final MacApkGlWindow window;
+        final int javaError;
+        Created(MacApkGlWindow w, int e) { window = w; javaError = e; }
+    }
+
+    /** Connect to {@code st} as its producer and allocate the pbuffer. */
+    static Created create(android.opengl.EGLDisplay dpy, android.opengl.EGLConfig cfg,
+                          SurfaceTexture st) { return create(dpy, cfg, st, false); }
+
+    static Created create(android.opengl.EGLDisplay dpy, android.opengl.EGLConfig cfg,
+                          SurfaceTexture st, boolean allowShared) {
+        MacApkGlWindow w = new MacApkGlWindow(dpy, cfg, st, allowShared);
+        // AOSP: a second producer (another window surface, a camera, a decoder)
+        // makes native_window_api_connect fail and eglCreateWindowSurface
+        // return EGL_NO_SURFACE with EGL_BAD_ALLOC. An abandoned stream too.
+        if (!st.macapkConnectProducer(w)) return new Created(null, EGL10.EGL_BAD_ALLOC);
+        int[] size = defaultSize(st);
+        android.opengl.EGLSurface s = null;
+        if (allowShared && SHARED_EXPERIMENT) {
+            long pool = com.macapk.loader.SharedGlFrameBridge.create(
+                dpy.getNativeHandle(), cfg.getNativeHandle(), size[0], size[1]);
+            if (pool != 0) {
+                long[] slot = new long[2];
+                if (com.macapk.loader.SharedGlFrameBridge.begin(pool, slot)) {
+                    w.mSharedPool = pool; w.mSharedToken = slot[0];
+                    s = android.opengl.EGLSurface.macapkWrapNativeHandle(slot[1]);
+                    android.util.Log.i("MacApkGlWindow", "shared experiment enabled " + size[0] + "x" + size[1]);
+                    if (traceNativeLayer()) {
+                        android.util.Log.i("MacApkGlWindow", "native-layer begin token="
+                            + slot[0] + " surface=0x" + Long.toHexString(slot[1]));
+                    }
+                } else com.macapk.loader.SharedGlFrameBridge.destroy(pool);
+            }
+        }
+        if (s == null) s = newPbuffer(dpy, cfg, size[0], size[1]);
+        if (s == null) {
+            st.macapkDisconnectProducer(w);
+            return new Created(null, 0);
+        }
+        w.mPbuffer = s;
+        w.mW = size[0];
+        w.mH = size[1];
+        return new Created(w, EGL10.EGL_SUCCESS);
+    }
+
+    private static int[] defaultSize(SurfaceTexture st) {
+        int w = st.macapkGetDefaultWidth(), h = st.macapkGetDefaultHeight();
+        if (w <= 1 || h <= 1) {
+            try {
+                android.util.DisplayMetrics dm = android.content.res.Resources.getSystem().getDisplayMetrics();
+                if (dm != null && dm.widthPixels > 0 && dm.heightPixels > 0) {
+                    w = dm.widthPixels;
+                    h = dm.heightPixels;
+                } else {
+                    w = 1280;
+                    h = 720;
+                }
+            } catch (Throwable t) {
+                w = 1280;
+                h = 720;
+            }
+        }
+        return new int[] { w, h };
+    }
+
+    private static android.opengl.EGLSurface newPbuffer(android.opengl.EGLDisplay dpy,
+            android.opengl.EGLConfig cfg, int w, int h) {
+        android.opengl.EGLSurface s = EGL14.eglCreatePbufferSurface(dpy, cfg,
+            new int[] { EGL_WIDTH, w, EGL_HEIGHT, h, EGL_NONE }, 0);
+        return (s == null || s.getNativeHandle() == 0) ? null : s;
+    }
+
+    /** The ANGLE surface currently standing in for this window. */
+    android.opengl.EGLSurface nativeSurface() { return mPbuffer; }
+    SurfaceTexture surfaceTexture() { return mSt; }
+    int width() { return mW; }
+    int height() { return mH; }
+    boolean isDestroyed() { return mDestroyed; }
+    long frames() { return mFrames; }
+
+    /**
+     * The window half of eglSwapBuffers: read the pbuffer back and queue it as
+     * one frame. The caller guarantees this surface is the calling thread's
+     * current DRAW surface under a context of client version
+     * {@code clientVersion}. Every piece of GL state touched to make the read
+     * well-defined is restored, so the app's next draw sees exactly what it
+     * left: the read framebuffer binding (a swap presents the WINDOW's back
+     * buffer whatever FBO the app has bound), the pack alignment, and on ES3
+     * the pack buffer and row/skip parameters (a bound GL_PIXEL_PACK_BUFFER
+     * would otherwise receive the pixels).
+     */
+    android.opengl.EGLSurface queueFrame(int clientVersion) {
+        final long traceStart = TRACE_READBACK ? System.nanoTime() : 0L;
+        final int w = mW, h = mH;
+        final int n = w * h;
+        if (n <= 0) return null;
+        if (TRACE_GEOMETRY) {
+            int dw = mSt.macapkGetDefaultWidth(), dh = mSt.macapkGetDefaultHeight();
+            if (w != mTraceWidth || h != mTraceHeight
+                    || dw != mTraceDefaultWidth || dh != mTraceDefaultHeight) {
+                int[] viewport = new int[4];
+                GLES20.glGetIntegerv(0x0BA2 /* GL_VIEWPORT */, viewport, 0);
+                android.util.Log.i("MacApkGlWindow", "[gfx-window] st="
+                    + System.identityHashCode(mSt) + " key=" + mSt.macapkDirectLayerSurfaceKey()
+                    + " frame=" + mFrames + " buffer=" + w + "x" + h
+                    + " default=" + dw + "x" + dh + " viewport="
+                    + viewport[0] + "," + viewport[1] + " " + viewport[2] + "x" + viewport[3]
+                    + " shared=" + (mSharedPool != 0));
+                mTraceWidth = w; mTraceHeight = h;
+                mTraceDefaultWidth = dw; mTraceDefaultHeight = dh;
+            }
+        }
+        if (mSharedPool != 0) {
+            int[] desired = defaultSize(mSt);
+            int surfaceKey = NATIVE_LAYER_EXPERIMENT && desired[0] == w && desired[1] == h
+                ? mSt.macapkDirectLayerSurfaceKey() : 0;
+            if (surfaceKey > 0) {
+                long[] next = new long[2];
+                final long beforeToken = mSharedToken;
+                final long beforeSurface = mPbuffer.getNativeHandle();
+                if (traceNativeLayer() && (mFrames < 6 || mFrames % 120 == 0)) {
+                    android.opengl.EGLSurface current = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW);
+                    long currentHandle = current == null ? 0 : current.getNativeHandle();
+                    android.util.Log.i("MacApkGlWindow", "native-layer draw before="
+                        + mFrames + " token=" + beforeToken + " expected=0x"
+                        + Long.toHexString(beforeSurface) + " current=0x"
+                        + Long.toHexString(currentHandle));
+                }
+                // The CALayer consumer receives storage written by ANGLE, so
+                // publish only after every producer command has completed.
+                GLES20.glFinish();
+                if (com.macapk.loader.SharedGlFrameBridge.presentLayer(
+                        mSharedPool, mSharedToken, surfaceKey, next)) {
+                    mDirectLayerActive = true;
+                    mSharedToken = next[0];
+                    mPbuffer = android.opengl.EGLSurface.macapkWrapNativeHandle(next[1]);
+                    mFrames++;
+                    if (TRACE_READBACK) {
+                        mTraceFrames++;
+                        if (traceNativeLayer() && (mFrames < 6 || mFrames % 120 == 0)) {
+                            android.util.Log.i("MacApkGlWindow", "native-layer draw after="
+                                + mFrames + " token=" + beforeToken + " next_token="
+                                + next[0] + " next_surface=0x" + Long.toHexString(next[1]));
+                        }
+                        if (mTraceFrames % 300 == 0)
+                            android.util.Log.i("MacApkGlWindow", "native-layer frames="
+                                + mTraceFrames + " next_size=" + w + "x" + h);
+                    }
+                    return mPbuffer;
+                }
+                // Once the SurfaceView hole is open, mixing an occasional
+                // Canvas copy into the native layer makes the two consumers
+                // alternate and visibly flash. Under ring/main-thread pressure
+                // hold the last native frame and drop this producer frame.
+                if (mDirectLayerActive) {
+                    if (TRACE_READBACK && mFrames % 300 == 0)
+                        android.util.Log.i("MacApkGlWindow", "native-layer backpressure @"
+                            + mFrames + " size=" + w + "x" + h);
+                    return null;
+                }
+                // Before the first accepted native frame, use the proven
+                // compatibility copy so an unavailable layer cannot black out
+                // a SurfaceView whose hole has not opened yet.
+            }
+            int[] pixels = mFree.poll();
+            while (pixels != null && pixels.length != n) pixels = mFree.poll();
+            if (pixels == null) pixels = new int[n];
+            final long copyStart = TRACE_READBACK ? System.nanoTime() : 0L;
+            GLES20.glFinish();
+            boolean copied = com.macapk.loader.SharedGlFrameBridge.copyDrawingArgb(mSharedPool, mSharedToken, pixels);
+            if (copied) {
+                mSt.macapkQueueProducerFrame(pixels, w, h, w, FLIP_V, mRecycler, true);
+                mFrames++;
+                if (TRACE_READBACK) {
+                    mTraceFrames++; mTraceBytes += (long)w*h*4;
+                    mTraceTotalNanos += System.nanoTime()-copyStart;
+                    if (mTraceFrames % 300 == 0)
+                        android.util.Log.i("MacApkGlWindow", "shared-copy frames=" + mTraceFrames
+                            + " bytes=" + mTraceBytes + " total_ns=" + mTraceTotalNanos + " size=" + w + "x" + h);
+                }
+                return null;
+            }
+            // Preserve the current frame on a failed experimental copy.
+            mFree.offer(pixels);
+            android.util.Log.w("MacApkGlWindow", "shared copy failed; using GL readback");
+        }
+        if (mRgba == null || mRgba.capacity() < n * 4) {
+            mRgba = java.nio.ByteBuffer.allocateDirect(n * 4)
+                .order(java.nio.ByteOrder.nativeOrder());
+        }
+
+        final boolean es3 = clientVersion >= 3;
+        final int[] v = new int[1];
+        GLES20.glGetIntegerv(es3 ? GL_READ_FRAMEBUFFER_BINDING : GL_FRAMEBUFFER_BINDING, v, 0);
+        final int savedFb = v[0];
+        GLES20.glGetIntegerv(GL_PACK_ALIGNMENT, v, 0);
+        final int savedAlign = v[0];
+        int savedPbo = 0, savedRowLen = 0, savedSkipRows = 0, savedSkipPixels = 0;
+        if (es3) {
+            GLES20.glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, v, 0); savedPbo = v[0];
+            GLES20.glGetIntegerv(GL_PACK_ROW_LENGTH, v, 0); savedRowLen = v[0];
+            GLES20.glGetIntegerv(GL_PACK_SKIP_ROWS, v, 0); savedSkipRows = v[0];
+            GLES20.glGetIntegerv(GL_PACK_SKIP_PIXELS, v, 0); savedSkipPixels = v[0];
+        }
+        final int fbTarget = es3 ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER;
+        if (savedFb != 0) GLES20.glBindFramebuffer(fbTarget, 0);
+        if (savedAlign != 4) GLES20.glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        if (es3) {
+            if (savedPbo != 0) GLES20.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            if (savedRowLen != 0) GLES20.glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            if (savedSkipRows != 0) GLES20.glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+            if (savedSkipPixels != 0) GLES20.glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+        }
+
+        mRgba.clear();
+        final long traceReadStart = TRACE_READBACK ? System.nanoTime() : 0L;
+        GLES20.glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, mRgba);
+        final long traceReadEnd = TRACE_READBACK ? System.nanoTime() : 0L;
+
+        if (es3) {
+            if (savedSkipPixels != 0) GLES20.glPixelStorei(GL_PACK_SKIP_PIXELS, savedSkipPixels);
+            if (savedSkipRows != 0) GLES20.glPixelStorei(GL_PACK_SKIP_ROWS, savedSkipRows);
+            if (savedRowLen != 0) GLES20.glPixelStorei(GL_PACK_ROW_LENGTH, savedRowLen);
+            if (savedPbo != 0) GLES20.glBindBuffer(GL_PIXEL_PACK_BUFFER, savedPbo);
+        }
+        if (savedAlign != 4) GLES20.glPixelStorei(GL_PACK_ALIGNMENT, savedAlign);
+        if (savedFb != 0) GLES20.glBindFramebuffer(fbTarget, savedFb);
+
+        mRgba.position(0);
+        int[] argb = mFree.poll();
+        while (argb != null && argb.length != n) argb = mFree.poll();  // a stale size: drop it
+        if (argb == null) argb = new int[n];
+
+        boolean fastDone = false;
+        try {
+            fastDone = com.macapk.loader.NativeCocoa.convertGlPbufferToArgb(mRgba, argb, w, h);
+        } catch (Throwable ignored) {}
+
+        if (!fastDone) {
+            java.nio.IntBuffer intBuf = mRgba.asIntBuffer();
+            int[] rowBuf = new int[w];
+            for (int y = 0; y < h; y++) {
+                int srcRow = h - 1 - y;
+                intBuf.position(srcRow * w);
+                intBuf.get(rowBuf, 0, w);
+                int dst = y * w;
+                for (int x = 0; x < w; x++) {
+                    int word = rowBuf[x];
+                    int a = word >>> 24;
+                    int r = word & 0xff;
+                    int b = (word >> 16) & 0xff;
+                    if (a != 0xff) {
+                        if (a == 0) {
+                            r = 0; b = 0; word = 0;
+                        } else {
+                            int g = (word >> 8) & 0xff;
+                            r = (r * 255 + (a >> 1)) / a;
+                            g = (g * 255 + (a >> 1)) / a;
+                            b = (b * 255 + (a >> 1)) / a;
+                            word = (a << 24) | (g << 8);
+                        }
+                    }
+                    argb[dst + x] = (word & 0xff00ff00) | (r << 16) | b;
+                }
+            }
+        }
+        // Inspect before publishing: the consumer may recycle argb as soon as it
+        // has latched it. This opt-in scan is diagnostic, never a perf sample.
+        if (TRACE_READBACK && (mFrames < 3 || mFrames % 300 == 0)) {
+            int nonzero = 0, opaque = 0, hash = 1;
+            for (int pixel : argb) {
+                int alpha = pixel >>> 24;
+                if (alpha != 0) nonzero++;
+                if (alpha == 255) opaque++;
+                hash = 31 * hash + pixel;
+            }
+            android.util.Log.i("MacApkGlWindow", "[readback-pixels] st="
+                + System.identityHashCode(mSt) + " key=" + mSt.macapkDirectLayerSurfaceKey()
+                + " frame=" + mFrames + " size=" + w + "x" + h
+                + " nonzero=" + nonzero + " opaque=" + opaque
+                + " hash=" + Integer.toHexString(hash));
+        }
+        // premultipliedSource=true: a GL consumer (updateTexImage) must see the
+        // premultiplied bytes a device buffer holds, not our straight copy.
+        mSt.macapkQueueProducerFrame(argb, w, h, w, FLIP_V, mRecycler, true); /*GLPREMUL*/
+        mFrames++;
+        if (TRACE_READBACK) {
+            mTraceFrames++;
+            mTraceBytes += (long) w * h * 4;
+            mTraceReadNanos += traceReadEnd - traceReadStart;
+            mTraceTotalNanos += System.nanoTime() - traceStart;
+            if (mTraceFrames % 300 == 0) {
+                android.util.Log.i("MacApkGlWindow", "readback frames=" + mTraceFrames
+                    + " bytes=" + mTraceBytes + " read_ns=" + mTraceReadNanos
+                    + " total_ns=" + mTraceTotalNanos + " size=" + w + "x" + h);
+            }
+        }
+        return null;
+    }
+
+    /** Premultiplied channel back to straight alpha, rounded to nearest. */
+    private static int unpremul(int c, int a) {
+        int v = (c * 255 + (a >> 1)) / a;
+        return v > 255 ? 255 : v;
+    }
+
+    /**
+     * Follow a changed default buffer size: allocate a pbuffer at the new size
+     * and make it this window's surface. Returns the OLD surface, which the
+     * caller must unbind (re-making the new one current) and then destroy, or
+     * null when the size did not change or the new pbuffer could not be made
+     * (the old one stays; the next swap retries).
+     */
+    android.opengl.EGLSurface resizeIfNeeded() {
+        if (mDestroyed) return null;
+        int[] size = defaultSize(mSt);
+        if (size[0] == mW && size[1] == mH) return null;
+        android.opengl.EGLSurface s = null;
+        long newPool = 0, newToken = 0;
+        if (mAllowShared && SHARED_EXPERIMENT) {
+            long pool = com.macapk.loader.SharedGlFrameBridge.create(
+                mDpy.getNativeHandle(), mCfg.getNativeHandle(), size[0], size[1]);
+            if (pool != 0) {
+                long[] slot = new long[2];
+                if (com.macapk.loader.SharedGlFrameBridge.begin(pool, slot)) {
+                    newPool = pool;
+                    newToken = slot[0];
+                    s = android.opengl.EGLSurface.macapkWrapNativeHandle(slot[1]);
+                    android.util.Log.i("MacApkGlWindow", "shared experiment resized "
+                        + size[0] + "x" + size[1]);
+                } else com.macapk.loader.SharedGlFrameBridge.destroy(pool);
+            }
+        }
+        if (s == null) s = newPbuffer(mDpy, mCfg, size[0], size[1]);
+        if (s == null) return null;
+        mFree.clear();
+        mRgba = null;
+        android.opengl.EGLSurface old = mPbuffer;
+        if (mSharedPool != 0) {
+            mRetiredPool = mSharedPool; mRetiredToken = mSharedToken;
+        }
+        mSharedPool = newPool; mSharedToken = newToken;
+        mPbuffer = s;
+        mW = size[0];
+        mH = size[1];
+        return old;
+    }
+
+    /** Called only after the old surface has been unbound on this thread. */
+    void retireResizedSurface(android.opengl.EGLSurface old) {
+        if (mRetiredPool == 0) { EGL14.eglDestroySurface(mDpy, old); return; }
+        retireResizedPool();
+    }
+
+    /** The EGL14 bridge rebinds the replacement surface after the Java
+     *  callback returns. The old pool can then be retired on the next swap or
+     *  when the window closes; its producer token was never drawn after the
+     *  resize swap. */
+    private void retireResizedPool() {
+        if (mRetiredPool == 0) return;
+        long pool = mRetiredPool, token = mRetiredToken;
+        mRetiredPool = 0; mRetiredToken = 0;
+        if (!destroySharedPool(pool, token))
+            android.util.Log.e("MacApkGlWindow", "shared pool retirement failed");
+    }
+
+    /** eglDestroySurface: disconnect from the stream (its last frame stays
+     *  latched, as GLConsumer keeps its current image) and free the pbuffer.
+     *  A surface still current is freed by ANGLE once it is released, per the
+     *  EGL spec. Returns the native result. */
+    boolean destroy() {
+        if (mDestroyed) return true;
+        mDestroyed = true;
+        retireResizedPool();
+        mSt.macapkDisconnectProducer(this);
+        mFree.clear();
+        mRgba = null;
+        if (mSharedPool != 0) {
+            long pool=mSharedPool, token=mSharedToken;
+            mSharedPool=0; mSharedToken=0;
+            return destroySharedPool(pool, token);
+        }
+        return EGL14.eglDestroySurface(mDpy, mPbuffer);
+    }
+
+    /** Cancel the producer slot and close now or, when layer transactions are
+     *  still pending, hand final destruction to their bounded callbacks. */
+    private static boolean destroySharedPool(long pool, long token) {
+        if (token != 0) com.macapk.loader.SharedGlFrameBridge.cancel(pool, token);
+        if (com.macapk.loader.SharedGlFrameBridge.destroy(pool)) return true;
+        return com.macapk.loader.SharedGlFrameBridge.destroyDeferred(pool);
+    }
+
+    // =====================================================================
+    // android.opengl.EGL14 window surfaces: the upcalls of
+    // runtime/src/egl14_bridges.inc (MACAPK_EGL14_WINDOW_REAL, default ON).
+    // Called only from those bridges, on the app's own thread.
+    // =====================================================================
+
+    private static final String TAG14 = "Mac.apk.EGL14";
+
+    /** AOSP's not_valid_surface message (android_opengl_EGL14.cpp). */
+    private static final String NOT_VALID_SURFACE =
+        "Make sure the SurfaceView or associated SurfaceHolder has a valid Surface";
+
+    /** A window is named by (native display, the handle the app was given). */
+    private record Egl14Key(long dpy, long surface) {}
+    private static final java.util.concurrent.ConcurrentHashMap<Egl14Key, MacApkGlWindow>
+        EGL14_WINDOWS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** egl14CreateWindowSurface: not a stream the bridge can serve. The bridge
+     *  then asks ANGLE with no native window, which reports
+     *  EGL_BAD_NATIVE_WINDOW after validating the display and config. */
+    private static final long EGL14_NOT_A_STREAM = 0;
+    /** egl14CreateWindowSurface: the pbuffer was refused; ANGLE's error stands. */
+    private static final long EGL14_ANGLE_REFUSED = -1;
+    /** egl14CreateWindowSurface: a SurfaceView's Surface. The bridge makes a real
+     *  ANGLE window on the SurfaceView's native window (the native-EGL layer
+     *  ANativeWindow_fromSurface hands NDK code), with the app's attrib list.
+     *  Not an EGL error code (those are 0x3000-0x300E), so -2 is unambiguous. */
+    private static final long EGL14_SURFACEVIEW_WINDOW = -2;
+
+    /** MACAPK_EGL14_SURFACEVIEW_WINDOW (default ON; GitHub #15). =0 restores the
+     *  pre-change refusal of a SurfaceView's Surface (EGL_BAD_NATIVE_WINDOW). */
+    private static final boolean EGL14_SURFACEVIEW_ON =
+        !"0".equals(System.getenv("MACAPK_EGL14_SURFACEVIEW_WINDOW"));
+
+    private static int sLog14Budget = 24;
+    private static synchronized boolean log14() {
+        if (sLog14Budget <= 0) return false;
+        sLog14Budget--;
+        return true;
+    }
+    private static void info14(String msg) {
+        try {
+            com.macapk.loader.NativeLog.i(TAG14, msg);
+        } catch (Throwable ignored) {
+            // NativeLog.print is native; a harness JVM without it logs nothing.
+        }
+    }
+
+    /** AOSP's sentinel scan: some EGL_NONE at or after {@code offset}
+     *  (android_opengl_EGL14.cpp: the loop over _remaining = length - offset,
+     *  which finds nothing when offset is past the end). */
+    private static void requireEglNone(int[] attribs, int offset) {
+        for (int i = attribs.length - 1; i >= offset; i--) {
+            if (attribs[i] == EGL_NONE) return;
+        }
+        throw new IllegalArgumentException("attrib_list must contain EGL_NONE!");
+    }
+
+    /**
+     * EGL14.eglCreateWindowSurface: AOSP EGL14.java's dispatch, then the checks
+     * of the JNI entry it picks (frameworks/base core/jni/android_opengl_EGL14.cpp
+     * android_eglCreateWindowSurface / android_eglCreateWindowSurfaceTexture),
+     * in their order. Throws what AOSP throws. Returns the new window's handle
+     * (&gt; 0), {@link #EGL14_NOT_A_STREAM}, {@link #EGL14_ANGLE_REFUSED},
+     * {@link #EGL14_SURFACEVIEW_WINDOW}, or
+     * minus the EGL error to report (EGL_BAD_ALLOC: the stream is abandoned or
+     * already has a producer, AOSP's native_window_api_connect failure).
+     */
+    public static long egl14CreateWindowSurface(android.opengl.EGLDisplay dpy,
+            android.opengl.EGLConfig cfg, Object win, int[] attribs, int offset) {
+        android.view.Surface sur = null;
+        if (win instanceof android.view.SurfaceView) {
+            sur = ((android.view.SurfaceView) win).getHolder().getSurface();
+        } else if (win instanceof android.view.SurfaceHolder) {
+            sur = ((android.view.SurfaceHolder) win).getSurface();
+        } else if (win instanceof android.view.Surface) {
+            sur = (android.view.Surface) win;
+        }
+        final SurfaceTexture st;
+        final String kind;
+        if (sur != null) {
+            // android_eglCreateWindowSurface: the list is optional here.
+            if (attribs != null) {
+                if (offset < 0) throw new IllegalArgumentException("offset < 0");
+                requireEglNone(attribs, offset);
+            }
+            // android_view_Surface_getNativeWindow == NULL -> not_valid_surface.
+            if (!sur.isValid()) throw new IllegalArgumentException(NOT_VALID_SURFACE);
+            st = sur.macapkGetSurfaceTexture();
+            if (st == null && EGL14_SURFACEVIEW_ON && sur.macapkGetOwnerSurfaceView() != null) {
+                // A SurfaceView's Surface (GitHub #15: MapLibre's SurfaceView
+                // render thread; WebRTC's SurfaceViewRenderer is the same
+                // shape). AOSP hands EGL the Surface's ANativeWindow
+                // (android_eglCreateWindowSurface: android_view_Surface_getNativeWindow);
+                // ours is the dedicated native-EGL CAMetalLayer, the window
+                // ANativeWindow_fromSurface gives NDK code for the same Surface,
+                // so a Java-made window and an NDK-made one are the SAME window.
+                // Note the owner first, as ANativeWindow_fromSurface does, so the
+                // layer composites below the window with its hole punched.
+                sur.macapkNoteNativeWindowConsumer();
+                if (log14()) {
+                    info14("eglCreateWindowSurface(" + win.getClass().getName()
+                        + ") -> SurfaceView window on the native-EGL layer");
+                }
+                return EGL14_SURFACEVIEW_WINDOW;
+            }
+            if (st == null) {
+                // An ImageReader's Surface, a plain Surface (or a SurfaceView's
+                // under MACAPK_EGL14_SURFACEVIEW_WINDOW=0): no window we can
+                // produce into.
+                if (log14()) {
+                    info14("eglCreateWindowSurface(" + win.getClass().getName()
+                        + ") -> EGL_NO_SURFACE (EGL_BAD_NATIVE_WINDOW: not a SurfaceTexture stream)");
+                }
+                return EGL14_NOT_A_STREAM;
+            }
+            kind = "Surface(SurfaceTexture)";
+        } else if (win instanceof SurfaceTexture) {
+            // android_eglCreateWindowSurfaceTexture: the list is REQUIRED.
+            if (attribs == null) throw new IllegalArgumentException("attrib_list == null");
+            if (offset < 0) throw new IllegalArgumentException("offset < 0");
+            requireEglNone(attribs, offset);
+            st = (SurfaceTexture) win;
+            kind = "SurfaceTexture";
+        } else {
+            // AOSP EGL14.java, verbatim (null lands here too).
+            throw new UnsupportedOperationException(
+                "eglCreateWindowSurface() can only be called with an instance of "
+                + "Surface, SurfaceView, SurfaceTexture or SurfaceHolder at the moment, "
+                + "this will be fixed later.");
+        }
+        // The window's own attributes (EGL_RENDER_BUFFER, EGL_GL_COLORSPACE_KHR)
+        // have no pbuffer counterpart; the stream buffer is RGBA8888 sRGB.
+        Created made = create(dpy, cfg, st);
+        if (made.window == null) {
+            if (log14()) {
+                info14("eglCreateWindowSurface(" + kind + ") -> EGL_NO_SURFACE"
+                    + (made.javaError != 0 ? " (EGL_BAD_ALLOC: stream abandoned or already has a producer)"
+                                           : " (pbuffer refused)"));
+            }
+            return made.javaError != 0 ? -(long) made.javaError : EGL14_ANGLE_REFUSED;
+        }
+        long h = made.window.mPbuffer.getNativeHandle();
+        EGL14_WINDOWS.put(new Egl14Key(dpy.getNativeHandle(), h), made.window);
+        if (log14()) {
+            info14("eglCreateWindowSurface(" + kind + " " + made.window.mW + "x" + made.window.mH
+                + ") -> pbuffer-backed window 0x" + Long.toHexString(h));
+        }
+        return h;
+    }
+
+    /**
+     * The window half of EGL14.eglSwapBuffers. The bridge calls this only when
+     * the window's current pbuffer is the calling thread's DRAW surface, and
+     * makes the native swap itself afterwards. Queues one frame, then follows a
+     * changed default buffer size (a real window picks it up at its next
+     * dequeue). Returns the NEW pbuffer's handle when it resized (the bridge
+     * re-binds it, retires the old one and translates the app's handle from
+     * then on), else 0.
+     */
+    public static long egl14SwapWindow(long dpy, long surface, int clientVersion) {
+        MacApkGlWindow w = EGL14_WINDOWS.get(new Egl14Key(dpy, surface));
+        if (w == null || w.mDestroyed) return 0;
+        // The C++ bridge made the previous replacement surface current before
+        // returning. Retire that pool before this swap rotates the new one.
+        w.retireResizedPool();
+        android.opengl.EGLSurface next = w.queueFrame(clientVersion);
+        if (w.mFrames == 1 && log14()) {
+            info14("eglSwapBuffers -> SurfaceTexture frame #1 (" + w.mW + "x" + w.mH + ")");
+        }
+        android.opengl.EGLSurface old = w.resizeIfNeeded();
+        if (old != null) {
+            if (log14()) info14("SurfaceTexture window resized to " + w.mW + "x" + w.mH);
+            return w.mPbuffer.getNativeHandle();
+        }
+        if (next != null) return next.getNativeHandle();
+        return 0;
+    }
+
+    /** EGL14.eglDestroySurface / eglTerminate on a window: disconnect from the
+     *  stream and destroy its CURRENT pbuffer (the bridge has already dropped
+     *  the handle from its registry, so this destroy is a plain one). */
+    public static boolean egl14DestroyWindow(long dpy, long surface) {
+        MacApkGlWindow w = EGL14_WINDOWS.remove(new Egl14Key(dpy, surface));
+        return w == null || w.destroy();
+    }
+}
