@@ -1,31 +1,37 @@
-# PILOT-001：交付首项有证据的通用改进
+# PILOT-001：首批 Framework API 契约修复（Batch 1）
 
-- 状态：TODO
-- 前置：ARCH-001、CI-001
+- 状态：DONE
+- 前置：ARCH-001、TEST-001
 - 证据目录：`work/upgrade/PILOT-001/`
 
-## 目标与范围
+## 目标与修复范围
 
-实施 ARCH-001 选定的一项小改进。当前尚未选定目标，不能提前开始重写。
-开工前补全：问题/契约、允许文件、最小测试、适用回归、性能指标及回退条件。
+针对 [CONTRACT-001](CONTRACT-001.md) 与 [ADR-0003](../adr/0003-aosp-module-evaluation.md) 已锁定的 5 项纯 Java 框架契约缺口实施最小通用修复，并将 `docs/compat/contract_baseline.json` 中对应 5 项 `XFAIL` 翻转为 `PASS`：
 
-## 步骤
+1. **`ServiceManager.getServiceOrThrow` (`GAP-IPC-001` / `CTR-IPC-XFAIL-001`)**：在 `runtime/java/android/os/ServiceManager.java` 新增 `public static class ServiceNotFoundException extends Exception`，当 `getService(name) == null` 时抛出 `new ServiceNotFoundException(name)`。
+2. **`Bundle` API 33 类型安全读取 (`GAP-CONTRACT-BUNDLE-001` / `CTR-BUNDLE-XFAIL-001`)**：在 `runtime/java/android/os/Bundle.java` 的 `getParcelableArrayList(k, Class)`、`getParcelableArray(k, Class)`、`getSerializable(k, Class)`、`getSparseParcelableArray(k, Class)` 中校验返回值与容器元素的 `clazz.isInstance(...)`，类型不匹配时按 AOSP 契约返回 `null`（不泄露不兼容元素）。
+3. **`PatternMatcher` `PATTERN_ADVANCED_GLOB` 与转义点号 (`GAP-CONTRACT-PM-001` / `CTR-PM-XFAIL-001`)**：在 `runtime/java/android/os/PatternMatcher.java` 实现 `PATTERN_ADVANCED_GLOB` 语法校验（非法字符集/量词抛 `IllegalArgumentException`）、字符集 `[...]`/`[^...]`、`+`/`*`/`{m,n}` 匹配与 `Parcel` 往返，修正 `matchGlobPattern` 中转义 `\.` 误匹配任意字符的问题，并保留 `getPattern()` 别名（供 `WifiNetworkSpecifier` 使用）及 `PatternMatcher(Parcel)` 构造器（供 `PathPermission` 使用）。
+4. **`Intent.parseUri` `URI_ANDROID_APP_SCHEME` (`GAP-CONTRACT-INTENT-001` / `CTR-INTENT-XFAIL-001`)**：在 `runtime/java/android/content/Intent.java` 支持解析 `android-app://<package>[/<scheme>[/<host><path>]][#Intent;...;end]`，提取目标 `package` 与内部 data URI。
+5. **`AudioTrack.getMinBufferSize` 参数校验 (`GAP-CONTRACT-AUDIO-001` / `CTR-AUDIO-XFAIL-001`)**：在 `runtime/java/android/media/AudioTrack.java` 校验 `sampleRateInHz`（`4000..192000`）、`channelConfig` 与 `audioFormat`，非法参数返回 `ERROR_BAD_VALUE` (`-2`)。
 
-1. 对固定基础版本复现缺陷或测出热点，记录实际执行二进制与输入。
-2. 兼容修复先建立暴露缺陷的通用回归；性能任务先保留基线；重构先固定可观察行为。
-3. 实施最小修复，不添加包名/业务类/资源 ID 专用分支。
-4. 重跑最小测试、原场景与另一类相关工作负载，检查生命周期和显示正确性。
-5. 性能任务使用同样方法做前后对比，报告波动及相关指标退化；不降低画质伪造改善。
-6. 审查 diff、运行适用 CI，更新文档与任务记录。发布/替换正式安装另行安排。
+## 允许修改文件
 
-## 验收
+- `runtime/java/android/os/ServiceManager.java`
+- `runtime/java/android/os/Bundle.java`
+- `runtime/java/android/os/PatternMatcher.java`
+- `runtime/java/android/content/Intent.java`
+- `runtime/java/android/media/AudioTrack.java`
+- `docs/compat/contract_baseline.json`、`debug/ContractSuiteTest.java`（如需补充断言）
+- 台账与状态文件：`docs/compat/GAPS.md`、`docs/compat/gaps.json`、`docs/compat/capabilities.json`、`docs/compat/CAPABILITIES.md`、`docs/compat/inventory.json`、`docs/tasks/PILOT-001.md`、`docs/UPGRADE_PLAN.md`、`PROJECT_STATE.md`
 
-- [ ] ARCH-001 明确的行为/指标目标得到验证。
-- [ ] 必需回归 PASS，相关跨场景证据齐全，适用性能检查可解释。
-- [ ] 无范围外重构、无默默弱化测试、无正式应用数据变更。
-- [ ] 已知限制、回退、后续任务明确；未验证项不称完成。
+## 构建与验收命令
 
-## 回退与记录
+1. 离线构建：`MACAPK_NO_BUNDLE_SYNC=1 runtime/scripts/build.sh`
+2. 契约回归：`python3 scripts/run_contract_tests.py --out-dir work/upgrade/PILOT-001`（预期 `PASS=12, XFAIL=2, XPASS=0, REGRESSION=0`，`rc=0`）与 `python3 scripts/run_contract_tests.py --self-test`（`rc=0`）
+3. 离线总门禁：`python3 scripts/run_tests.py --group offline --strict --out-dir work/upgrade/PILOT-001/run_tests_offline`（`FAIL=0, SKIP=0`，`rc=0`）
 
-以独立提交保留结果，必要时撤销或切回已验证路径。
-源码回退不代替二进制/应用数据恢复。尚未执行。
+## 验收与回退
+
+- [x] 上述 5 项契约用例由 `XFAIL` 转为 `PASS`（`PASS=12, XFAIL=2, XPASS=0, REGRESSION=0`），`run_contract_tests.py` 与 `run_tests.py --group offline --strict` 全部 `rc=0`。
+- [x] 无包名/类名特例，不触碰 `/Applications/Mac.apk.app` 或共享 runtime。
+- **回退**：`git revert` 本卡提交并重跑 `MACAPK_NO_BUNDLE_SYNC=1 runtime/scripts/build.sh`。

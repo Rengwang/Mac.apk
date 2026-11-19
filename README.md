@@ -1,14 +1,17 @@
 # Mac.apk
 
 > [!IMPORTANT]
-> **Rengwang 通用 Android 兼容层开发分支 · 2026-10-29**
-> 这是经过用户验收的完整源码快照：通用视频、多 Surface、透明叠层、资源的主题、交互控件状态、窗口生命周期、Parcel/Binder 和跨应用兼容能力已同步更新。
-> 请先阅读 **[通用运行时升级手册](docs/MACAPK_UPGRADE_HANDBOOK.md)**；完整修改时间线、验证证据、已知风险和后续路线都记录在其中。
-> 下方原版说明中的 Apple 签名、发行版本和兼容性统计属于上游官方发行；本分支尚未提供同等验收或新的公证安装包。
+> **Rengwang 通用 Android 兼容层开发分支 · 2026-11-19（基于上游 `1.0.2379`）**
+> 本仓库包含上游 `1.0.2379` 源码及通用兼容/架构升级成果（`PILOT-001 .. HOTAPI-003` 契约与高频 Stub 修复、`SURFACE-001..003`、`SCHED-001`、`IPC-001` / `GAP-IPC-003`、`MEDIA-001` / `GAP-MED-002`、上游 Fork 通用整合、`VIDEO-PWR-001` 音视频/无头进程/Sidecar 自动化管线优化），均遵守通用 API/ABI 契约、不写应用专用分支。
+>
+> - **当前状态与交接入口**：[PROJECT_STATE.md](PROJECT_STATE.md) · [升级任务总表](docs/UPGRADE_PLAN.md) · [接手导航](docs/UPGRADE_START_HERE.md)
+> - **路线、架构与构建测试**：[升级路线图](docs/ROADMAP.md) · [旧版升级手册（历史）](docs/MACAPK_UPGRADE_HANDBOOK.md) · [BUILDING.md](BUILDING.md) · [TESTING.md](TESTING.md)
+>
+> 下方原版说明中的 Apple 签名、发行版本和兼容性统计属于上游官方发行；本地开发分支目前仍处于 `VIDEO-PWR-001` / `GFX-001` / `DANMAKU-001` 持续完善阶段（不代表上游公证发行版）。
 
 **Run Android apps natively on Apple Silicon Macs. No emulator, no virtual machine, no Linux underneath.**
 
-[![Latest release](https://img.shields.io/github/v/release/kksimp/Mac.apk?label=latest&color=6c5ce7)](../../releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/kksimp/Mac.apk?label=latest&color=6c5ce7)](https://github.com/kksimp/Mac.apk/releases/latest)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE) [![Commercial license available](https://img.shields.io/badge/commercial%20license-available-blue)](COMMERCIAL.md)
 [![Signed and notarized](https://img.shields.io/badge/signed-notarized%20by%20Apple-000000)](https://github.com/kksimp/Mac.apk/wiki/Installation)
 [![Sponsor](https://img.shields.io/badge/sponsor-kksimp-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/kksimp)
@@ -60,7 +63,7 @@ on top of macOS directly. [How it works →](https://github.com/kksimp/Mac.apk/w
 
 ## Quick start
 
-1. Download the disk image from the [Releases page](../../releases/latest) and drag
+1. Download the disk image from the [Releases page](https://github.com/kksimp/Mac.apk/releases/latest) and drag
    **Mac.apk** into **Applications**. It is signed and notarized by Apple, so it opens
    normally.
 2. Open Mac.apk and click **Install** next to **Runtime:** in the top left.
@@ -95,7 +98,7 @@ Mac.apk has had a lot of help from people outside the project: @5566brs, @defia,
 
 Send the Mac.apk version, your macOS version, the app and where you got it, what
 happened, and the app's log from `~/Library/Logs/macapk/` to Kaleb@voltare.us or
-[open an issue](../../issues/new). Look the log over before posting it publicly.
+[open an issue](https://github.com/kksimp/Mac.apk/issues/new). Look the log over before posting it publicly.
 [What to include →](https://github.com/kksimp/Mac.apk/wiki/Reporting-Problems)
 
 ## Source code
@@ -159,4 +162,4 @@ build recipe) is attached to that release on the
 - **Project page:** https://projects.voltare.us/macapk
 - **Wiki:** https://github.com/kksimp/Mac.apk/wiki
 - **Commercial licensing:** Kaleb@voltare.us
-- **Bug reports:** Kaleb@voltare.us or [open an issue](../../issues/new)
+- **Bug reports:** Kaleb@voltare.us or [open an issue](https://github.com/kksimp/Mac.apk/issues/new)

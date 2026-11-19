@@ -37,6 +37,50 @@ public class MediaCodecDequeueTest {
         Thread stopped = new Thread(() -> answer.set(c.dequeueInputBuffer(-1)));
         stopped.start(); Thread.sleep(30); c.release(); stopped.join(1000);
         if (stopped.isAlive() || answer.get() != -1) throw new AssertionError("release did not cancel");
-        System.out.println("PASS: bounded input/output timeout, non-blocking poll, producer progress, release cancellation");
+
+        // Verify async dispatch with setCallback(cb, handler), condition lock wait and flush
+        MediaCodec asyncCodec = MediaCodec.createByCodecName("test-async");
+        java.util.concurrent.CountDownLatch formatLatch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch inputLatch = new java.util.concurrent.CountDownLatch(1);
+        asyncCodec.setCallback(new MediaCodec.Callback() {
+            @Override public void onInputBufferAvailable(MediaCodec codec, int index) {
+                inputLatch.countDown();
+            }
+            @Override public void onOutputBufferAvailable(MediaCodec codec, int index, MediaCodec.BufferInfo info) {}
+            @Override public void onError(MediaCodec codec, MediaCodec.CodecException e) {}
+            @Override public void onOutputFormatChanged(MediaCodec codec, android.media.MediaFormat format) {
+                formatLatch.countDown();
+            }
+        }, null);
+        field("mStarted").setBoolean(asyncCodec, true);
+        field("mAsyncRunning").setBoolean(asyncCodec, true);
+        Object asyncLock = field("mAsyncLock").get(asyncCodec);
+        synchronized (asyncLock) {
+            ((Queue<Integer>) field("mInFree").get(asyncCodec)).add(0);
+        }
+        Thread asyncThread = new Thread(() -> {
+            try {
+                java.lang.reflect.Method m = MediaCodec.class.getDeclaredMethod("asyncDispatchLoop");
+                m.setAccessible(true);
+                m.invoke(asyncCodec);
+            } catch (Exception ignored) {}
+        }, "test-async-dispatch");
+        field("mAsyncThread").set(asyncCodec, asyncThread);
+        asyncThread.setDaemon(true);
+        asyncThread.start();
+        if (!formatLatch.await(1, java.util.concurrent.TimeUnit.SECONDS)) {
+            throw new AssertionError("async onOutputFormatChanged timed out");
+        }
+        if (!inputLatch.await(1, java.util.concurrent.TimeUnit.SECONDS)) {
+            throw new AssertionError("async onInputBufferAvailable timed out");
+        }
+        asyncCodec.flush();
+        boolean isPaused = field("mAsyncPaused").getBoolean(asyncCodec);
+        if (!isPaused) throw new AssertionError("expected mAsyncPaused=true after flush");
+        asyncCodec.release();
+        asyncThread.join(1000);
+        if (asyncThread.isAlive()) throw new AssertionError("asyncThread did not exit on release");
+
+        System.out.println("PASS: bounded input/output timeout, non-blocking poll, producer progress, release cancellation, async dispatch & flush");
     }
 }

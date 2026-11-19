@@ -143,7 +143,29 @@ public class ActivityManager {
         outInfo.lowMemory     = outInfo.availMem <= outInfo.threshold;
     }
 
-    public List<RunningTaskInfo>          getRunningTasks(int maxNum)  { return Collections.emptyList(); }
+    public List<RunningTaskInfo> getRunningTasks(int maxNum) {
+        if (maxNum <= 0) return Collections.emptyList();
+        android.app.Activity[] activities =
+                com.macapk.loader.ActivityHost.macapkTaskActivitySnapshot();
+        if (activities == null || activities.length == 0) return Collections.emptyList();
+
+        android.app.Activity base = activities[0];
+        android.app.Activity top = activities[activities.length - 1];
+        RunningTaskInfo info = new RunningTaskInfo();
+        info.id = 1;
+        info.taskId = 1;
+        info.baseActivity = new android.content.ComponentName(base, base.getClass());
+        info.topActivity = new android.content.ComponentName(top, top.getClass());
+        info.baseIntent = base.getIntent() == null ? null
+                : new android.content.Intent(base.getIntent());
+        info.numActivities = activities.length;
+        info.isRunning = !top.isFinishing();
+        info.numRunning = info.isRunning ? activities.length : 0;
+        info.description = top.getTitle();
+        info.taskDescription = top.macapkTaskDescription();
+        return Collections.singletonList(info);
+    }
+
     public List<RunningServiceInfo>       getRunningServices(int maxNum) { return Collections.emptyList(); }
 
     /** AOSP: "or null if there are no running processes (it will not
@@ -170,19 +192,16 @@ public class ActivityManager {
      *  reported" is the honest, contract-faithful answer. */
     public List<ProcessErrorStateInfo> getProcessesInErrorState() { return null; }
 
-    public List<RecentTaskInfo>           getRecentTasks(int maxNum, int flags) { return Collections.emptyList(); }
+    public List<RecentTaskInfo> getRecentTasks(int maxNum, int flags) {
+        if (maxNum <= 0) return Collections.emptyList();
+        RecentTaskInfo info = macapkCurrentRecentTask();
+        return info != null ? Collections.singletonList(info) : Collections.emptyList();
+    }
 
-    /** AOSP exposes each live task owned by the calling application. Mac.apk's
-     *  ActivityHost maintains exactly one task, so return its coherent snapshot
-     *  while that task contains an activity. This is not a cosmetic "non-empty"
-     *  answer: baseActivity/topActivity/baseIntent/count are read from the real
-     *  hosted Activity stack and are the same values the app would inspect on a
-     *  device. Some Compose/WebView containers use baseActivity to distinguish a
-     *  task root from a child page before creating their content tree. */
-    public List<AppTask> getAppTasks() {
+    private RecentTaskInfo macapkCurrentRecentTask() {
         android.app.Activity[] activities =
                 com.macapk.loader.ActivityHost.macapkTaskActivitySnapshot();
-        if (activities == null || activities.length == 0) return Collections.emptyList();
+        if (activities == null || activities.length == 0) return null;
 
         android.app.Activity base = activities[0];
         android.app.Activity top = activities[activities.length - 1];
@@ -197,8 +216,22 @@ public class ActivityManager {
                 : new android.content.Intent(base.getIntent());
         info.numActivities = activities.length;
         info.isRunning = !top.isFinishing();
+        info.description = top.getTitle();
         info.taskDescription = top.macapkTaskDescription();
-        return Collections.singletonList(new AppTask(info));
+        return info;
+    }
+
+    /** AOSP exposes each live task owned by the calling application. Mac.apk's
+     *  ActivityHost maintains exactly one task, so return its coherent snapshot
+     *  while that task contains an activity. This is not a cosmetic "non-empty"
+     *  answer: baseActivity/topActivity/baseIntent/count are read from the real
+     *  hosted Activity stack and are the same values the app would inspect on a
+     *  device. Some Compose/WebView containers use baseActivity to distinguish a
+     *  task root from a child page before creating their content tree. */
+    public List<AppTask> getAppTasks() {
+        RecentTaskInfo info = macapkCurrentRecentTask();
+        return info != null ? Collections.singletonList(new AppTask(info))
+                            : Collections.emptyList();
     }
 
     public void killBackgroundProcesses(String packageName) {}
@@ -898,8 +931,14 @@ public class ActivityManager {
     }
 
     public static boolean isLowMemoryKillReportSupported() { return false; }
-    public void setProcessStateSummary(byte[] state) { }
-    public byte[] getProcessStateSummary() { return null; }
+    private static volatile byte[] sProcessStateSummary;
+    public void setProcessStateSummary(byte[] state) {
+        sProcessStateSummary = state == null ? null : java.util.Arrays.copyOf(state, state.length);
+    }
+    public byte[] getProcessStateSummary() {
+        byte[] s = sProcessStateSummary;
+        return s == null ? null : java.util.Arrays.copyOf(s, s.length);
+    }
 
     // ================================================================
     // AOSP API-36 surface completion (android.app.ActivityManager).

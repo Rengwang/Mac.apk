@@ -112,8 +112,10 @@ set(MACAPK_RUNTIME_SOURCES
     # NativeCocoa.hostFontFile: CoreText names the Mac's CJK font files for the
     # native-stack fonts.xml (android.graphics.MacApkHostFonts).
     src/host_fonts.cpp
+    src/native_reflection.cpp
     src/native_sqlite.cpp
     src/native_os.cpp
+    src/native_host_crypto.cpp
     # com.macapk.loader.NativeLinker: dlopen WITHOUT JNI_OnLoad, the Android
     # linker's DT_NEEDED semantics (also compiled by debug/soloader_premap_gate.sh).
     src/native_linker.cpp
@@ -427,6 +429,7 @@ target_link_libraries(macapk-runtime PRIVATE
     # dyld shared cache, so nothing is bundled.
     "-framework IOSurface"
     "-framework WebKit"
+    "-framework CFNetwork"
     "-framework GameController"
     "-framework CoreLocation"
     "-framework CoreBluetooth"

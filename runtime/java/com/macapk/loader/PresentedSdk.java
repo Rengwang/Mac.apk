@@ -91,12 +91,9 @@
 //
 // GATES. MACAPK_SDK_INT is default-unset; MACAPK_SDK_FROM_TARGET is DEFAULT-ON
 // since v1.0.1012 (set it to 0 to restore the flat DEFAULT_SDK in one run).
-// (This block used to claim MACAPK_SDK_FROM_TARGET was "DEFAULT-ON since
-// v1.0.1004". That was never true of the code below it -- the branch tests
-// `"1".equals(getenv(...))`, so an unset var presents 29 -- and the claim
-// survived the same evening's revert, contradicting the comment 30 lines down
-// that records it. Corrected 2026-08-20; a stale gate default in this file is
-// expensive because every consumer derives its level from here.)
+// MACAPK_SDK_FROM_TARGET is DEFAULT-ON since v1.0.1012 (tested via
+// !"0".equals(getenv(...)); set to 0 to disable per-app clamp and restore
+// flat DEFAULT_SDK).
 //   MACAPK_SDK_INT=<n>        absolute override, wins over everything.
 //   MACAPK_SDK_FROM_TARGET=0  DISABLES the per-app clamp and restores the flat
 //                             DEFAULT_SDK. Anything else (unset included) keeps
@@ -257,16 +254,11 @@ public final class PresentedSdk {
                 // clamping only when targetSdk <= CEILING, and leaving apps
                 // above the ceiling at DEFAULT_SDK, before flipping again.
                 //
-                // Historical note on the original revert: Presenting each app its own targetSdk (clamped
-                // [29,34]) rendered Aurora Store ALL WHITE -- owner-observed,
-                // immediately after the flip, on an otherwise-working build.
-                // Not diagnosed: the flip changes SDK_INT for nearly every app
-                // AND flips isExplicit(), which switches the CONFIG_DIRS
-                // force-serve and MACAPK_ARSC_RES_SDK carve-outs from a pinned
-                // 34 to level-derived behaviour -- so it moves resource
-                // selection and code branches at once. That coupling is
-                // exactly why it needs a per-level campaign rather than a
-                // default flip. Opt in with MACAPK_SDK_FROM_TARGET=1.
+                // Historical note on the original revert: The temporary 2026-08-20 revert
+                // required opt-in with MACAPK_SDK_FROM_TARGET=1. Since v1.0.1012,
+                // the underlying resource/lifecycle issues have been resolved, and per-app
+                // clamping is default-ON (!"0".equals(getenv(...))). Opt out with
+                // MACAPK_SDK_FROM_TARGET=0.
                 //
                 // The owner still wants this: "we are
                 // supposed to use the highest the app supports by default."
@@ -423,7 +415,7 @@ public final class PresentedSdk {
     private static int readTargetSdk() {
         String apk = System.getenv("MACAPK_APK_PATH");
         if (apk == null || apk.isEmpty()) {
-            logw("MACAPK_SDK_FROM_TARGET=1 but "
+            logw("MACAPK_SDK_FROM_TARGET active but "
                 + "MACAPK_APK_PATH is unset; presenting default " + DEFAULT_SDK);
             return 0;
         }

@@ -5551,7 +5551,19 @@ public class Resources {
         } catch (Throwable ignored) {}
         return false;
     }
-    public float getFloat(int id) { return 0f; }
+    /** AOSP Resources.getFloat(int): reads TYPE_FLOAT (or parseable string
+     *  value) from getValue(id, tv, true) instead of hardcoding 0f. */
+    public float getFloat(int id) {
+        android.util.TypedValue tv = new android.util.TypedValue();
+        try { getValue(id, tv, true); } catch (Throwable t) { return 0f; }
+        if (tv.type == android.util.TypedValue.TYPE_FLOAT) {
+            return tv.getFloat();
+        }
+        if (tv.type == android.util.TypedValue.TYPE_STRING && tv.string != null) {
+            try { return Float.parseFloat(tv.string.toString().trim()); } catch (NumberFormatException ignored) {}
+        }
+        return 0f;
+    }
     public float getFraction(int id, int base, int pbase) {
         // AOSP Resources.getFraction (Resources.java:1130, android11-release):
         // getValue then complexToFraction(data, base, pbase) -- %  multiplies
@@ -7524,10 +7536,28 @@ public class Resources {
         return getDrawable(id, theme);
     }
 
-    /** AOSP Resources.openRawResourceFd(int): returns an
-     *  AssetFileDescriptor for the raw resource. We don't have a
-     *  real fd; null = "not available." */
-    public AssetFileDescriptor openRawResourceFd(int id) { return null; }
+    /** Open the installed APK's file descriptor at the selected resource entry. */
+    public AssetFileDescriptor openRawResourceFd(int id) {
+        android.util.TypedValue value = new android.util.TypedValue();
+        getValue(id, value, true);
+        String path = value.type == android.util.TypedValue.TYPE_STRING && value.string != null
+            ? value.string.toString() : null;
+        String resource = "resource ID #0x" + Integer.toHexString(id);
+        if (path == null || !path.startsWith("res/") || assets == null) {
+            throw new NotFoundException("File for " + resource);
+        }
+
+        int cookie = value.assetCookie;
+        if (cookie == 0 && (id >>> 24) == 0x01) {
+            cookie = assets.macapkFrameworkAssetCookie();
+            if (cookie == 0) throw new NotFoundException("File " + path + " from " + resource);
+        }
+        try {
+            return assets.openNonAssetFd(cookie, path);
+        } catch (java.io.IOException e) {
+            throw new NotFoundException("File " + path + " from " + resource, e);
+        }
+    }
 
     /** AOSP Resources.parseBundleExtra(String, AttributeSet, Bundle):
      *  parses an <extra> tag's attributes into the given bundle. */

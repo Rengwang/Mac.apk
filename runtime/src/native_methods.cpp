@@ -8,9 +8,11 @@
 // JNI signatures at one location so the surface is auditable.
 
 #include "macapk/native_methods.h"
+#include "macapk/native_reflection.h"
 #include "macapk/gms_signin.h"
 #include "macapk/native_host_proxy.h"
 #include "macapk/cocoa_bridge.h"
+#include "macapk/native_host_crypto.h"
 #include "macapk/self_capture.h"   // SelfCaptureGlWanted
 #include "macapk/gles_bridge.h"
 #include "video_pixels.h"
@@ -69,10 +71,9 @@ namespace {
 
 // Minimum level to EMIT, read once from MACAPK_LOG_LEVEL. Default 0 = emit
 // everything (unchanged for direct CLI runs + the debug harnesses that grep
-// the log). The launcher UI sets MACAPK_LOG_LEVEL=5 by default so a normal
-// run is quiet (WARN+ERROR only, so a crash still surfaces) and FASTER -- the
-// framework logs every classload/JNI call at INFO, tens of thousands of lines
-// per boot. Levels match NativeLog: V=2 D=3 I=4 W=5 E=6. This one funnel gates
+// the log). The launcher UI sets MACAPK_LOG_LEVEL=4 (INFO) by default so a normal
+// run is quiet and fast (along with MACAPK_QUIET_CLASSLOAD=1), while still emitting
+// install lifecycle events. Levels match NativeLog: V=2 D=3 I=4 W=5 E=6. This one funnel gates
 // both framework NativeLog.* and app-side android.util.Log.
 static int macapk_log_min_level() {
     static const int lvl = [] {
@@ -646,6 +647,9 @@ void CocoaPresentSurfaceBitmapFrom(int surface_key, int width, int height,
 int CocoaPresentFrameFrom(int width, int height, int bl, int bt, int br, int bb, int flags,
                           MacapkPixelsAcquireFn acquire, MacapkPixelsReleaseFn release,
                           void* ctx);
+void CocoaReleaseVideoPixelBuffer(jlong pixbufHandle);
+bool CocoaLatchVideoPixelBufferToGl(jlong pixbufHandle, jint texName, jlong boundState[3]);
+void CocoaReleaseGlBoundIosurfaceState(jlong boundState[3]);
 namespace {
 
 // Present fast path, step 2 (2026-09-25, P1.2 of
@@ -810,6 +814,42 @@ jboolean Cocoa_convertVideoArgbToRgba(JNIEnv* env, jclass, jintArray argbArr,
     return JNI_TRUE;
 }
 
+void Cocoa_releaseVideoPixelBuffer(JNIEnv*, jclass, jlong pixbufHandle) {
+    CocoaReleaseVideoPixelBuffer(pixbufHandle);
+}
+
+jboolean Cocoa_latchVideoPixelBufferToGl(JNIEnv* env, jclass, jlong pixbufHandle,
+                                         jint texName, jlongArray boundStateArr) {
+    if (!boundStateArr || env->GetArrayLength(boundStateArr) < 3) {
+        CocoaReleaseVideoPixelBuffer(pixbufHandle);
+        return JNI_FALSE;
+    }
+    jlong state[3] = {0, 0, 0};
+    env->GetLongArrayRegion(boundStateArr, 0, 3, state);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        CocoaReleaseVideoPixelBuffer(pixbufHandle);
+        return JNI_FALSE;
+    }
+    const bool ok = CocoaLatchVideoPixelBufferToGl(pixbufHandle, texName, state);
+    env->SetLongArrayRegion(boundStateArr, 0, 3, state);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+void Cocoa_releaseGlBoundIosurfaceState(JNIEnv* env, jclass, jlongArray boundStateArr) {
+    if (!boundStateArr || env->GetArrayLength(boundStateArr) < 3) return;
+    jlong state[3] = {0, 0, 0};
+    env->GetLongArrayRegion(boundStateArr, 0, 3, state);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return;
+    }
+    CocoaReleaseGlBoundIosurfaceState(state);
+    env->SetLongArrayRegion(boundStateArr, 0, 3, state);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
 jboolean Cocoa_convertGlPbufferToArgb(JNIEnv* env, jclass, jobject rgbaBuf, jintArray argbArr, jint w, jint h) {
     if (!rgbaBuf || !argbArr || w <= 0 || h <= 0) return JNI_FALSE;
     const uint32_t* src = static_cast<const uint32_t*>(env->GetDirectBufferAddress(rgbaBuf));
@@ -823,30 +863,7 @@ jboolean Cocoa_convertGlPbufferToArgb(JNIEnv* env, jclass, jobject rgbaBuf, jint
     void* raw = env->GetPrimitiveArrayCritical(argbArr, nullptr);
     if (!raw) return JNI_FALSE;
     uint32_t* dst = static_cast<uint32_t*>(raw);
-
-    for (int y = 0; y < h; ++y) {
-        const uint32_t* srcRow = src + (h - 1 - y) * w;
-        uint32_t* dstRow = dst + y * w;
-        for (int x = 0; x < w; ++x) {
-            uint32_t px = srcRow[x];
-            uint32_t a = px >> 24;
-            uint32_t r = px & 0xff;
-            uint32_t b = (px >> 16) & 0xff;
-            if (a != 0xff) {
-                if (a == 0) {
-                    px = 0; r = 0; b = 0;
-                } else {
-                    uint32_t g = (px >> 8) & 0xff;
-                    r = (r * 255 + (a >> 1)) / a;
-                    g = (g * 255 + (a >> 1)) / a;
-                    b = (b * 255 + (a >> 1)) / a;
-                    px = (a << 24) | (g << 8);
-                }
-            }
-            dstRow[x] = (px & 0xff00ff00) | (r << 16) | b;
-        }
-    }
-
+    pixels::FlipRgbaPremulToArgb(src, dst, w, h);
     env->ReleasePrimitiveArrayCritical(argbArr, raw, 0);
     return JNI_TRUE;
 }
@@ -1001,6 +1018,15 @@ const JNINativeMethod kNativeCocoaMethods[] = {
     {const_cast<char*>("convertVideoArgbToRgba"),
      const_cast<char*>("([ILjava/nio/ByteBuffer;IIIZ)Z"),
      reinterpret_cast<void*>(Cocoa_convertVideoArgbToRgba)},
+    {const_cast<char*>("releaseVideoPixelBuffer"),
+     const_cast<char*>("(J)V"),
+     reinterpret_cast<void*>(Cocoa_releaseVideoPixelBuffer)},
+    {const_cast<char*>("latchVideoPixelBufferToGl"),
+     const_cast<char*>("(JI[J)Z"),
+     reinterpret_cast<void*>(Cocoa_latchVideoPixelBufferToGl)},
+    {const_cast<char*>("releaseGlBoundIosurfaceState"),
+     const_cast<char*>("([J)V"),
+     reinterpret_cast<void*>(Cocoa_releaseGlBoundIosurfaceState)},
 };
 
 // ---------- com.macapk.loader.NativeGles (placeholder) ----------
@@ -4624,6 +4650,7 @@ int JavaVsyncFire() { return JavaVsyncFireAt(JavaVsyncNanoTime()); }
 void RegisterAllNativeMethods(JNIEnv* env) {
     Bind(env, "com/macapk/loader/NativeLog",   kNativeInstallJniTrace,
          sizeof(kNativeInstallJniTrace) / sizeof(kNativeInstallJniTrace[0]));
+    RegisterReflectionNativeMethods(env);
     Bind(env, "com/macapk/loader/NativeLog",   kNativeLogMethods,
          sizeof(kNativeLogMethods)   / sizeof(kNativeLogMethods[0]));
     Bind(env, "com/macapk/loader/NativeLog",   kNativeQos,
@@ -4702,6 +4729,7 @@ void RegisterAllNativeMethods(JNIEnv* env) {
     Bind(env, "com/macapk/loader/NativeImageCodec", kNativeImageCodecMethods,
          sizeof(kNativeImageCodecMethods) / sizeof(kNativeImageCodecMethods[0]));
     sqlite::RegisterNativeSqliteMethods(env);
+    RegisterHostCryptoNativeMethods(env);
     osnative::RegisterNativeOsMethods(env);
     audio::RegisterNativeAudioMethods(env);
     RegisterUserVerificationNativeMethods(env);

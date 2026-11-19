@@ -59,6 +59,8 @@ public final class Looper {
      *  that older Mac.apk builds used. */
     static final boolean MAIN_LOOP_REENTRY_NESTS =
         !"0".equals(System.getenv("MACAPK_MAIN_LOOP_REENTRY"));
+    static final boolean LOOPER_TRACE =
+        "1".equals(System.getenv("MACAPK_LOOPER_TRACE"));
     private static final java.util.concurrent.atomic.AtomicInteger
         reentrantLoopCalls = new java.util.concurrent.atomic.AtomicInteger();
 
@@ -724,7 +726,7 @@ public final class Looper {
             while ((msg = q.macapkPollDue()) != null) {
                 dispatched = true;
                 n++;
-                if (n <= 5 || (n % 200) == 0)
+                if (n <= 5 || (LOOPER_TRACE && (n % 200) == 0))
                     android.util.Log.i("Looper", "dispatch #" + n + " on thread=" + tn);
                 try {
                     if (msg.target != null) msg.target.dispatchMessage(msg);
@@ -843,7 +845,7 @@ public final class Looper {
             msg.recycleUnchecked();
             // Sparse liveness log: proves the loop is ticking on the right
             // thread and how much it has processed, without per-frame spam.
-            if (n == 1 || n == 60 || n == 600 || (n % 3000) == 0)
+            if (n == 1 || (LOOPER_TRACE && (n == 60 || n == 600 || (n % 3000) == 0)))
                 android.util.Log.i("Looper",
                     "MACAPK_REAL_LOOPER: main loop dispatched #" + n + " on thread=" + tn);
         }

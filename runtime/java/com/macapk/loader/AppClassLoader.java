@@ -170,6 +170,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                           File translatorBin, String apkPath) {
         super(urls, parent);
         UnverifiedClasses.init(urls);
+        this.initialCodeUrls = urls.clone();
         this.stubLibraryPath = stubLibraryPath;
         this.appDir          = appDir;
         this.translatorBin   = translatorBin;
@@ -177,6 +178,18 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         this.apkFile         = apkSet.isEmpty() ? null : apkSet.get(0);
         this.apkZips         = new java.util.zip.ZipFile[apkSet.size()];
         this.apkZipFailed    = new boolean[apkSet.size()];
+        // APK resources and on-demand code belong to the original element,
+        // so reflective append/prepend/removal applies to both lookups.
+        try {
+            URL[] resources = new URL[apkSet.size()];
+            for (int i = 0; i < resources.length; i++) resources[i] = apkSet.get(i).toURI().toURL();
+            macapkAddInitialResources(resources, name -> {
+                dalvik.system.LazyDexSource source = lazySource();
+                return source == null ? null : source.classBytes(name);
+            });
+        } catch (java.net.MalformedURLException impossible) {
+            throw new IllegalArgumentException("Invalid APK resource path", impossible);
+        }
     }
 
     // ---- Classpath resources served from the APK zip(s) ----
@@ -197,7 +210,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     @Override
     public URL findResource(String name) {
         URL u = super.findResource(name);
-        if (u != null) return u;
+        if (u != null || macapkDexPathChanged()) return macapkResourceUrl(u, name);
         return apkEntryUrl(name);
     }
 
@@ -205,12 +218,32 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     public java.util.Enumeration<URL> findResources(String name)
             throws IOException {
         java.util.Enumeration<URL> base = super.findResources(name);
+        if (macapkDexPathChanged()) {
+            java.util.List<URL> all = new java.util.ArrayList<>();
+            while (base.hasMoreElements()) all.add(macapkResourceUrl(base.nextElement(), name));
+            return java.util.Collections.enumeration(all);
+        }
         java.util.List<URL> apk = apkEntryUrls(name);
         if (apk.isEmpty()) return base;
         java.util.List<URL> all = new java.util.ArrayList<>();
         while (base.hasMoreElements()) all.add(base.nextElement());
         all.addAll(apk);
         return java.util.Collections.enumeration(all);
+    }
+
+    private synchronized URL macapkResourceUrl(URL url, String name) {
+        if (url == null || !"jar".equals(url.getProtocol())) return url;
+        String value = url.toExternalForm();
+        for (int i = 0; i < apkSet.size(); i++) {
+            try {
+                String prefix = "jar:" + apkSet.get(i).toURI().toURL() + "!/";
+                if (value.startsWith(prefix)) {
+                    URL mapped = apkEntryUrlIn(i, name.startsWith("/") ? name.substring(1) : name);
+                    return mapped != null ? mapped : url;
+                }
+            } catch (java.net.MalformedURLException ignored) { }
+        }
+        return url;
     }
 
     /** jar:file: URL for an entry of the installed set -- the FIRST member,
@@ -666,6 +699,8 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     // python process we would not use is pure cost.
     private volatile dalvik.system.LazyDexSource lazyDex;
     private volatile boolean lazyDexTried;
+    /** Code paths belonging to the original APK, before any addDexPath calls. */
+    private final URL[] initialCodeUrls;
 
     private dalvik.system.LazyDexSource lazySource() {
         if (lazyDexTried) return lazyDex;
@@ -704,13 +739,12 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         }
     }
 
-    /** True when this loader's classpath carries a classes.jar that actually
-     *  exists on disk. Asked of the URLs rather than of a guessed path,
-     *  because the loader's classpath IS the definition of where eager classes
-     *  come from and nothing else has to stay in sync with it. */
+    /** True when an original code URL carries an eager jar that exists on
+     *  disk. A later addDexPath jar belongs to a different element and cannot
+     *  disable the original APK's on-demand code. */
     private boolean hasEagerClassesJar() {
         try {
-            for (URL u : getURLs()) {
+            for (URL u : initialCodeUrls) {
                 if (u == null || !"file".equals(u.getProtocol())) continue;
                 String p = u.getPath();
                 if (p == null || !p.endsWith(".jar")) continue;
@@ -774,7 +808,13 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // it carries the entry -- the SAME entry, through the same kind of
         // JarFile, that the URL lookup below would resolve. See
         // BOOTSPEED_JARREAD. A miss (or any trouble) takes the unchanged URL path.
-        byte[] direct = BOOTSPEED_JARREAD ? readClassJarEntry(resourcePath) : null;
+        byte[] direct;
+        try {
+            direct = macapkDexPathChanged() ? macapkFindDexClassBytes(resourcePath)
+                : BOOTSPEED_JARREAD ? readClassJarEntry(resourcePath) : null;
+        } catch (java.io.IOException io) {
+            throw new ClassNotFoundException(classDotted, io);
+        }
         java.net.URL u = direct != null ? null : findResource(resourcePath);
         if (direct != null || u != null) {
             try (java.io.InputStream in = direct != null ? null : u.openStream()) {
@@ -826,7 +866,9 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // eager behaviour is byte-for-byte unchanged. Bytes still go through
         // ClassFileRewriter -- the interception point is the same one the
         // eager path uses, so a rewrite fix applies to both.
-        dalvik.system.LazyDexSource lazy = lazySource();
+        // A mutated path already consulted lazy code at its owning element's
+        // position. Do not retry it globally after that element was removed.
+        dalvik.system.LazyDexSource lazy = macapkDexPathChanged() ? null : lazySource();
         if (lazy != null) {
             byte[] raw = remapRewrite(lazy.classBytes(srcDotted.replace('.', '/')));
             if (raw != null) {
@@ -1904,21 +1946,44 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     private final java.util.concurrent.ConcurrentHashMap<String, Object> soLoadLocks =
         new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** System.load(path) as the guest sees it. An ELF "libX.so" is translated into
-     *  the same lib_native/libX.dylib cache findLibrary and the exposure passes
-     *  use (same stamps, same load bias), then loaded against THIS loader; any
-     *  other path loads as it always did. Throws UnsatisfiedLinkError as
-     *  System.load does. */
+    private static boolean hasElfMagic(File input) {
+        if (input == null || !input.isFile()) return false;
+        byte[] magic = new byte[4];
+        try (java.io.FileInputStream in = new java.io.FileInputStream(input)) {
+            return in.read(magic) == 4
+                    && magic[0] == 0x7f && magic[1] == 'E'
+                    && magic[2] == 'L'  && magic[3] == 'F';
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** System.load(path) as the guest sees it. Both standard "libX.so" libraries
+     *  and unpacked ELF binaries under non-standard names (e.g. plugin/map SDK
+     *  artifacts with ELF magic 0x7f 'E' 'L' 'F') are translated into
+     *  lib_native/*.dylib using the same stamps and load bias as findLibrary,
+     *  then loaded against THIS loader; non-ELF host libraries load directly.
+     *  Throws UnsatisfiedLinkError as System.load does. */
     public void macapkLoadNative(String path) {
         if (path == null) throw new NullPointerException("path");
         File f = new File(path);
         String n = f.getName();
-        if (!(n.startsWith("lib") && n.endsWith(".so") && f.isFile())) {
+        boolean isStandardSo = n.startsWith("lib") && n.endsWith(".so") && n.length() > 6;
+        if (!f.isFile() || (!isStandardSo && !hasElfMagic(f))) {
             loadIntoThisLoader(path);
             return;
         }
-        String fileBase = n.substring(0, n.length() - 3);   // "libX"
-        String libname = fileBase.substring(3);
+        String fileBase;
+        String libname;
+        if (isStandardSo) {
+            fileBase = n.substring(0, n.length() - 3);   // "libX"
+            libname = fileBase.substring(3);
+        } else {
+            libname = n;
+            String safeName = n.replaceAll("[^A-Za-z0-9._-]", "_");
+            String pathHash = Integer.toHexString(f.getAbsolutePath().hashCode());
+            fileBase = "elf_" + pathHash + "_" + safeName;
+        }
         File cacheDir = new File(appDir, "lib_native");
         cacheDir.mkdirs();
         File cached = new File(cacheDir, fileBase + ".dylib");

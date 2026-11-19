@@ -88,7 +88,7 @@ public final class Log {
     // AOSP's real default (our default MIN_LEVEL=0 for CLI runs is MORE
     // permissive than AOSP's INFO floor), so no app that currently works
     // stops working -- it only stops doing needlessly-suppressed DEBUG/
-    // VERBOSE work under the launcher's quieter MACAPK_LOG_LEVEL=5 default.
+    // VERBOSE work under the launcher's quieter MACAPK_LOG_LEVEL=4 default.
     // Apps are required to tolerate isLoggable() returning false (that is
     // the whole point of the API), so this can only make an app log/compute
     // LESS, never crash or misbehave. See

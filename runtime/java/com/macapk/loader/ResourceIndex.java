@@ -1417,7 +1417,8 @@ public final class ResourceIndex {
         // Canonicalize the config key against the framework's own dp thresholds
         // when they are known (this process's earlier build, or the sidecar),
         // so a sub-threshold pixel jitter cannot spawn a spurious miss.
-        int[][] thr = diskOk ? macapkFwThresholds(idHash, dir) : null;
+        int[][] thr = diskOk ? macapkFwThresholds(idHash, dir)
+                             : (idHash != null ? sFwThresholdCache.get(idHash) : null);
         String cfgKey = macapkFwViewCfgKey(thr);
 
         MacapkFwView mem = macapkGetCachedFwView(cfgKey);
@@ -1451,6 +1452,9 @@ public final class ResourceIndex {
             // against them (the lookup above may have used the raw key on the
             // first-ever launch) and persist under it, so the next launch hits.
             int[][] builtThr = macapkLastBuildThresholds;
+            if (idHash != null && builtThr != null) {
+                sFwThresholdCache.put(idHash, builtThr);
+            }
             String canonKey = (builtThr != null) ? macapkFwViewCfgKey(builtThr) : cfgKey;
             macapkPutCachedFwView(canonKey, built);
             if (diskOk && !verify) {
@@ -1690,14 +1694,37 @@ public final class ResourceIndex {
         return null;
     }
 
-    /** Build the resolution view: full-parse the framework table, keep the
-     *  config-selected slice. Returns null on ANY failure; the caller keeps
-     *  the hand tables, never the text fallback (this view is additive). */
-    private MacapkFwView macapkBuildFwViewUncached(ArscReader indexReader) {
-        try {
-            File apk = macapkFrameworkApkFile();
-            if (apk == null) return null;
-            long t0 = System.nanoTime();
+    /** Immutable parsed platform-table rows grouped by qualifier string + extracted
+     *  thresholds, reusable across every Configuration rebuild in the process so
+     *  a rotation or dark-mode switch never re-unzips or re-parses 52 MB of
+     *  framework-res.apk resources.arsc. Soft-referenced so extreme heap pressure
+     *  can reclaim it safely. */
+    private static final class MacapkFwParsed {
+        final String idHash;
+        final Map<String, List<ArscReader.Row>> byCfg;
+        final int[][] thresholds;
+
+        MacapkFwParsed(String idHash, Map<String, List<ArscReader.Row>> byCfg,
+                int[][] thresholds) {
+            this.idHash = idHash;
+            this.byCfg = byCfg;
+            this.thresholds = thresholds;
+        }
+    }
+    private static volatile java.lang.ref.SoftReference<MacapkFwParsed> sFwParsedCache;
+    private static final Object sFwParsedLock = new Object();
+
+    private MacapkFwParsed macapkLoadOrGetFwParsed(File apk) throws Exception {
+        String idHash = macapkFwIdHash(apk);
+        java.lang.ref.SoftReference<MacapkFwParsed> ref = sFwParsedCache;
+        MacapkFwParsed cached = ref != null ? ref.get() : null;
+        if (cached != null && idHash.equals(cached.idHash)) return cached;
+
+        synchronized (sFwParsedLock) {
+            ref = sFwParsedCache;
+            cached = ref != null ? ref.get() : null;
+            if (cached != null && idHash.equals(cached.idHash)) return cached;
+
             byte[] arsc;
             try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(apk)) {
                 java.util.zip.ZipEntry e = zf.getEntry("resources.arsc");
@@ -1709,21 +1736,43 @@ public final class ResourceIndex {
             // Full parse with NO injected maps: the framework table renders
             // its own references and its own attr enum/flag symbol names.
             ArscReader full = ArscReader.parse(arsc);
+            java.util.LinkedHashMap<String, List<ArscReader.Row>> grouped =
+                new java.util.LinkedHashMap<>();
+            for (ArscReader.Row row : full.rows()) {
+                grouped.computeIfAbsent(row.config, k -> new ArrayList<>()).add(row);
+            }
+            for (Map.Entry<String, List<ArscReader.Row>> en : grouped.entrySet()) {
+                en.setValue(Collections.unmodifiableList(en.getValue()));
+            }
+            int[][] thresholds = macapkFwBucketsFromConfigs(grouped.keySet());
+            MacapkFwParsed built = new MacapkFwParsed(
+                idHash, Collections.unmodifiableMap(grouped), thresholds);
+            sFwParsedCache = new java.lang.ref.SoftReference<>(built);
+            return built;
+        }
+    }
+
+    /** Build the resolution view: full-parse the framework table, keep the
+     *  config-selected slice. Returns null on ANY failure; the caller keeps
+     *  the hand tables, never the text fallback (this view is additive). */
+    private MacapkFwView macapkBuildFwViewUncached(ArscReader indexReader) {
+        try {
+            File apk = macapkFrameworkApkFile();
+            if (apk == null) return null;
+            long t0 = System.nanoTime();
+            MacapkFwParsed parsed = macapkLoadOrGetFwParsed(apk);
+            if (parsed == null) return null;
             MacapkFwView v = new MacapkFwView(apk, indexReader.publicMap());
             for (Map.Entry<Integer, String> en : v.publicMap.entrySet()) {
                 v.nameToId.put(en.getValue(), en.getKey());
             }
-            java.util.LinkedHashMap<String, List<ArscReader.Row>> byCfg =
-                new java.util.LinkedHashMap<>();
-            for (ArscReader.Row row : full.rows()) {
-                byCfg.computeIfAbsent(row.config, k -> new ArrayList<>()).add(row);
-            }
+            Map<String, List<ArscReader.Row>> byCfg = parsed.byCfg;
             // The framework's own -w/-h/-sw dp thresholds, captured for the
             // replay cache key (see macapkFwThresholdsFromConfigs), plus under
             // MACAPK_RES_SIZECLASS the size classes / aspect it ships
             // (macapkFwBucketsFromConfigs). Stashed for the wrapper to name the
             // write file and the sidecar.
-            macapkLastBuildThresholds = macapkFwBucketsFromConfigs(byCfg.keySet());
+            macapkLastBuildThresholds = parsed.thresholds;
             List<String> selected = new ArrayList<>();
             final Map<String, Integer> score = new HashMap<>();
             for (String cfg : byCfg.keySet()) {

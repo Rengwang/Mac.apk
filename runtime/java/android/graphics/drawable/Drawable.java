@@ -406,8 +406,9 @@ public abstract class Drawable {
     }
 
     public void setDither(boolean dither) {}
-    public void setFilterBitmap(boolean filter) {}
-    public boolean isFilterBitmap() { return false; }
+    private boolean mMacapkFilterBitmap;
+    public void setFilterBitmap(boolean filter) { mMacapkFilterBitmap = filter; }
+    public boolean isFilterBitmap() { return mMacapkFilterBitmap; }
     // android:autoMirrored / setAutoMirrored: flip horizontally under RTL
     // (back arrows, chevrons). Was a no-op, so every such icon pointed the
     // LTR way in a Hebrew/Arabic UI.

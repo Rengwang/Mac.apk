@@ -199,13 +199,11 @@ public final class Boot {
         }
     }
 
-    /** MACAPK_BOOTSPEED_OVERLAP: build the app's ResourceIndex on a worker while
-     *  THIS (the AppKit main) thread initialises AWT, then hand the index back.
-     *  Behaviour is the inline `new ResourceIndex(cfg, apkPath)` exactly: the
-     *  same constructor on the same inputs (cfg is not touched by either side
-     *  until the join, and Thread.start/FutureTask.get order everything before
-     *  and after), and its exception, if any, is rethrown here unchanged. */
-    private static ResourceIndex buildResourceIndexWhileAwtInits(
+    /** Start building the app's ResourceIndex on a daemon worker thread so it
+     *  overlaps with independent boot work (AWT init on main, or native library
+     *  premap/setup in headless service processes). Returns null if the thread
+     *  cannot be started so the caller falls back inline. */
+    private static java.util.concurrent.FutureTask<ResourceIndex> startResourceIndexTask(
             final Configuration cfg, final String apkPath) {
         java.util.concurrent.FutureTask<ResourceIndex> task =
             new java.util.concurrent.FutureTask<>(() -> new ResourceIndex(cfg, apkPath));
@@ -215,19 +213,21 @@ public final class Boot {
             Thread t = new Thread(null, task, "macapk-resindex", 8L * 1024 * 1024);
             t.setDaemon(true);
             t.start();
+            return task;
         } catch (Throwable cannotStart) {
-            initAwtOnAppKitMainThread();
-            return new ResourceIndex(cfg, apkPath);
+            return null;
         }
-        initAwtOnAppKitMainThread();
-        bootClock("AWT initialised (overlapped with the resource index)");
+    }
+
+    /** Join a ResourceIndex task started by {@link #startResourceIndexTask},
+     *  preserving interrupt state and rethrowing any unchecked cause. */
+    private static ResourceIndex awaitResourceIndexTask(
+            java.util.concurrent.FutureTask<ResourceIndex> task) {
         boolean interrupted = false;
         try {
             while (true) {
                 try {
-                    ResourceIndex r = task.get();
-                    bootClock("resource index joined");
-                    return r;
+                    return task.get();
                 } catch (InterruptedException ie) {
                     interrupted = true;   // the index is still building; wait it out
                 } catch (java.util.concurrent.ExecutionException ee) {
@@ -240,6 +240,50 @@ public final class Boot {
         } finally {
             if (interrupted) Thread.currentThread().interrupt();
         }
+    }
+
+    private static void applyResourceIndexAndTheme(
+            ResourceIndex resIdx, Configuration cfg, Manifest manifest, String apkPath) {
+        Resources.macapkSetResourceIndex(resIdx);
+        sApkPath = apkPath;
+        if (manifest.applicationTheme != null) {
+            resIdx.setApplicationThemeName(manifest.applicationTheme);
+            sAppThemeName = manifest.applicationTheme;
+        } else {
+            int t = manifest.targetSdk;
+            boolean unresolved = Manifest.TARGETSDK_ZERO ? t < 0 : t <= 0;
+            String def = unresolved ? "Theme.DeviceDefault.Light.DarkActionBar"
+                       : (t < 11)   ? "Theme"
+                       : (t < 14)   ? "Theme.Holo"
+                       : (t < 24)   ? "Theme.DeviceDefault"
+                                    : "Theme.DeviceDefault.Light.DarkActionBar";
+            resIdx.setApplicationThemeName(def);
+            sAppThemeName = def;
+            NativeLog.i(TAG, "no manifest theme; AOSP default for targetSdk="
+                            + t + " -> " + def);
+        }
+        macapkRememberResourceIndex(cfg, resIdx);
+    }
+
+    /** MACAPK_BOOTSPEED_OVERLAP: build the app's ResourceIndex on a worker while
+     *  THIS (the AppKit main) thread initialises AWT, then hand the index back.
+     *  Behaviour is the inline `new ResourceIndex(cfg, apkPath)` exactly: the
+     *  same constructor on the same inputs (cfg is not touched by either side
+     *  until the join, and Thread.start/FutureTask.get order everything before
+     *  and after), and its exception, if any, is rethrown here unchanged. */
+    private static ResourceIndex buildResourceIndexWhileAwtInits(
+            final Configuration cfg, final String apkPath) {
+        java.util.concurrent.FutureTask<ResourceIndex> task =
+            startResourceIndexTask(cfg, apkPath);
+        if (task == null) {
+            initAwtOnAppKitMainThread();
+            return new ResourceIndex(cfg, apkPath);
+        }
+        initAwtOnAppKitMainThread();
+        bootClock("AWT initialised (overlapped with the resource index)");
+        ResourceIndex r = awaitResourceIndexTask(task);
+        bootClock("resource index joined");
+        return r;
     }
 
     /** The temporary-directory half of AOSP ActivityThread.setupGraphicsSupport
@@ -919,8 +963,18 @@ public final class Boot {
             + " s; starting the app anyway (binds wait for them)");
     }
 
+    static boolean isHeadlessServiceProcess() {
+        if ("1".equals(System.getenv("MACAPK_FORCE_SECONDARY_WINDOW"))) return false;
+        if ("0".equals(System.getenv("MACAPK_HEADLESS_SERVICE"))) return false;
+        if (SystemClient.isServiceHost()) return true;
+        if ("1".equals(System.getenv("MACAPK_SECONDARY_PROCESS"))) return true;
+        String proc = System.getenv("MACAPK_PROCESS_NAME");
+        return proc != null && proc.indexOf(':') >= 0;
+    }
+
     public static void run(String apkPath, String appJar, String appDir, String manifestPath) {
         bootClock("Boot.run entered");
+        final boolean headlessService = isHeadlessServiceProcess();
         prefetchFrameworkResources();
         // MACAPK_BOOTSPEED_OVERLAP defers the AWT init to the resource-index
         // build below (buildResourceIndexWhileAwtInits) so the two overlap. Not
@@ -928,17 +982,19 @@ public final class Boot {
         // the opt-in background pre-warm (it would become the initialiser from
         // off the main thread -- the exact deadlock) and the diagnostic self-tests,
         // which return or spawn threads before the index exists.
-        final boolean awtDeferred = BOOTSPEED_OVERLAP
+        final boolean awtDeferred = !headlessService
+            && BOOTSPEED_OVERLAP
             && System.getenv("MACAPK_AWT_PREWARM") == null
             && System.getenv("MACAPK_AUDIO_SELFTEST") == null
             && !"1".equals(System.getenv("MACAPK_MEDIA_SELFTEST"))
             && !"1".equals(System.getenv("MACAPK_VIDEO_IMAGE_SELFTEST"));
-        if (!awtDeferred) {
+        if (!awtDeferred && !headlessService) {
             initAwtOnAppKitMainThread();
             bootClock("AWT initialised");
         }
         prewarmInvokeDynamic();
         installShutdownDump();
+        AnrWatchdog.start();   // all-thread dump when the main thread stalls 5 s
         // MACAPK_TRACE_JNI: patch the process-wide JNIEnv vtable to log JNI
         // resolves (FindClass/GetMethodID/GetFieldID/...) that return NULL --
         // names the missing android.* member behind the pairip +0x440c4 branch.
@@ -1390,7 +1446,7 @@ public final class Boot {
         // AOSP RuntimeInit.commonInit sets the default HTTP User-Agent here.
         HttpAgent.install();
 
-        if (!NativeCocoa.init()) {
+        if (!headlessService && !NativeCocoa.init()) {
             NativeLog.e(TAG, "NativeCocoa.init() failed");
             return;
         }
@@ -1426,7 +1482,7 @@ public final class Boot {
             // A SERVICE HOST launches no activity (the broker started it to
             // answer a bind), so a package with no launcher -- Google Play
             // services, Services Framework, any service-only APK -- boots fine.
-            if (!SystemClient.isServiceHost()) {
+            if (!SystemClient.isServiceHost() && !headlessService) {
                 NativeLog.e(TAG, "no launchable activity in manifest");
                 return;
             }
@@ -1617,7 +1673,7 @@ public final class Boot {
         // difference was a permanent black band. With the window at the cap the
         // app gets the identical content rect and the letterbox becomes a no-op
         // via its own tolerance. Off: MACAPK_FIT_WINDOW_TO_ASPECT=0.
-        if (!windowPolicy) NativeCocoa.setMaxAspectRatio(maxAspect);
+        if (!windowPolicy && !headlessService) NativeCocoa.setMaxAspectRatio(maxAspect);
         // v1.0.1637: seed the committed display AFTER the call above. It
         // reshapes g_phone_w/h synchronously (grow the short side when the
         // screen has room, else shrink the long one); the size used to be read
@@ -1627,9 +1683,16 @@ public final class Boot {
         // boot and every later resize -- the v1.0.423/.874/.939/.997 notes that
         // lived here (decor ladder, max-aspect letterbox, screenLayout
         // following the dp metrics, bounds vs appBounds) are carried there.
-        DisplayConfig.seedFromCanvas();
-        final int macapkRealW = DisplayConfig.realWidthPx();
-        final int macapkRealH = DisplayConfig.realHeightPx();
+        final int macapkRealW;
+        final int macapkRealH;
+        if (!headlessService) {
+            DisplayConfig.seedFromCanvas();
+            macapkRealW = DisplayConfig.realWidthPx();
+            macapkRealH = DisplayConfig.realHeightPx();
+        } else {
+            macapkRealW = 720;
+            macapkRealH = 1280;
+        }
         // The PROCESS configuration: a fully populated one to fill in, not
         // `new Configuration()`, which is AOSP's all-UNDEFINED delta under
         // MACAPK_CONFIG_UNSET_CTOR, see
@@ -1711,57 +1774,17 @@ public final class Boot {
         // >=700dp-tall screen selects the two-line display that carries the
         // live result preview). v1.0.445.
         bootClock("configuration + Resources built");
-        ResourceIndex resIdx = awtDeferred
-            ? buildResourceIndexWhileAwtInits(cfg, apkPath)
-            : new ResourceIndex(cfg, apkPath);
-        if (!awtDeferred) bootClock("resource index built");
-        Resources.macapkSetResourceIndex(resIdx);
-        // v1.0.1047: keep the constructor input. A ResourceIndex bakes the
-        // night qualifier at CONSTRUCTION (cfgNight is set once, and every
-        // values-* family is ingested against it right after), so the only way
-        // to serve values-night after a live appearance flip is to build a
-        // second index -- which needs exactly this. It was a local of run(),
-        // which is why the flip was previously impossible without a relaunch.
-        sApkPath = apkPath;
-        // v1.0.128: seed the application-theme cascade from the manifest's
-        // `<application android:theme="@style/X">`. ResourceIndex's theme
-        // resolver walks the style cascade rooted here for `?attr/...`
-        // references (cards / bottom-nav / FAB chrome). Generic for any
-        // APK that declares a theme.
-        if (manifest.applicationTheme != null) {
-            resIdx.setApplicationThemeName(manifest.applicationTheme);
-            sAppThemeName = manifest.applicationTheme;
-        } else {
-            // lane design 1, 2026-08-02: an app that declares NO theme still
-            // gets one on Android, chosen by targetSdk. AOSP
-            // (core/java/android/content/res/Resources.java:200-223):
-            //   selectDefaultTheme -> selectSystemTheme(curTheme, targetSdk,
-            //       R.style.Theme, R.style.Theme_Holo, R.style.Theme_DeviceDefault,
-            //       R.style.Theme_DeviceDefault_Light_DarkActionBar)
-            //   < HONEYCOMB(11) -> Theme; < ICE_CREAM_SANDWICH(14) -> Theme.Holo;
-            //   < N(24) -> Theme.DeviceDefault; else the Light.DarkActionBar one.
-            // Without this such an app had NO cascade root at all, so every
-            // `?attr` fell straight through to defaults.
-            int t = manifest.targetSdk;
-            // manifest.targetSdk is the parsed value itself, so a 0 here is
-            // never "unresolved": it is AOSP's no-<uses-sdk> default and takes
-            // R.style.Theme like any level below 11 (Resources.selectSystemTheme
-            // :216, android14). This runs BEFORE macapkInitVersion binds it, so
-            // it tests the gate directly instead of Application.macapkTargetSdkKnown.
-            // MACAPK_TARGETSDK_ZERO=0 restores `t <= 0` (dead then: the old
-            // synthesis never produced 0).
-            boolean unresolved = Manifest.TARGETSDK_ZERO ? t < 0 : t <= 0;
-            String def = unresolved ? "Theme.DeviceDefault.Light.DarkActionBar"
-                       : (t < 11)   ? "Theme"
-                       : (t < 14)   ? "Theme.Holo"
-                       : (t < 24)   ? "Theme.DeviceDefault"
-                                    : "Theme.DeviceDefault.Light.DarkActionBar";
-            resIdx.setApplicationThemeName(def);
-            sAppThemeName = def;
-            NativeLog.i(TAG, "no manifest theme; AOSP default for targetSdk="
-                            + t + " -> " + def);
+        final java.util.concurrent.FutureTask<ResourceIndex> headlessResIdxTask =
+            (headlessService && !awtDeferred && BOOTSPEED_OVERLAP)
+                ? startResourceIndexTask(cfg, apkPath)
+                : null;
+        if (headlessResIdxTask == null) {
+            ResourceIndex resIdx = awtDeferred
+                ? buildResourceIndexWhileAwtInits(cfg, apkPath)
+                : new ResourceIndex(cfg, apkPath);
+            if (!awtDeferred) bootClock("resource index built");
+            applyResourceIndexAndTheme(resIdx, cfg, manifest, apkPath);
         }
-        macapkRememberResourceIndex(cfg, resIdx);
         // Let getResourcePackageName(0x7f...) return the running APK's
         // package -- AOSP behavior that some apps (HCR 1.43's onCreate
         // resource lookup, e.g.) depend on during init.
@@ -1774,8 +1797,10 @@ public final class Boot {
         android.content.MacApkUriGrants.setManifestPackage(manifest.packageName);
         // AOSP's starting window, at the point AOSP shows it: before any of the
         // app's code runs. See paintStartingWindowFromManifest.
-        paintStartingWindowFromManifest(resources, manifest);
-        bootClock("starting window painted (T1 marker)");
+        if (!headlessService) {
+            paintStartingWindowFromManifest(resources, manifest);
+            bootClock("starting window painted (T1 marker)");
+        }
         // Keyboard bindings (the Controls menu): seed the built-in profiles on
         // first run, then pick one for this package. MACAPK_KEYBIND_PROFILE
         // forces a profile by name, which is how the path is exercised before
@@ -1806,10 +1831,12 @@ public final class Boot {
         // (duolingo: <adaptive-icon> color bg + vector fg, no PNG) left it
         // missing -> the launcher fell back to a monogram tile. Now that the
         // framework parses <adaptive-icon> + renders vectors, rasterize it here.
-        try { writeLauncherIcon(resources, manifestPath, appDir, manifest.packageName,
-                                manifest.applicationIconRaw, apkPath); }
-        catch (Throwable t) { NativeLog.w(TAG, "launcher-icon render skipped: " + t); }
-        bootClock("launcher icon done");
+        if (!headlessService) {
+            try { writeLauncherIcon(resources, manifestPath, appDir, manifest.packageName,
+                                    manifest.applicationIconRaw, apkPath); }
+            catch (Throwable t) { NativeLog.w(TAG, "launcher-icon render skipped: " + t); }
+            bootClock("launcher icon done");
+        }
         // Persistent app-local state: SharedPreferences, save files,
         // anything written via Context.openFileOutput / getFilesDir /
         // getCacheDir. Route these UNDER the resolved android root
@@ -1906,8 +1933,10 @@ public final class Boot {
         String dataSubdir = new File(appDir).getName();
         File persistentDataDir = new File(androidRoot,
                 "data/data/" + dataSubdir);
-        android.app.LocaleManager.macapkRestoreApplicationLocales(
-                manifest.packageName, persistentDataDir, resources);
+        if (headlessResIdxTask == null) {
+            android.app.LocaleManager.macapkRestoreApplicationLocales(
+                    manifest.packageName, persistentDataDir, resources);
+        }
         File filesDir = new File(persistentDataDir, "files"); filesDir.mkdirs();
         File cacheDir = new File(persistentDataDir, "cache"); cacheDir.mkdirs();
         NativeLog.i(TAG, "data dir: " + persistentDataDir.getAbsolutePath());
@@ -2102,6 +2131,14 @@ public final class Boot {
             Thread.currentThread().interrupt();
             NativeLog.w(TAG, "interrupted awaiting BouncyCastle provider construction; "
                 + "BC-named crypto unavailable this launch");
+        }
+
+        if (headlessResIdxTask != null) {
+            ResourceIndex resIdx = awaitResourceIndexTask(headlessResIdxTask);
+            bootClock("resource index joined (overlapped with headless boot setup)");
+            applyResourceIndexAndTheme(resIdx, cfg, manifest, apkPath);
+            android.app.LocaleManager.macapkRestoreApplicationLocales(
+                    manifest.packageName, persistentDataDir, resources);
         }
 
         // Capture appCl as final for the lambdas below, and set it as
@@ -2700,6 +2737,26 @@ public final class Boot {
                     t.printStackTrace();
                 }
                 applicationHolder[0] = application;
+                if (!headlessService && !"0".equals(System.getenv("MACAPK_PREWARM_MEDIA_SERVICES"))) {
+                    final android.app.Application cbApp = application;
+                    final Manifest cbManifest = manifest;
+                    final java.util.concurrent.atomic.AtomicBoolean firstResume =
+                        new java.util.concurrent.atomic.AtomicBoolean(false);
+                    application.registerActivityLifecycleCallbacks(
+                        new android.app.Application.ActivityLifecycleCallbacks() {
+                            @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}
+                            @Override public void onActivityStarted(android.app.Activity a) {}
+                            @Override public void onActivityResumed(android.app.Activity a) {
+                                if (firstResume.compareAndSet(false, true)) {
+                                    SystemClient.scheduleMediaServicePrewarm(cbApp, cbManifest);
+                                }
+                            }
+                            @Override public void onActivityPaused(android.app.Activity a) {}
+                            @Override public void onActivityStopped(android.app.Activity a) {}
+                            @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}
+                            @Override public void onActivityDestroyed(android.app.Activity a) {}
+                        });
+                }
             } catch (Throwable t) {
                 // Boot-level setup failure (provider chain, etc.). Still
                 // surfaces as "Application init failed" but is rarer. Stashed
@@ -2736,13 +2793,15 @@ public final class Boot {
         // the Mac.apk window): permission dialogs and single-instance need it.
         try { RunLock.ensureHeld(); } catch (Throwable t) { NativeLog.w(TAG, "run lock: " + t); }
         ActivityHost.init(application, appCl);
-        // Touch dispatcher: Cocoa mouse events route here, then to the
-        // active Activity's dispatchTouchEvent.
-        NativeCocoa.registerTouchDispatcher(new TouchDispatcher());
-        // Host game controllers (GameController.framework) as Android gamepads,
-        // delivered through the same focused-window path (MACAPK_GAMEPAD,
-        // default ON; docs/host-game-controllers_2026-10-02.md).
-        GamepadBridge.macapkStart();
+        if (!headlessService) {
+            // Touch dispatcher: Cocoa mouse events route here, then to the
+            // active Activity's dispatchTouchEvent.
+            NativeCocoa.registerTouchDispatcher(new TouchDispatcher());
+            // Host game controllers (GameController.framework) as Android gamepads,
+            // delivered through the same focused-window path (MACAPK_GAMEPAD,
+            // default ON; docs/host-game-controllers_2026-10-02.md).
+            GamepadBridge.macapkStart();
+        }
         // Input recorder (OFF unless MACAPK_RECORD_INPUT or recordings/ENABLED;
         // docs/input-recorder_2026-10-01.md). Initialised here, off the input path.
         try { InputRecorder.start(application.getPackageName()); }
@@ -2754,6 +2813,8 @@ public final class Boot {
         // activity before consuming anything. See TouchDispatcher.
         try { TouchDispatcher.macapkStartInjectDriver(); }
         catch (Throwable t) { NativeLog.w(TAG, "inject driver: " + t); }
+        try { AutomationServer.startIfEnabled(); }
+        catch (Throwable t) { NativeLog.w(TAG, "automation server: " + t); }
 
         // Run the activity lifecycle on a worker thread, NOT the
         // process main thread. The main thread is the only one Cocoa
@@ -2805,6 +2866,14 @@ public final class Boot {
                         + " extras=" + extras);
             }
         }
+        // Unlike String extras, this preserves a Boolean false (Flutter's
+        // enable-impeller toggle checks both hasExtra and getBooleanExtra).
+        // Apply independently of MACAPK_LAUNCH_ACTIVITY so the normal launcher
+        // activity can receive `am start --ez`-style options too.
+        int rejectedExtras = LaunchExtras.applyBooleans(
+            intent, System.getenv("MACAPK_LAUNCH_BOOLEAN_EXTRAS"));
+        if (rejectedExtras != 0) NativeLog.w(TAG,
+            "Ignored " + rejectedExtras + " malformed boolean launch extra(s)");
         // MACAPK_RESTART_INTENTS: the ActivityManager hand-off. When the previous
         // instance of this app exited with an activity start still pending
         // (the restart idiom: startActivity(X); exit()), MacApkProcessExit
@@ -2950,7 +3019,7 @@ public final class Boot {
                     // A service host was started by the broker to answer another
                     // app's bind: like a device's background process, it runs no
                     // activity (MACAPK_SERVICE_HOST=1; the window stays hidden).
-                    if (SystemClient.isServiceHost()) {
+                    if (SystemClient.isServiceHost() || headlessService) {
                         NativeLog.i(TAG, "service host: no launcher activity");
                         ActivityHost.runMainLoopOnly();
                     } else {

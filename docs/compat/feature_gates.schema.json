@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mac.apk.local/schemas/feature_gates.schema.json",
+  "title": "Mac.apk Feature Gates & Launch Entry Consistency Registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "baseline_commit",
+    "inventory_summary",
+    "launch_entries",
+    "entry_mismatches",
+    "followup_cards",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "baseline_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "inventory_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scan_roots",
+        "excluded_dirs",
+        "files_scanned",
+        "distinct_tokens",
+        "dex2jvm_tokens",
+        "experimental_tokens",
+        "priority_gates_documented"
+      ],
+      "properties": {
+        "scan_roots": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "excluded_dirs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "files_scanned": { "type": "integer", "minimum": 1 },
+        "distinct_tokens": { "type": "integer", "minimum": 1 },
+        "dex2jvm_tokens": { "type": "integer", "minimum": 1 },
+        "experimental_tokens": { "type": "integer", "minimum": 1 },
+        "priority_gates_documented": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "launch_entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "source",
+          "sets_env",
+          "unsets_env",
+          "notes"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
+          "source": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "minItems": 1
+          },
+          "sets_env": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "unsets_env": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "notes": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "entry_mismatches": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "title",
+          "gates",
+          "affected_entries",
+          "evidence",
+          "impact",
+          "followup_card"
+        ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^GAP-GATE-[0-9]{3}$" },
+          "severity": { "type": "string", "enum": ["high", "medium", "low"] },
+          "title": { "type": "string", "minLength": 1 },
+          "gates": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "minItems": 1
+          },
+          "affected_entries": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "minItems": 1
+          },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "minItems": 1
+          },
+          "impact": { "type": "string", "minLength": 1 },
+          "followup_card": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "followup_cards": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "path", "title", "status", "summary"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["TODO", "READY", "IN_PROGRESS", "BLOCKED", "DEFERRED", "DONE"] },
+          "summary": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "domain",
+          "kind",
+          "type",
+          "read_timing",
+          "read_timing_detail",
+          "read_locations",
+          "defaults_by_entry",
+          "entry_consistent",
+          "mismatch_ref",
+          "dependencies",
+          "capability_ids",
+          "test_ids",
+          "owner",
+          "applicable_versions",
+          "promotion_or_sunset_criteria"
+        ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^GATE-[A-Z0-9]+-[0-9]{3}$" },
+          "name": { "type": "string", "pattern": "^(MACAPK|DEX2JVM)_[A-Z0-9_]+$" },
+          "domain": {
+            "type": "string",
+            "enum": [
+              "experimental",
+              "sdk_abi",
+              "surface_video_choreo",
+              "cache_aot_fwview",
+              "gc_jvm_broker_ipc_dex2jvm"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["experimental", "behavioral", "compat_opt_out", "diagnostic"]
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "boolean_01",
+              "boolean_presence",
+              "integer",
+              "enum",
+              "string",
+              "path",
+              "string_list"
+            ]
+          },
+          "read_timing": {
+            "type": "string",
+            "enum": [
+              "init_static",
+              "init_launch",
+              "first_call_cached",
+              "runtime_per_call",
+              "build_time"
+            ]
+          },
+          "read_timing_detail": { "type": "string", "minLength": 1 },
+          "read_locations": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["file", "line", "symbol", "expression"],
+              "properties": {
+                "file": { "type": "string", "minLength": 1 },
+                "line": { "type": "integer", "minimum": 1 },
+                "symbol": { "type": "string", "minLength": 1 },
+                "expression": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
+          "defaults_by_entry": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "runtime",
+              "launcher_control_panel",
+              "app_stub_dock",
+              "system_broker_spawn"
+            ],
+            "properties": {
+              "runtime": { "type": "string", "minLength": 1 },
+              "launcher_control_panel": { "type": "string", "minLength": 1 },
+              "app_stub_dock": { "type": "string", "minLength": 1 },
+              "system_broker_spawn": { "type": "string", "minLength": 1 }
+            }
+          },
+          "entry_consistent": { "type": "boolean" },
+          "mismatch_ref": { "type": ["string", "null"] },
+          "dependencies": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "capability_ids": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "test_ids": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "owner": { "type": "string", "minLength": 1 },
+          "applicable_versions": { "type": "string", "minLength": 1 },
+          "promotion_or_sunset_criteria": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

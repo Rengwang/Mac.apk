@@ -8,6 +8,12 @@ package android.system;
 public final class OsConstants {
     private OsConstants() {}
 
+    // Linux/Android memory protection bits used by SharedMemory clients.
+    public static final int PROT_NONE  = 0;
+    public static final int PROT_READ  = 1;
+    public static final int PROT_WRITE = 2;
+    public static final int PROT_EXEC  = 4;
+
     // errno
     public static final int EPERM   = 1;
     public static final int ENOENT  = 2;
@@ -22,10 +28,7 @@ public final class OsConstants {
     // mmap(2) / mprotect(2). Bilibili's BootOpt/FastKType reads PROT_READ very
     // early; without the field the NoSuchFieldError aborts Application.onCreate
     // and its Hilt service stays uninitialized.
-    public static final int PROT_NONE  = 0;
-    public static final int PROT_READ  = 1;
-    public static final int PROT_WRITE = 2;
-    public static final int PROT_EXEC  = 4;
+    // (PROT_* are declared once, at the top of the class.)
 
     public static final int MAP_SHARED    = 1;
     public static final int MAP_PRIVATE   = 2;

@@ -38,8 +38,8 @@
 #
 # Flags:
 #   --fresh-caches   invalidate the per-app regenerable caches (see above)
-#   --no-promote     build only; leave the canonical app untouched (for a
-#                    deliberate A/B against an older installed build)
+#   --no-promote     build and open the local bundle; skip promotion and
+#                    shared runtime staging
 #   --promote        promote even from a CLONE (see below)
 #
 # INSTALLS ARE GUARDED (2026-10-07, scripts/install_guard.sh). In a clone of the

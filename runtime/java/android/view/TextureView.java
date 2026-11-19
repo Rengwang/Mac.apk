@@ -96,6 +96,33 @@ public class TextureView extends View {
     private static final boolean sSetDefaultBufferSize =
         !"0".equals(System.getenv("MACAPK_TEXTUREVIEW_BUFSIZE"));
 
+    /** Route Hardware-decoded video bound to a non-rotated TextureView straight
+     *  through the GPU CAMetalLayer (g_video_layer) + Canvas.punchHole instead of
+     *  locking CVPixelBuffer on CPU and scaling an 8MB Bitmap in Java2D.
+     *  Bisect gate: MACAPK_TEXTUREVIEW_DIRECT_LAYER=0 restores CPU copy path. */
+    private static final boolean sDirectVideoLayer =
+        !"0".equals(System.getenv("MACAPK_TEXTUREVIEW_DIRECT_LAYER"));
+
+    /** Route EGL14 / EGL10 window surfaces bound to an axis-aligned TextureView
+     *  straight through a keyed GPU CAMetalLayer + Canvas.punchHole instead of
+     *  MacApkGlWindow pbuffer + synchronous glReadPixels.
+     *  Bisect gate: MACAPK_TEXTUREVIEW_DIRECT_GL_LAYER=0 restores pbuffer path. */
+    private static final boolean sDirectGlLayer =
+        !"0".equals(System.getenv("MACAPK_TEXTUREVIEW_DIRECT_GL_LAYER"));
+    private volatile int mDirectGlLayerKey;
+
+    private final float[] mDirectTransformCheck = new float[9];
+    private final int[] mDirectOriginScratch = new int[2];
+    private final java.util.concurrent.atomic.AtomicBoolean mDirectUpdatePosted =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final Runnable mDirectUpdateRunnable = new Runnable() {
+        @Override
+        public void run() {
+            mDirectUpdatePosted.set(false);
+            applyUpdate();
+        }
+    };
+
     /** Last latch generation this view has drawn, vs the SurfaceTexture's own
      *  counter -- how draw() tells "new frame" from "same frame redrawn". */
     private int mDrawnGeneration;
@@ -147,6 +174,15 @@ public class TextureView extends View {
 
     @Override
     public void onDetachedFromWindow() {
+        int glKey = mDirectGlLayerKey;
+        mDirectGlLayerKey = 0;
+        if (glKey > 0) {
+            if (mSurfaceTexture != null) {
+                mSurfaceTexture.macapkDisconnectDirectGlLayerKey(glKey);
+            } else {
+                SurfaceView.macapkUnpublishExternalKeyedSurface(glKey);
+            }
+        }
         boolean destroy = true;
         if (mSurfaceTexture != null && mListener != null && mAvailable) {
             try {
@@ -154,12 +190,7 @@ public class TextureView extends View {
             } catch (Throwable ignored) {}
         }
         if (mSurfaceTexture != null) {
-            // Undo the video-target registration Surface's constructor made
-            // (see ensureSurfaceTexture() below), so a decoded-video frame
-            // arriving after this view is gone does not resurrect a detached
-            // SurfaceTexture as the render target (harmless -- the frame
-            // just latches into a Bitmap nobody draws -- but pointless work
-            // and a misleading log if anyone traces it).
+            mSurfaceTexture.macapkSetHostTextureView(null, null);
             mSurfaceTexture.macapkUnregisterVideoTargetIfSelf();
             if (destroy) {
                 mSurfaceTexture.release();
@@ -182,6 +213,8 @@ public class TextureView extends View {
         if (mAvailable && mSurfaceTexture != null) {
             // AOSP :444: the buffer follows the view before the listener hears.
             if (sSetDefaultBufferSize) mSurfaceTexture.setDefaultBufferSize(w, h);
+            int glKey = mDirectGlLayerKey;
+            if (glKey > 0) publishDirectGlLayerRect(glKey);
             if (mListener != null && (w != mSurfaceWidth || h != mSurfaceHeight)) {
                 mSurfaceWidth = w; mSurfaceHeight = h;
                 try { mListener.onSurfaceTextureSizeChanged(mSurfaceTexture, w, h); }
@@ -192,6 +225,20 @@ public class TextureView extends View {
         }
     }
 
+    @Override
+    protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+        super.onLayout(changed, left, top, right, bottom);
+        int glKey = mDirectGlLayerKey;
+        if (glKey > 0) publishDirectGlLayerRect(glKey);
+    }
+
+    @Override
+    protected void onVisibilityChanged(View changedView, int visibility) {
+        super.onVisibilityChanged(changedView, visibility);
+        int glKey = mDirectGlLayerKey;
+        if (glKey > 0) publishDirectGlLayerRect(glKey);
+    }
+
     private void ensureSurfaceTexture() {
         if (mSurfaceTexture == null) {
             mSurfaceTexture = new SurfaceTexture();
@@ -199,6 +246,7 @@ public class TextureView extends View {
             // creation (mUpdateListener); a producer frame then invalidates.
             mSurfaceTexture.setOnFrameAvailableListener(mUpdateListener);
         }
+        mSurfaceTexture.macapkSetHostTextureView(this, mUpdateListener);
         if (mSurface == null || !mSurface.isValid()) {
             mSurface = new Surface(mSurfaceTexture);
         }
@@ -242,24 +290,37 @@ public class TextureView extends View {
         if (surfaceTexture.isReleased()) {
             throw new IllegalArgumentException("Cannot set a released SurfaceTexture");
         }
+        int oldGlKey = mDirectGlLayerKey;
+        mDirectGlLayerKey = 0;
+        if (oldGlKey > 0) {
+            if (mSurfaceTexture != null) {
+                mSurfaceTexture.macapkDisconnectDirectGlLayerKey(oldGlKey);
+            } else {
+                SurfaceView.macapkUnpublishExternalKeyedSurface(oldGlKey);
+            }
+        }
         if (mSurfaceTexture != null) {
+            mSurfaceTexture.macapkSetHostTextureView(null, null);
             mSurfaceTexture.macapkUnregisterVideoTargetIfSelf();
             mSurfaceTexture.release();
         }
-        mSurfaceTexture = surfaceTexture;
-        mSurface = (surfaceTexture != null) ? new Surface(surfaceTexture) : null;
-        if (surfaceTexture != null) {
-            // The adopted texture becomes this view's stream; its frames must
-            // reach our draw loop (AOSP re-registers mUpdateListener too).
-            surfaceTexture.setOnFrameAvailableListener(mUpdateListener);
-            // AOSP getTextureLayer's mUpdateSurface branch: an adopted texture
-            // is set "to use the current view size" (:487).
-            if (sSetDefaultBufferSize && getWidth() > 0 && getHeight() > 0) {
-                surfaceTexture.setDefaultBufferSize(getWidth(), getHeight());
-            }
+        if (mSurface != null) {
+            try { mSurface.release(); } catch (Throwable ignored) {}
+            mSurface = null;
         }
-        mAvailable = surfaceTexture != null;
-        if (mAvailable) publishAvailableIfReady();
+        mSurfaceTexture = surfaceTexture;
+        mSurface = new Surface(surfaceTexture);
+        // The adopted texture becomes this view's stream; its frames must
+        // reach our draw loop (AOSP re-registers mUpdateListener too).
+        surfaceTexture.setOnFrameAvailableListener(mUpdateListener);
+        surfaceTexture.macapkSetHostTextureView(this, mUpdateListener);
+        // AOSP getTextureLayer's mUpdateSurface branch: an adopted texture
+        // is set "to use the current view size" (:487).
+        if (sSetDefaultBufferSize && getWidth() > 0 && getHeight() > 0) {
+            surfaceTexture.setDefaultBufferSize(getWidth(), getHeight());
+        }
+        mAvailable = false;
+        publishAvailableIfReady();
     }
 
     public boolean isAvailable() { return mAvailable; }
@@ -285,11 +346,165 @@ public class TextureView extends View {
         return mSurface;
     }
 
+    private volatile boolean mDirectTransformOk = true;
+
     // Transform applied to the texture when drawn. We store it faithfully even
     // though our draw path does not yet apply it.
     public void setTransform(Matrix transform) {
-        mMatrix.set(transform);
+        if (transform != null) {
+            mMatrix.set(transform);
+            mMatrix.getValues(mDirectTransformCheck);
+            mDirectTransformOk = mDirectTransformCheck[Matrix.MSKEW_X] == 0f
+                    && mDirectTransformCheck[Matrix.MSKEW_Y] == 0f
+                    && mDirectTransformCheck[Matrix.MSCALE_X] > 0f
+                    && mDirectTransformCheck[Matrix.MSCALE_Y] > 0f;
+        } else {
+            mMatrix.reset();
+            mDirectTransformOk = true;
+        }
         mMatrixChanged = true;
+        int glKey = mDirectGlLayerKey;
+        if (glKey > 0) {
+            publishDirectGlLayerRect(glKey);
+            try { invalidate(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** True when this TextureView is eligible to connect a direct keyed GL CAMetalLayer. */
+    public boolean macapkDirectGlLayerMode() {
+        return sDirectGlLayer
+                && mAvailable
+                && macapkAttached
+                && getRotation() == 0f
+                && mDirectTransformOk;
+    }
+
+    /** True when this TextureView can composite its direct GL layer right now. */
+    public boolean macapkDirectGlLayerEligible() {
+        return macapkDirectGlLayerMode()
+                && isShown()
+                && getWidth() > 0
+                && getHeight() > 0
+                && getAlpha() > 0.01f
+                && !SurfaceView.macapkIsViewStoppedUnderTop(this);
+    }
+
+    private void publishDirectGlLayerRect(int key) {
+        if (key <= 0) return;
+        int vw = getWidth();
+        int vh = getHeight();
+        int ownW = vw, ownH = vh;
+        SurfaceTexture st = mSurfaceTexture;
+        if (st != null) {
+            int dw = st.macapkGetDefaultWidth();
+            int dh = st.macapkGetDefaultHeight();
+            if (dw > 0 && dh > 0) {
+                ownW = dw;
+                ownH = dh;
+            }
+        }
+        int vx = 0, vy = 0;
+        boolean vis = macapkDirectGlLayerEligible();
+        if (vis) {
+            try {
+                macapkWindowOrigin(mDirectOriginScratch);
+                vx = mDirectOriginScratch[0];
+                vy = mDirectOriginScratch[1];
+            } catch (Throwable t) {
+                vis = false;
+            }
+        }
+        SurfaceView.macapkPublishExternalKeyedSurfaceRect(
+                key, vx, vy, vw, vh, ownW, ownH, vis);
+    }
+
+    public synchronized int macapkConnectDirectGlLayer() {
+        if (!macapkDirectGlLayerMode()
+                || getWidth() <= 0 || getHeight() <= 0
+                || getAlpha() <= 0.01f) {
+            return 0;
+        }
+        int key = mDirectGlLayerKey;
+        if (key <= 0) {
+            key = SurfaceView.macapkAllocateExternalSurfaceKey();
+            mDirectGlLayerKey = key;
+        }
+        SurfaceView.macapkBindExternalKeyedTextureView(key, this);
+        publishDirectGlLayerRect(key);
+        try { postInvalidate(); } catch (Throwable ignored) {}
+        return key;
+    }
+
+    public synchronized void macapkDisconnectDirectGlLayer(int key) {
+        if (key <= 0) return;
+        if (mDirectGlLayerKey == key) {
+            mDirectGlLayerKey = 0;
+            SurfaceView.macapkUnpublishExternalKeyedSurface(key);
+            try { postInvalidate(); } catch (Throwable ignored) {}
+        } else {
+            SurfaceView.macapkUnpublishExternalKeyedSurface(key);
+        }
+    }
+
+    boolean macapkSyncDirectGlExternalSurface(int key) {
+        int cur = mDirectGlLayerKey;
+        if (cur <= 0 || cur != key || !sDirectGlLayer || !macapkAttached) {
+            return false;
+        }
+        publishDirectGlLayerRect(key);
+        return true;
+    }
+
+    /** True when this TextureView is structurally eligible for direct GPU
+     *  CAMetalLayer composition (detached/axis-aligned/enabled). Visibility and
+     *  alpha are checked separately in macapkDirectVideoLayerEligible() so
+     *  transiently hidden views hide g_video_layer instead of falling back to CPU. */
+    public boolean macapkDirectVideoLayerMode() {
+        return sDirectVideoLayer
+                && mAvailable
+                && macapkAttached
+                && getRotation() == 0f
+                && mDirectTransformOk;
+    }
+
+    /** True when this TextureView can composite decoded video directly through
+     *  the GPU CAMetalLayer (g_video_layer) + Canvas.punchHole right now. */
+    public boolean macapkDirectVideoLayerEligible() {
+        return macapkDirectVideoLayerMode()
+                && isShown()
+                && getWidth() > 0
+                && getHeight() > 0
+                && getAlpha() > 0.01f;
+    }
+
+    /** Packed window rect for g_video_layer, or -1L when currently hidden/ineligible. */
+    public long macapkDirectVideoRectPacked() {
+        try {
+            if (!macapkDirectVideoLayerEligible()) return -1L;
+            macapkWindowOrigin(mDirectOriginScratch);
+            return View.macapkPackVideoRect(
+                    mDirectOriginScratch[0], mDirectOriginScratch[1],
+                    getWidth(), getHeight());
+        } catch (Throwable t) {
+            return -1L;
+        }
+    }
+
+    /** Framework-internal: punch the initial hole and notify SurfaceTextureListener
+     *  without forcing a full UI Canvas redraw on every video frame. */
+    public void macapkPostDirectVideoFrameHook(boolean punchNeeded) {
+        if (punchNeeded) {
+            try { postInvalidate(); } catch (Throwable ignored) {}
+        }
+        if (mListener != null && mDirectUpdatePosted.compareAndSet(false, true)) {
+            try {
+                if (!post(mDirectUpdateRunnable)) {
+                    mDirectUpdatePosted.set(false);
+                }
+            } catch (Throwable ignored) {
+                mDirectUpdatePosted.set(false);
+            }
+        }
     }
     public Matrix getTransform(Matrix transform) {
         if (transform == null) transform = new Matrix();
@@ -354,6 +569,28 @@ public class TextureView extends View {
 
     @Override
     public void draw(android.graphics.Canvas canvas) {
+        int glKey = mDirectGlLayerKey;
+        if (glKey > 0 && mSurfaceTexture != null
+                && mSurfaceTexture.macapkIsDirectGlLayerActive(glKey)
+                && macapkDirectGlLayerEligible()) {
+            publishDirectGlLayerRect(glKey);
+            if (canvas != null) {
+                canvas.punchHole(0f, 0f, getWidth(), getHeight(), 0f, 0f, getAlpha());
+            }
+            mMatrixChanged = false;
+            return;
+        }
+        if (mSurfaceTexture != null && mSurfaceTexture.macapkIsDirectVideoLayerActive()
+                && macapkDirectVideoLayerEligible()) {
+            // Direct GPU CAMetalLayer path: punch a transparent hole at view bounds
+            // so g_video_layer (zPos 0.25) shows through while sibling overlays paint
+            // on top, avoiding the 8MB CPU readback/Java2D blit per video frame.
+            if (canvas != null) {
+                canvas.punchHole(0f, 0f, getWidth(), getHeight(), 0f, 0f, getAlpha());
+            }
+            mMatrixChanged = false;
+            return;
+        }
         // TextureView in AOSP does not draw via the app's Canvas machinery --
         // the render thread composites the SurfaceTexture's latest image. Our
         // render thread IS the Canvas pipeline, so this draw performs the

@@ -31,7 +31,8 @@
 //   [the Parcel bytes, padded to 4, when not OOL]
 // Object kinds: 0 null, 1 binder (a port right), 2 ParcelFileDescriptor and
 // 3 raw FileDescriptor (both an fd, sent as a FILEPORT -- the receiver gets a
-// new fd for the same open file, as the binder driver's BINDER_TYPE_FD does).
+// new fd for the same open file, as the binder driver's BINDER_TYPE_FD does),
+// and 4 raw Mach send right (moved cleanly, e.g. IOSurfaceCreateMachPort).
 //
 // None of the APIs used here is deprecated in the macOS 27 SDK; all predate the
 // 26.4 floor. Rendezvous is bootstrap_check_in / bootstrap_look_up on a
@@ -49,6 +50,7 @@
 #include <unistd.h>
 #include <vector>
 #include <atomic>
+#include <mutex>
 
 // libSystem (what XPC itself uses to pass fds): a Mach send right that holds a
 // kernel reference to an open file; makefd installs a new fd for it.
@@ -149,6 +151,10 @@ bool build(Out& o, int32_t code, int32_t flags, int32_t status, int32_t senderUi
             if (ports[i] < 0 || fileport_makeport(ports[i], &fp) != 0) fp = MACH_PORT_NULL;
             d->name = fp;
             d->disposition = MACH_MSG_TYPE_MOVE_SEND;
+        } else if (kinds[i] == 4) {
+            mach_port_t port = (mach_port_t)ports[i];
+            d->name = port;
+            d->disposition = (port != MACH_PORT_NULL) ? MACH_MSG_TYPE_MOVE_SEND : MACH_MSG_TYPE_COPY_SEND;
         } else {
             mach_port_t port = (kinds[i] == 0) ? MACH_PORT_NULL : (mach_port_t)ports[i];
             d->name = port;
@@ -251,6 +257,23 @@ void drop_ports(const In& in) {
         if (pt) mach_port_deallocate(mach_task_self(), (mach_port_t)pt);
 }
 
+// When mach_msg(SEND) fails before enqueuing (e.g. MACH_SEND_INVALID_DEST),
+// XNU did not move any MACH_MSG_TYPE_MOVE_SEND rights out of our task; release
+// owned moved rights so transient dead peers cannot leak fileports or IOSurface ports.
+void destroy_unsent_moves(mach_msg_header_t* h, const std::vector<int32_t>& kinds) {
+    if (!h || !(h->msgh_bits & MACH_MSGH_BITS_COMPLEX)) return;
+    auto* p = reinterpret_cast<uint8_t*>(h) + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
+    for (size_t i = 0; i < kinds.size(); i++) {
+        auto* d = reinterpret_cast<mach_msg_port_descriptor_t*>(p);
+        if ((kinds[i] == 2 || kinds[i] == 3 || kinds[i] == 4)
+            && d->type == MACH_MSG_PORT_DESCRIPTOR
+            && d->name != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), d->name);
+        }
+        p += sizeof(mach_msg_port_descriptor_t);
+    }
+}
+
 jintArray toJ(JNIEnv* env, const std::vector<int32_t>& v) {
     jintArray a = env->NewIntArray((jsize)v.size());
     if (a && !v.empty()) env->SetIntArrayRegion(a, 0, (jsize)v.size(), v.data());
@@ -288,6 +311,8 @@ pid_t sender_pid(mach_msg_header_t* h) {
     return audit_token_to_pid(t->msgh_audit);
 }
 
+std::mutex g_rcv_mu;
+
 void* loop(void*) {
     JNIEnv* env = nullptr;
     char name[32];
@@ -297,14 +322,20 @@ void* loop(void*) {
         return nullptr;
     std::vector<uint8_t> buf(kRcvBuf);
     for (;;) {
+        // Serialize receive + FLAG_ONEWAY enqueue across pool threads so XNU Mach
+        // port FIFO order is preserved before Java PortOnewayQueue drains serially;
+        // synchronous transactions release g_rcv_mu immediately before dispatch.
+        std::unique_lock<std::mutex> rcvLock(g_rcv_mu);
         kern_return_t kr = receive(buf, g_portset, 0);
         if (kr != KERN_SUCCESS) {
+            rcvLock.unlock();
             fprintf(stderr, "[binder] receive failed: %s\n", mach_error_string(kr));
             continue;
         }
         auto* h = reinterpret_cast<mach_msg_header_t*>(buf.data());
         if (h->msgh_id == MACH_NOTIFY_DEAD_NAME) {
             mach_port_t dead = reinterpret_cast<mach_dead_name_notification_t*>(h)->not_port;
+            rcvLock.unlock();
             env->CallStaticVoidMethod(g_transport, g_onDead, (jint)dead);
             if (env->ExceptionCheck()) env->ExceptionClear();
             // The notification carries a user reference on the dead name.
@@ -312,11 +343,13 @@ void* loop(void*) {
             continue;
         }
         if (h->msgh_id != kMsgId) {
+            rcvLock.unlock();
             mach_msg_destroy(h);
             continue;
         }
         In in;
         if (!parse(h, in)) {
+            rcvLock.unlock();
             fprintf(stderr, "[binder] malformed message dropped\n");
             mach_msg_destroy(h);
             continue;
@@ -324,6 +357,10 @@ void* loop(void*) {
         const mach_port_t target = h->msgh_local_port;
         const mach_port_t reply = h->msgh_remote_port;   // send-once, or NULL (oneway)
         const pid_t pid = sender_pid(h);
+        const bool isOneway = (in.head.flags & 1) != 0;
+        if (!isOneway) {
+            rcvLock.unlock();
+        }
 
         jbyteArray jdata = env->NewByteArray((jsize)in.head.dataLen);
         if (jdata && in.head.dataLen)
@@ -334,6 +371,9 @@ void* loop(void*) {
             g_transport, g_dispatch, (jint)target, (jint)in.head.code, (jint)in.head.flags,
             jdata, toJ(env, in.offs), toJ(env, in.ports), toJ(env, in.kinds),
             (jint)pid, (jint)in.head.senderUid);
+        if (isOneway) {
+            rcvLock.unlock();
+        }
         if (env->ExceptionCheck()) {
             env->ExceptionDescribe();
             env->ExceptionClear();
@@ -518,15 +558,20 @@ Java_android_os_MacApkBinderTransport_nativeTransact(JNIEnv* env, jclass, jint d
         h->msgh_bits |= MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
         kern_return_t kr = mach_msg(h, MACH_SEND_MSG, h->msgh_size, 0, MACH_PORT_NULL,
                                     MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        if (kr != KERN_SUCCESS) destroy_unsent_moves(h, kinds);
         if (kr == MACH_SEND_INVALID_DEST) return result(env, DEAD_OBJECT, nullptr);
         return result(env, kr == KERN_SUCCESS ? NO_ERROR : FAILED_TRANSACTION, nullptr);
     }
     mach_port_t reply = thread_reply_port();
-    if (!reply) return result(env, FAILED_TRANSACTION, nullptr);
+    if (!reply) {
+        destroy_unsent_moves(h, kinds);
+        return result(env, FAILED_TRANSACTION, nullptr);
+    }
     h->msgh_local_port = reply;
     h->msgh_bits |= MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
     kern_return_t kr = mach_msg(h, MACH_SEND_MSG, h->msgh_size, 0, MACH_PORT_NULL,
                                 MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS) destroy_unsent_moves(h, kinds);
     if (kr == MACH_SEND_INVALID_DEST) return result(env, DEAD_OBJECT, nullptr);
     if (kr != KERN_SUCCESS) return result(env, FAILED_TRANSACTION, nullptr);
     std::vector<uint8_t> buf(kRcvBuf);

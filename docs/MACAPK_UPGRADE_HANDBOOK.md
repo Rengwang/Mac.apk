@@ -1,5 +1,10 @@
 # Mac.apk 通用 Android 兼容运行时升级手册
 
+> 当前升级入口（2026-11-14）：[路线图](ROADMAP.md)、[任务表](UPGRADE_PLAN.md)、
+> [执行协议](AUTONOMOUS_EXECUTION.md)。本手册保留 2026-10-29 的架构与历史证据；
+> 当前 HEAD 已有后续 Binder/Surface/性能及上游整合。下面的分支、默认值、缺失功能和 build ID
+> 不直接代表当前状态；修改前核对实际源码与 PROJECT_STATE，不机械照旧阶段重写已存在能力。
+
 - 最后整理：2026-10-29
 - 已验证实现提交：`4706bf2`；Activity 任务 API 修复：`cb0e055`；DEX
   成员类动态代理修复见 5.8
@@ -486,7 +491,7 @@ diff 的文件顺序堆叠。
 
 ### 6.7 生产默认值与启动入口
 
-以下四个能力在 Dock stub、LaunchServices 环境和控制面板三条路径中保持一致：
+在 GATE-002 统一后，以下四个能力在直接 CLI、Dock stub、LaunchServices 环境、控制面板以及 Broker 启动等全部路径中保持一致默认开启（未设置时默认开启，显式 `=0` 可回退/opt-out）：
 
 ```text
 MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS=1
@@ -500,6 +505,8 @@ MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE=1
 类加载日志而拖慢视频。实现入口是 `launcher/AppStubMain.swift` 的 Dock stub
 环境，以及 `launcher/MacApkLauncherApp.swift` 中设置面板直接启动和
 installed-bundle LaunchServices 环境；用户显式环境变量统一在默认值之后应用。
+同时 `AppStubMain.swift` 在启动时同步清洗 9 个测试/harness 专用环境变量，
+防止脏 shell 污染生产应用环境。
 
 ### 6.8 新增测试与诊断
 
@@ -584,33 +591,8 @@ NATIVE_ID=773fd23055a186aa
 
 ### 7.1 构建
 
-```bash
-scripts/check-requirements.sh
-scripts/rebuild_and_run.sh
-```
-
-只构建不改 `/Applications`：
-
-```bash
-scripts/rebuild_and_run.sh --no-promote
-```
-
-分步构建：
-
-```bash
-runtime/scripts/build.sh
-scripts/build_launcher.sh
-debug/build_java_only.sh
-```
-
-发布前还要运行仓库已有的依赖与自包含审计：
-
-```bash
-scripts/audit_bundle_deps.sh build/Mac.apk.app
-debug/dist_parity.sh
-debug/staleness.sh
-debug/entitlements_check.sh
-```
+当前开发构建命令见 [TESTING.md](../TESTING.md)，依赖和打包说明见 [BUILDING.md](../BUILDING.md)。
+复现本手册中记录的历史基线时，先对齐当时的源码提交与构建身份。
 
 ### 7.2 当前证据
 
@@ -798,75 +780,8 @@ classfile 的完整链路。后续应加入一个不依赖商用 APK 的 fixture
 
 ## 9. 后续升级路线
 
-### 阶段 0：稳定当前分支
-
-验收标准：
-
-- 固定当前 `CONVERTER_ID=1b0ad561c01dc6ff` 的 build ID、app bundle 和 DEX
-  fixture 校验值；
-- `OwnerFrameBarrierTest` 连续 100 次通过；
-- Java/native 测试纳入一条可重复脚本；
-- 增加 DEX→classfile→`Proxy.newProxyInstance()` 的端到端 fixture；
-- 记录 Dock、控制面板、Finder 的启动环境完全一致；
-- 将 4 个稳定兼容 feature gate 做显式版本号和 fallback。
-
-### 阶段 1：真正的 Surface identity 和 synthesized BufferQueue
-
-目标是让每次 Android `Surface` 创建都拥有独立 producer identity，而不是从
-“哪个 layer 没有绑定”反推。计划：
-
-1. 在 Java 层给每个 producer-facing Surface 分配不可复用的 session ID；
-2. native ANativeWindow 持有 session、consumer、格式、buffer geometry、generation；
-3. 建立显式 BufferQueue 状态：dequeued、queued、acquired、released；
-4. Metal/Cocoa consumer 通过 transaction 更新 frame、crop、transform、alpha、z-order；
-5. 活动 destroy、Surface release 和 producer disconnect 都通过同一条生命周期路径；
-6. 用多视频、视频+弹幕、相机预览、游戏 HUD 和 WebView overlay 做压力测试。
-
-这是在现有 worktree 上最值得投入的架构升级，也会显著提高其他 Android 应用的
-同屏多媒体成功率。
-
-### 阶段 2：VideoToolbox 和 MediaCodec 完整化
-
-1. 为 Annex-B、avcC、hvcC 建立逐格式 fixture；
-2. 覆盖 H.264/HEVC 8-bit/10-bit、旋转、crop 和动态分辨率；
-3. 验证 flush、seek、reconfigure、EOS、queued input/output depth；
-4. 为 VP8/VP9 与硬件解码建立统一 capability 查询；
-5. 加长时间播放的内存、线程和 frame-drop 观测；
-6. 受保护视频只报告真实能力，不做静默降级。
-
-### 阶段 3：Choreographer、窗口和 damage
-
-1. 实现 delayed callback 的真实 deadline；
-2. 把 owner frame、lifecycle、input、Surface transaction 分类排序；
-3. 加嵌套 Looper、多 Activity、横竖屏和后台恢复压力测试；
-4. damage 统一使用祖先 transform 和旧/新 bounds 合并；
-5. 多显示器、窗口缩放和 different backing scale factor 纳入回归。
-
-### 阶段 4：Binder 与多进程服务
-
-1. 引入稳定 node handle、引用计数和 death notification；
-2. 支持真实 transaction code、oneway 和同步返回值；
-3. 加 fd 传递、权限检查和 sender identity；
-4. 统一 `ServiceInfo.processName`、isolated process 和 manifest 声明；
-5. 用本地 service、ContentProvider、BroadcastReceiver 和跨应用 launch 建立矩阵。
-
-### 阶段 5：资源和主题系统收敛
-
-1. 把 resource value 的 query ID、target ID、pool index、cookie 和 configuration
-   建模成不可混用的对象；
-2. 覆盖 alias、overlay、bag、private attr、style cascade 和 defStyleAttr；
-3. 为 Material/AppCompat/Dynamic Color 建立 snapshot 测试；
-4. 统一 vector tint、ImageView tint、drawable state 和 LevelListDrawable；
-5. 自动检测缺失字体、icon-font 和 PUA glyph，不依赖开发者临时日志。
-
-### 阶段 6：工程化与上游化
-
-- 把实验开关改成带版本、owner、fallback、删除条件的 capability registry；
-- 每个修复附最小 AOSP 依据、复现步骤、跨应用证据和自动化测试；
-- 把只能依赖应用类名的诊断移出生产逻辑；
-- 对生成文件、缓存、日志和二进制加入持续仓库卫生检查；
-- 按可独立审查的主题拆成上游 PR，而不是继续扩大单一大型提交；
-- 如果上游主线接受相关修改，优先在主线收敛，兼容分支只保留尚未合并的扩展。
+按 [升级路线图](ROADMAP.md) 与 [任务表](UPGRADE_PLAN.md) 执行。
+需要追溯 2026-10-29 的旧路线时，可用 `git show dfe3fe2:docs/MACAPK_UPGRADE_HANDBOOK.md` 查阅。
 
 ## 10. 继续开发的标准流程
 
@@ -892,39 +807,10 @@ classfile 的完整链路。后续应加入一个不依赖商用 APK 的 fixture
 - 含个人路径、设备状态或无法公开分发的日志；
 - 只说明“某页面现在能打开”但没有通用原理解释的最终文档。
 
-## 11. 仓库整理结果
+## 11. 仓库整理记录
 
-本次整理完成了以下事项：
-
-- 保留上游 `README.md`、`BUILDING.md`、`COMPATIBILITY.md` 和治理文档；
-- 新增本手册，作为兼容分支的总设计、历史、测试、风险和路线记录；
-- 删除 `README-COMPAT.md`，其首批补丁和旧安装方式已概括并更新到本手册；
-- 删除 `artifacts/` 下三份阶段性诊断和 570 行旧 patch；
-- 删除内容已由 Git 历史保留，可从提交 `e9040a2`、`6839007`、`a6ba981`
-  追溯，不需要继续占用工作树；
-- README 和 BUILDING 都增加了本手册入口；
-- `.gitignore` 已排除构建目录、framework-res 展开缓存、release 凭据、签名文件、
-  IDE 状态和日志；
-- `build/`、`runtime/build/`、`runtime/translator/build/` 和
-  `thirdparty/framework-res/` 是可再生本地产物，不应进入提交或发布分支。
-
-2026-10-29 的最终残留检查确认，除本手册的说明更新外，工作树只有
-`runtime/java/com/macapk/dex/DexConverter.java` 和
-`debug/InnerClassAccessTest.java` 两个本次功能文件；没有发现需要删除或归档的
-未跟踪过程文件。GitHub 发布树继续保留上游 README、赞助和 CLA 配置。
-
-源码注释中仍有许多对早期 `docs/*.md` 设计记录的引用。这些文档已从公开工作树
-移除，引用保留的是当时的 AOSP 依据、测量过程和设计理由，不是运行时依赖，也不
-是损坏的链接。不要为了消除链接而批量删除注释；需要追溯时从 Git 历史读取原文，
-新的稳定结论应持续收敛到本手册。
-
-如果以后要恢复旧报告，使用：
-
-```bash
-git show <旧提交>:<路径>
-```
-
-历史仍完整保存在提交图中，不需要把过期副本继续留在默认分支。
+2026-10-29 的整理与发布提交见本手册 5.6。早期源码注释引用的设计记录可从相应历史提交追溯。
+本轮清理见 [CLEANUP-001](tasks/CLEANUP-001.md)。
 
 ## 12. 常用诊断入口
 

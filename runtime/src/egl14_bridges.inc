@@ -366,11 +366,52 @@ void egl14_win_set_cur(void* dpy, void* app, void* cur) {
         if (w.dpy == dpy && w.app == app) { w.cur = cur; return; }
 }
 
+// Tracked zero-readback TextureView keyed CAMetalLayer surfaces created via EGL14.
+struct Egl14DirectWin { void* dpy; void* surf; jint key; bool firstSwapPending; };
+std::vector<Egl14DirectWin> g_egl14DirectWins;   // guarded by Egl14WinLock
+
+void egl14_direct_add(void* dpy, void* s, jint key) {
+    Egl14WinLock l;
+    g_egl14DirectWins.push_back(Egl14DirectWin{dpy, s, key, true});
+}
+jint egl14_direct_find(void* dpy, void* s) {
+    if (!s) return 0;
+    Egl14WinLock l;
+    for (const Egl14DirectWin& w : g_egl14DirectWins)
+        if (w.dpy == dpy && w.surf == s) return w.key;
+    return 0;
+}
+jint egl14_direct_take_first_swap(void* dpy, void* s) {
+    if (!s) return 0;
+    Egl14WinLock l;
+    for (Egl14DirectWin& w : g_egl14DirectWins) {
+        if (w.dpy == dpy && w.surf == s) {
+            if (!w.firstSwapPending) return 0;
+            w.firstSwapPending = false;
+            return w.key;
+        }
+    }
+    return 0;
+}
+jint egl14_direct_take(void* dpy, void* s) {
+    Egl14WinLock l;
+    for (size_t i = 0; i < g_egl14DirectWins.size(); ++i) {
+        const Egl14DirectWin& w = g_egl14DirectWins[i];
+        if (w.dpy == dpy && (!s || w.surf == s)) {
+            jint key = w.key;
+            g_egl14DirectWins.erase(g_egl14DirectWins.begin() + static_cast<long>(i));
+            return key;
+        }
+    }
+    return 0;
+}
+
 // The MacApkGlWindow upcalls, resolved once. `create` is published last, so a
 // reader that sees it sees the rest.
 struct Egl14Upcalls {
     jclass cls = nullptr;
     jmethodID swap = nullptr, destroy = nullptr, create = nullptr;
+    jmethodID createDirect = nullptr, disconnectKey = nullptr, noteDirectSwap = nullptr;
     bool missing = false;
 };
 Egl14Upcalls g_egl14Up;
@@ -378,12 +419,22 @@ bool egl14_upcalls(JNIEnv* env) {
     if (__atomic_load_n(&g_egl14Up.create, __ATOMIC_ACQUIRE)) return true;
     if (__atomic_load_n(&g_egl14Up.missing, __ATOMIC_RELAXED)) return false;
     jclass c = env->FindClass("javax/microedition/khronos/egl/MacApkGlWindow");
-    jmethodID cr = nullptr, sw = nullptr, de = nullptr;
+    jmethodID cr = nullptr, crPbuf = nullptr, sw = nullptr, de = nullptr;
+    jmethodID disc = nullptr, noteSw = nullptr;
     if (c) {
         cr = env->GetStaticMethodID(c, "egl14CreateWindowSurface",
             "(Landroid/opengl/EGLDisplay;Landroid/opengl/EGLConfig;Ljava/lang/Object;[II)J");
         if (cr) sw = env->GetStaticMethodID(c, "egl14SwapWindow", "(JJI)J");
         if (sw) de = env->GetStaticMethodID(c, "egl14DestroyWindow", "(JJ)Z");
+        if (de) {
+            crPbuf = env->GetStaticMethodID(c, "egl14CreatePbufferWindowSurface",
+                "(Landroid/opengl/EGLDisplay;Landroid/opengl/EGLConfig;Ljava/lang/Object;[II)J");
+            if (!crPbuf) env->ExceptionClear();
+            disc = env->GetStaticMethodID(c, "egl14DisconnectDirectKey", "(I)V");
+            if (!disc) env->ExceptionClear();
+            noteSw = env->GetStaticMethodID(c, "egl14NoteDirectSwap", "(I)V");
+            if (!noteSw) env->ExceptionClear();
+        }
     }
     if (!c || !cr || !sw || !de) {
         // Never inert: say once that windows fall back to the pre-change
@@ -400,7 +451,10 @@ bool egl14_upcalls(JNIEnv* env) {
     env->DeleteLocalRef(c);
     g_egl14Up.swap = sw;
     g_egl14Up.destroy = de;
-    __atomic_store_n(&g_egl14Up.create, cr, __ATOMIC_RELEASE);
+    g_egl14Up.createDirect = cr;
+    g_egl14Up.disconnectKey = disc;
+    g_egl14Up.noteDirectSwap = noteSw;
+    __atomic_store_n(&g_egl14Up.create, crPbuf ? crPbuf : cr, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -492,8 +546,11 @@ __attribute__((unused)) void* egl14_native_resolve(void* dpy, void* s) {
 // egl14_native_resolve(dpy, s), as EGL14_eglSwapBuffers does. A render thread
 // the JVM does not know is attached for the call and detached after it.
 __attribute__((unused)) int egl14_native_swap(void* dpy, void* s) {
+    if (!s) return -1;
     Egl14Win w;
-    if (!s || !egl14_win_find(dpy, s, &w)) return -1;
+    bool foundPbuf = egl14_win_find(dpy, s, &w);
+    jint directKey = foundPbuf ? 0 : egl14_direct_find(dpy, s);
+    if (!foundPbuf && directKey == 0) return -1;
     // Looked up, not linked: the gate harnesses that include this file are not
     // all linked against libjvm.
     static auto getVms = (jint(*)(JavaVM**, jsize, jsize*))dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
@@ -508,6 +565,15 @@ __attribute__((unused)) int egl14_native_swap(void* dpy, void* s) {
             return -1;
         attached = true;
     } else if (rc != JNI_OK || !env) {
+        return -1;
+    }
+    if (!foundPbuf) {
+        if (egl14_upcalls(env) && !env->ExceptionCheck() && g_egl14Up.noteDirectSwap) {
+            env->CallStaticVoidMethod(g_egl14Up.cls, g_egl14Up.noteDirectSwap,
+                                      directKey > 0 ? directKey : 0);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        if (attached) vm->DetachCurrentThread();
         return -1;
     }
     int r = 1;
@@ -607,6 +673,14 @@ jboolean EGL14_eglTerminate(JNIEnv* env, jclass, jobject dpy) {
         jboolean ignored;
         if (!egl14_win_destroy(env, w, &ignored)) return JNI_FALSE;
     }
+    while (egl14_window_real()) {
+        jint directKey = egl14_direct_take(d, nullptr);
+        if (directKey <= 0) break;
+        if (egl14_upcalls(env) && g_egl14Up.disconnectKey) {
+            env->CallStaticVoidMethod(g_egl14Up.cls, g_egl14Up.disconnectKey, directKey);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+    }
     return (p && p(d)) ? JNI_TRUE : JNI_FALSE;
 }
 jstring EGL14_eglQueryString(JNIEnv* env, jclass, jobject dpy, jint name) {
@@ -681,7 +755,8 @@ jobject EGL14_eglCreateWindowSurface(JNIEnv* env, jclass, jobject dpy, jobject c
     // pre-change answer, EGL_NO_SURFACE with no error set.
     if (!egl14_window_real() || !egl14_upcalls(env)) return boxSurface(env, nullptr);
     void* d = egl_h(env, dpy);
-    jlong r = env->CallStaticLongMethod(g_egl14Up.cls, g_egl14Up.create, dpy, cfg, win, attribs, attOff);
+    jmethodID createEntry = g_egl14Up.createDirect ? g_egl14Up.createDirect : g_egl14Up.create;
+    jlong r = env->CallStaticLongMethod(g_egl14Up.cls, createEntry, dpy, cfg, win, attribs, attOff);
     if (env->ExceptionCheck()) return nullptr;   // AOSP's IllegalArgument / UnsupportedOperation
     if (r > 0) {
         void* s = reinterpret_cast<void*>(static_cast<intptr_t>(r));
@@ -689,6 +764,42 @@ jobject EGL14_eglCreateWindowSurface(JNIEnv* env, jclass, jobject dpy, jobject c
         return boxSurface(env, s);
     }
     static auto p = (MEGLSurface(*)(MEGLDisplay, MEGLConfig, MEGLNativeWindow, const MEGLint*))gl3_resolve("eglCreateWindowSurface");
+    if (r <= -100001) {
+        jint key = static_cast<jint>(-r - 100000L);
+        static auto ensureKeyedLayer =
+            (void*(*)(int, int*, int*))dlsym(RTLD_DEFAULT, "CocoaEnsureNativeEglLayerForSurfaceKey");
+        void* c = egl_h(env, cfg);
+        int lw = 0, lh = 0;
+        void* layer = (ensureKeyedLayer && key > 0)
+            ? ensureKeyedLayer(static_cast<int>(key), &lw, &lh) : nullptr;
+        void* s = nullptr;
+        if (layer && p) {
+            IntAttribs al(env, attribs, attOff);
+            s = p(d, c, layer, al.get());
+            al.release();
+        }
+        if (layer && s) {
+            egl14_direct_add(d, s, key);
+            fprintf(stderr, "[egl14] eglCreateWindowSurface(TextureView key=%d) -> EGLSurface %p "
+                    "on keyed CAMetalLayer %p (%dx%d), zero-readback\n",
+                    static_cast<int>(key), s, layer, lw, lh);
+            return boxSurface(env, s);
+        }
+        if (g_egl14Up.disconnectKey) {
+            env->CallStaticVoidMethod(g_egl14Up.cls, g_egl14Up.disconnectKey, key);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        static auto getErr = (MEGLint(*)())gl3_resolve("eglGetError");
+        if (getErr) getErr();
+        egl_err_reset();
+        r = env->CallStaticLongMethod(g_egl14Up.cls, g_egl14Up.create, dpy, cfg, win, attribs, attOff);
+        if (env->ExceptionCheck()) return nullptr;
+        if (r > 0) {
+            void* ps = reinterpret_cast<void*>(static_cast<intptr_t>(r));
+            egl14_win_add(d, ps);
+            return boxSurface(env, ps);
+        }
+    }
     if (r == -2) {
         // A SurfaceView's Surface (GitHub #15): a real ANGLE window on the
         // SurfaceView's native window, the dedicated native-EGL CAMetalLayer
@@ -718,6 +829,7 @@ jobject EGL14_eglCreateWindowSurface(JNIEnv* env, jclass, jobject dpy, jobject c
         void* s = p ? p(d, c, layer, al.get()) : nullptr;
         al.release();   // before any JNI call (a pre-fix pin is a critical section)
         if (s) {
+            egl14_direct_add(d, s, -2);
             if (noteLive) noteLive();
             fprintf(stderr, "[egl14] eglCreateWindowSurface(SurfaceView) -> EGLSurface %p on "
                     "native-EGL layer %p (%dx%d)\n", s, layer, lw, lh);
@@ -758,6 +870,11 @@ jboolean EGL14_eglDestroySurface(JNIEnv* env, jclass, jobject dpy, jobject surf)
     if (egl14_window_real() && egl14_win_take(d, s, &w)) {
         jboolean r = JNI_FALSE;
         return egl14_win_destroy(env, w, &r) ? r : JNI_FALSE;
+    }
+    jint directKey = egl14_window_real() ? egl14_direct_take(d, s) : 0;
+    if (directKey > 0 && egl14_upcalls(env) && g_egl14Up.disconnectKey) {
+        env->CallStaticVoidMethod(g_egl14Up.cls, g_egl14Up.disconnectKey, directKey);
+        if (env->ExceptionCheck()) env->ExceptionClear();
     }
     return (p && p(d, s)) ? JNI_TRUE : JNI_FALSE;
 }
@@ -899,7 +1016,16 @@ jboolean EGL14_eglSwapBuffers(JNIEnv* env, jclass, jobject dpy, jobject surf) {
         // but it is the call whose error the app reads.
         if (!egl14_win_swap(env, w)) return JNI_FALSE;
     }
-    return (p && p(d, egl14_win_cur(d, s))) ? JNI_TRUE : JNI_FALSE;
+    jboolean ok = (p && p(d, egl14_win_cur(d, s))) ? JNI_TRUE : JNI_FALSE;
+    if (ok == JNI_TRUE && egl14_window_real()) {
+        jint directKey = egl14_direct_find(d, s);
+        if (directKey != 0 && egl14_upcalls(env) && g_egl14Up.noteDirectSwap) {
+            env->CallStaticVoidMethod(g_egl14Up.cls, g_egl14Up.noteDirectSwap,
+                                      directKey > 0 ? directKey : 0);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+    }
+    return ok;
 }
 jboolean EGL14_eglCopyBuffers(JNIEnv* env, jclass, jobject dpy, jobject surf, jint target) {
     static auto p = (MEGLBoolean(*)(MEGLDisplay, MEGLSurface, void*))gl3_resolve("eglCopyBuffers");

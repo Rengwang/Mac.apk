@@ -1738,7 +1738,7 @@ void WriteAppMetadata(const fs::path& app_dir, const std::string& apk_path,
     std::string src_apk = !installed_apk.empty() && fs::is_regular_file(installed_apk, mec)
         ? installed_apk
         : (fs::is_regular_file(merged, mec) ? merged.string() : apk_path);
-    BinaryManifestInfo bin = ReadBinaryManifestInfo(src_apk);
+    BinaryManifestInfo bin = ReadBinaryManifestInfo(src_apk, /*resolve_label=*/false);
     if (!bin.ok) {
         std::fprintf(stderr,
             "[macapk] meta.json not written: no readable binary manifest in %s\n",
@@ -1778,6 +1778,10 @@ void WriteAppMetadata(const fs::path& app_dir, const std::string& apk_path,
         for (const std::string& m : members) {
             const std::string arsc = ReadZipEntry(m, "resources.arsc");
             if (arsc.empty()) continue;
+            // The base table also holds a resource-backed application label.
+            // Reuse this read for both metadata fields.
+            if (m == src_apk && bin.label.empty() && bin.label_ref != 0)
+                bin.label = ArscResolveString(arsc, bin.label_ref);
             uint32_t rank = 0; std::string cand;
             if (bin.icon_ref != 0)
                 cand = ArscBestRasterEntry(arsc, bin.icon_ref, &rank, &xml_wins);

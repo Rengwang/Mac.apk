@@ -37,6 +37,12 @@
 
 #ifdef MACAPK_HAS_ANGLE
 #include "angle_glue.h"
+#include "video_pixels.h"
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <EGL/eglext_angle.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #endif
 #include "sv_layer_policy.h"   // MACAPK_SV_LAYER_AT_CREATE decisions (table-tested)
 #include "vsync_thread_policy.h"   // MACAPK_VSYNC_THREAD tick ownership (debug/vsync_thread_gate.sh)
@@ -87,7 +93,16 @@
 static bool MacApkServiceHost() {
     static const bool on = [] {
         const char* e = std::getenv("MACAPK_SERVICE_HOST");
-        return e && std::strcmp(e, "1") == 0;
+        if (e && std::strcmp(e, "1") == 0) return true;
+        const char* forceWin = std::getenv("MACAPK_FORCE_SECONDARY_WINDOW");
+        if (forceWin && std::strcmp(forceWin, "1") == 0) return false;
+        const char* headlessEnv = std::getenv("MACAPK_HEADLESS_SERVICE");
+        if (headlessEnv && std::strcmp(headlessEnv, "0") == 0) return false;
+        const char* sec = std::getenv("MACAPK_SECONDARY_PROCESS");
+        if (sec && std::strcmp(sec, "1") == 0) return true;
+        const char* proc = std::getenv("MACAPK_PROCESS_NAME");
+        if (proc && std::strchr(proc, ':') != nullptr) return true;
+        return false;
     }();
     return on;
 }
@@ -100,13 +115,23 @@ static bool MacApkHarnessNoActivate() {
     return on;
 }
 
+static bool MacApkAutomationMode() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_AUTOMATION");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return on;
+}
+
 // Per-app host display preference, independent of the Android display model.
 // "left" follows a reconnecting Sidecar screen even when its display ID changes.
-static NSScreen* MacapkPreferredLaunchScreen() {
+static NSScreen* MacapkExplicitLaunchScreen() {
     NSString* choice = nil;
-    if (const char* e = std::getenv("MACAPK_HOST_DISPLAY"))
-        choice = [NSString stringWithUTF8String:e];
-    if (!choice) {
+    if (const char* e = std::getenv("MACAPK_HOST_DISPLAY")) {
+        choice = [[NSString stringWithUTF8String:e]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+    if (!choice.length) {
         if (const char* root = std::getenv("MACAPK_ANDROID_ROOT")) {
             NSString* path = [[NSString stringWithUTF8String:root]
                 stringByAppendingPathComponent:@".macapk/host-display.txt"];
@@ -114,19 +139,56 @@ static NSScreen* MacapkPreferredLaunchScreen() {
                 stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         }
     }
-    if (choice.length) {
-        NSArray<NSScreen*>* screens = [NSScreen screens];
-        NSScreen* primary = screens.firstObject;
-        NSScreen* selected = nil;
-        for (NSScreen* screen in screens) {
-            if ([choice isEqualToString:@"left"]) {
-                if (primary && NSMidX(screen.frame) < NSMinX(primary.frame)
-                    && (!selected || NSMinX(screen.frame) < NSMinX(selected.frame))) selected = screen;
-            } else if ([screen.localizedName isEqualToString:choice]) selected = screen;
-        }
-        if (selected) return selected;
+    if (!choice.length) return nil;
+    // Sidecar Display visibleFrame only includes the menu-bar inset once
+    // AppKit has initialized NSApp. Ensure NSApp exists on main-thread queries.
+    if (!NSApp && [NSThread isMainThread]) {
+        [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+            @"ApplePersistenceIgnoreState": @YES,
+        }];
+        [NSApplication sharedApplication];
     }
+    NSArray<NSScreen*>* screens = [NSScreen screens];
+    NSScreen* primary = screens.firstObject;
+    NSScreen* selected = nil;
+    NSString* lower = [choice lowercaseString];
+    for (NSScreen* screen in screens) {
+        if ([lower isEqualToString:@"left"]) {
+            if (primary && NSMidX(screen.frame) < NSMinX(primary.frame)
+                && (!selected || NSMinX(screen.frame) < NSMinX(selected.frame))) selected = screen;
+        } else if ([lower isEqualToString:@"sidecar"]) {
+            if ([screen.localizedName.lowercaseString containsString:@"sidecar"]) {
+                selected = screen;
+                break;
+            }
+        } else if ([screen.localizedName isEqualToString:choice]) {
+            selected = screen;
+            break;
+        }
+    }
+    return selected;
+}
+
+static NSScreen* MacapkPreferredLaunchScreen() {
+    if (NSScreen* selected = MacapkExplicitLaunchScreen()) return selected;
     return [NSScreen mainScreen];
+}
+
+// Keep automation/sidecar reshapes anchored on the configured launch screen
+// rather than drifting back to [NSScreen mainScreen] across orientation changes.
+static NSScreen* MacapkAnchorScreenForPlaceholder(NSWindow* w) {
+    NSScreen* preferred = MacapkExplicitLaunchScreen();
+    if (MacApkAutomationMode() && preferred) return preferred;
+    if (NSScreen* current = w ? [w screen] : nil) return current;
+    return preferred ? preferred : [NSScreen mainScreen];
+}
+
+static NSRect MacapkClampFrameToVisible(NSRect frame, NSRect vis) {
+    if (NSMaxX(frame) > NSMaxX(vis)) frame.origin.x = NSMaxX(vis) - frame.size.width;
+    if (frame.origin.x < vis.origin.x) frame.origin.x = vis.origin.x;
+    if (NSMaxY(frame) > NSMaxY(vis)) frame.origin.y = NSMaxY(vis) - frame.size.height;
+    if (frame.origin.y < vis.origin.y) frame.origin.y = vis.origin.y;
+    return frame;
 }
 
 static CGDirectDisplayID MacapkScreenDisplayID(NSScreen* screen) {
@@ -496,6 +558,20 @@ static MTKView* g_overlay_attached_view = nil;
 // publish, and the publish's main block migrates the overlay as it always has.
 // Nothing else reads it; with the IOSurface path off it is an unread counter.
 static std::atomic<uint32_t> g_canvas_host_epoch{0};
+
+// Capture the actual host and drawable generations with a submitted frame.
+static std::atomic<uint64_t> g_surface_drawable_epoch{0};
+
+struct SurfacePresentGeometry {
+    uint32_t host = g_canvas_host_epoch.load(std::memory_order_acquire);
+    uint64_t drawable = g_surface_drawable_epoch.load(std::memory_order_acquire);
+
+    bool isCurrent() const {
+        return host == g_canvas_host_epoch.load(std::memory_order_acquire)
+            && drawable == g_surface_drawable_epoch.load(std::memory_order_acquire);
+    }
+};
+
 
 // GD Meltdown touch investigation (2026-07-23): WindowManager overlays
 // (Dialog/AlertDialog/PopupWindow) composite onto g_last_metal_view via
@@ -4249,9 +4325,11 @@ bool CocoaInit() {
         // Before finishLaunching: see "Host URL intake" above.
         macapk_install_host_url_handler();
         [g_app finishLaunching];
-        // Give the runtime window a real menu bar (app menu + View > Rotate/Cmd+R)
-        // instead of AppKit's default empty one.
-        install_menu_bar(titleStr);
+        if (!MacApkServiceHost()) {
+            // Give the runtime window a real menu bar (app menu + View > Rotate/Cmd+R)
+            // instead of AppKit's default empty one.
+            install_menu_bar(titleStr);
+        }
 
         // v1.0.128: clamp content size to the host screen's visible
         // frame so a launcher request bigger than the user's display
@@ -4291,106 +4369,113 @@ bool CocoaInit() {
             g_wp.live.win_w_pt = g_win_w; g_wp.live.win_h_pt = g_win_h;
             g_wp.live.app_w_pt = g_phone_w; g_wp.live.app_h_pt = g_phone_h;
         }
-        // Open a placeholder window immediately so boot is visible.
-        NSRect frame = NSMakeRect(0, 0, cw, ch);
-        // v1.0.128: add Resizable so the user can drag the window
-        // larger / smaller AND so Cocoa's full-screen button (green
-        // traffic-light) is enabled. Without Resizable the
-        // toggleFullScreen action is a no-op.
-        NSWindowStyleMask style = kMacapkWindowStyle;
-        g_placeholder_window =
-            [[NSWindow alloc] initWithContentRect:frame
-                                         styleMask:style
-                                           backing:NSBackingStoreBuffered
-                                             defer:NO];
-        [g_placeholder_window setTitle:titleStr];
-        [g_placeholder_window setBackgroundColor:[NSColor blackColor]];
-        // FLAG_SECURE pushed before the window existed (see
-        // macapk_apply_secure_sharing_on_create): no-op unless Java asked.
-        macapk_apply_secure_sharing_on_create(g_placeholder_window);
+        if (!MacApkServiceHost()) {
+            // Open a placeholder window immediately so boot is visible.
+            NSRect frame = NSMakeRect(0, 0, cw, ch);
+            // v1.0.128: add Resizable so the user can drag the window
+            // larger / smaller AND so Cocoa's full-screen button (green
+            // traffic-light) is enabled. Without Resizable the
+            // toggleFullScreen action is a no-op.
+            NSWindowStyleMask style = kMacapkWindowStyle;
+            g_placeholder_window =
+                [[NSWindow alloc] initWithContentRect:frame
+                                             styleMask:style
+                                               backing:NSBackingStoreBuffered
+                                                 defer:NO];
+            [g_placeholder_window setTitle:titleStr];
+            [g_placeholder_window setBackgroundColor:[NSColor blackColor]];
+            // FLAG_SECURE pushed before the window existed (see
+            // macapk_apply_secure_sharing_on_create): no-op unless Java asked.
+            macapk_apply_secure_sharing_on_create(g_placeholder_window);
 
-        // v1.0.129: install the letterbox container as the window's
-        // contentView. Black bg, autoresizes with the window. Any
-        // MTKView later added via CocoaSetWindowContentView becomes a
-        // centered native-size subview of THIS container, not the
-        // direct contentView of the window.
-        // v1.0.503: the container is a MacApkLetterboxContainer subclass that
-        // aspect-fits its single render subview on every resize (defined later
-        // in this TU; instantiated by name like MacApkMetalView). Falls back to
-        // a plain NSView if the class can't be resolved (never expected).
-        Class containerCls = NSClassFromString(@"MacApkLetterboxContainer");
-        NSRect containerFrame = [[g_placeholder_window contentView] bounds];
-        g_letterbox_container = containerCls
-            ? [[containerCls alloc] initWithFrame:containerFrame]
-            : [[NSView alloc] initWithFrame:containerFrame];
-        [g_letterbox_container setWantsLayer:YES];
-        g_letterbox_container.layer.backgroundColor =
-            [[NSColor blackColor] CGColor];
-        // masksToBounds prevents an MTKView LARGER than the container
-        // (e.g. user shrunk the window below native size) from
-        // drawing past the container's edge.
-        g_letterbox_container.layer.masksToBounds = YES;
-        g_letterbox_container.autoresizingMask =
-            NSViewWidthSizable | NSViewHeightSizable;
-        [g_placeholder_window setContentView:g_letterbox_container];
+            // v1.0.129: install the letterbox container as the window's
+            // contentView. Black bg, autoresizes with the window. Any
+            // MTKView later added via CocoaSetWindowContentView becomes a
+            // centered native-size subview of THIS container, not the
+            // direct contentView of the window.
+            // v1.0.503: the container is a MacApkLetterboxContainer subclass that
+            // aspect-fits its single render subview on every resize (defined later
+            // in this TU; instantiated by name like MacApkMetalView). Falls back to
+            // a plain NSView if the class can't be resolved (never expected).
+            Class containerCls = NSClassFromString(@"MacApkLetterboxContainer");
+            NSRect containerFrame = [[g_placeholder_window contentView] bounds];
+            g_letterbox_container = containerCls
+                ? [[containerCls alloc] initWithFrame:containerFrame]
+                : [[NSView alloc] initWithFrame:containerFrame];
+            [g_letterbox_container setWantsLayer:YES];
+            g_letterbox_container.layer.backgroundColor =
+                [[NSColor blackColor] CGColor];
+            // masksToBounds prevents an MTKView LARGER than the container
+            // (e.g. user shrunk the window below native size) from
+            // drawing past the container's edge.
+            g_letterbox_container.layer.masksToBounds = YES;
+            g_letterbox_container.autoresizingMask =
+                NSViewWidthSizable | NSViewHeightSizable;
+            [g_placeholder_window setContentView:g_letterbox_container];
 
-        // v1.0.503: lock the window to the app's aspect ratio so a corner-drag
-        // can only resize along w:h and never distorts the content; the
-        // container aspect-fits the render view into the result and the existing
-        // surfaceChanged re-render chain re-renders at the new pixel size (live,
-        // stretch-free, no fixed resolution). Also floor the content size to an
-        // aspect-correct minimum (smaller side ~240pt, clamped to the initial
-        // size) so the surface can't collapse to a sliver.
-        // v1.0.1649 (phase 2a): the lock is applied by apply_window_locks_main.
-        // Legacy windows, and every window while MACAPK_WINDOW_FREE_RESIZE is
-        // off (the default), keep exactly the v1.0.503 lock described above;
-        // with it on, the policy's lock is per class.
-        apply_window_locks_main(g_win_w > 0 ? g_win_w : g_phone_w,
-                                g_win_h > 0 ? g_win_h : g_phone_h, cw, ch);
+            // v1.0.503: lock the window to the app's aspect ratio so a corner-drag
+            // can only resize along w:h and never distorts the content; the
+            // container aspect-fits the render view into the result and the existing
+            // surfaceChanged re-render chain re-renders at the new pixel size (live,
+            // stretch-free, no fixed resolution). Also floor the content size to an
+            // aspect-correct minimum (smaller side ~240pt, clamped to the initial
+            // size) so the surface can't collapse to a sliver.
+            // v1.0.1649 (phase 2a): the lock is applied by apply_window_locks_main.
+            // Legacy windows, and every window while MACAPK_WINDOW_FREE_RESIZE is
+            // off (the default), keep exactly the v1.0.503 lock described above;
+            // with it on, the policy's lock is per class.
+            apply_window_locks_main(g_win_w > 0 ? g_win_w : g_phone_w,
+                                    g_win_h > 0 ? g_win_h : g_phone_h, cw, ch);
 
-        // Center on the visible frame (excludes menu bar + Dock) rather than
-        // -[NSWindow center] (which sits "somewhat above center" and, combined with
-        // the startup reshape below, left the window drifting off to the left). The
-        // reshape path re-centers the same way once orientation resolves; this
-        // covers apps that never reshape. The user can move the window afterward.
-        {
-            NSRect fr0 = [g_placeholder_window frame];
-            ++g_own_frame_change;
-            [g_placeholder_window setFrameOrigin:NSMakePoint(
-                screenVis.origin.x + (screenVis.size.width  - fr0.size.width)  / 2.0,
-                screenVis.origin.y + (screenVis.size.height - fr0.size.height) / 2.0)];
-            --g_own_frame_change;
-        }
-        if (MacApkServiceHost()) { /* background service process: never shown */ }
-        else if (MacApkHarnessNoActivate()) [g_placeholder_window orderBack:nil];
-        else {
-            [g_placeholder_window makeKeyAndOrderFront:nil];
-            [g_app activateIgnoringOtherApps:YES];
-            MacApkFocusLogAfterShow("placeholder shown +1.5s");
-        }
-        // T0 marker for debug/boottime.sh. The placeholder is the first thing
-        // the user sees, and "a window is up" is a different fact from "the
-        // app drew something" -- measuring them apart is the whole point of
-        // the boot-time budget, so the boundary has to be in the log.
-        std::fprintf(stderr, "[macapk] window: placeholder shown\n");
-        // Correct the position once AppKit has applied the aspect-ratio fit-shrink
-        // (see recenter_placeholder_next_cycle) so the window opens centered.
-        recenter_placeholder_next_cycle();
-        // Native title-bar Back chevron (leading edge), the macOS-native
-        // replacement for the Android on-screen nav glyph. Same KEYCODE_BACK ->
-        // onBackPressed path as Esc / Cmd+[.
-        InstallBackTitlebarAccessory(g_placeholder_window);
-        // v1.0.1649 (phase 2a): the window delegate, BEFORE the optional
-        // fullscreen toggle below, so a --fullscreen launch goes through the
-        // same fullscreen transition as the green button.
-        install_window_delegate(g_placeholder_window);
-        // v1.0.128: optional --fullscreen (or MACAPK_FULLSCREEN=1)
-        // toggles the window into native macOS full-screen on launch.
-        // Honors NSWindowStyleMaskResizable above so toggleFullScreen
-        // actually engages.
-        const char* fs = std::getenv("MACAPK_FULLSCREEN");
-        if (fs && std::strcmp(fs, "1") == 0) {
-            [g_placeholder_window toggleFullScreen:nil];
+            // Center on the visible frame (excludes menu bar + Dock) rather than
+            // -[NSWindow center] (which sits "somewhat above center" and, combined with
+            // the startup reshape below, left the window drifting off to the left). The
+            // reshape path re-centers the same way once orientation resolves; this
+            // covers apps that never reshape. The user can move the window afterward.
+            {
+                NSRect fr0 = [g_placeholder_window frame];
+                fr0.origin.x = screenVis.origin.x + (screenVis.size.width  - fr0.size.width)  / 2.0;
+                fr0.origin.y = screenVis.origin.y + (screenVis.size.height - fr0.size.height) / 2.0;
+                fr0 = MacapkClampFrameToVisible(fr0, screenVis);
+                ++g_own_frame_change;
+                [g_placeholder_window setFrameOrigin:fr0.origin];
+                --g_own_frame_change;
+            }
+            if (MacApkHarnessNoActivate()) {
+                // In Sidecar automation mode, raise the window within its own level so
+                // screencapture -l captures it cleanly while never activating the app,
+                // making it key, or moving the user's cursor.
+                if (MacApkAutomationMode()) [g_placeholder_window orderFrontRegardless];
+                else [g_placeholder_window orderBack:nil];
+            } else {
+                [g_placeholder_window makeKeyAndOrderFront:nil];
+                [g_app activateIgnoringOtherApps:YES];
+                MacApkFocusLogAfterShow("placeholder shown +1.5s");
+            }
+            // T0 marker for debug/boottime.sh. The placeholder is the first thing
+            // the user sees, and "a window is up" is a different fact from "the
+            // app drew something" -- measuring them apart is the whole point of
+            // the boot-time budget, so the boundary has to be in the log.
+            std::fprintf(stderr, "[macapk] window: placeholder shown\n");
+            // Correct the position once AppKit has applied the aspect-ratio fit-shrink
+            // (see recenter_placeholder_next_cycle) so the window opens centered.
+            recenter_placeholder_next_cycle();
+            // Native title-bar Back chevron (leading edge), the macOS-native
+            // replacement for the Android on-screen nav glyph. Same KEYCODE_BACK ->
+            // onBackPressed path as Esc / Cmd+[.
+            InstallBackTitlebarAccessory(g_placeholder_window);
+            // v1.0.1649 (phase 2a): the window delegate, BEFORE the optional
+            // fullscreen toggle below, so a --fullscreen launch goes through the
+            // same fullscreen transition as the green button.
+            install_window_delegate(g_placeholder_window);
+            // v1.0.128: optional --fullscreen (or MACAPK_FULLSCREEN=1)
+            // toggles the window into native macOS full-screen on launch.
+            // Honors NSWindowStyleMaskResizable above so toggleFullScreen
+            // actually engages.
+            const char* fs = std::getenv("MACAPK_FULLSCREEN");
+            if (fs && std::strcmp(fs, "1") == 0) {
+                [g_placeholder_window toggleFullScreen:nil];
+            }
         }
 
         // v1.0.43: exit-on-window-close hook. The Swift launcher
@@ -4449,24 +4534,26 @@ bool CocoaInit() {
         // future engine creates its own separate NSWindow and
         // discards the placeholder, this hook will not fire for that
         // window; revisit then.
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSWindowWillCloseNotification
-                        object:g_placeholder_window
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification* /*note*/) {
-                std::fprintf(stderr,
-                             "[macapk] runtime window closed by user;"
-                             " exiting cleanly\n");
-                std::fflush(stderr);
-                // v1.0.1047: was System.exit(0) with a std::exit(0) fallback.
-                // BOTH deadlocked the runtime on close for any app with a guest
-                // static destructor that touches JNI (measured on Telegram) --
-                // see macapk_terminate_now above for the two-thread deadlock and
-                // why the escape has to be native. macapk_terminate_now runs the
-                // AOSP-guaranteed part of teardown (onPause/onStop/onDestroy, on
-                // the Looper thread, with a timeout) and then _exit()s.
-                macapk_terminate_now(0);
-            }];
+        if (g_placeholder_window) {
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:NSWindowWillCloseNotification
+                            object:g_placeholder_window
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification* /*note*/) {
+                    std::fprintf(stderr,
+                                 "[macapk] runtime window closed by user;"
+                                 " exiting cleanly\n");
+                    std::fflush(stderr);
+                    // v1.0.1047: was System.exit(0) with a std::exit(0) fallback.
+                    // BOTH deadlocked the runtime on close for any app with a guest
+                    // static destructor that touches JNI (measured on Telegram) --
+                    // see macapk_terminate_now above for the two-thread deadlock and
+                    // why the escape has to be native. macapk_terminate_now runs the
+                    // AOSP-guaranteed part of teardown (onPause/onStop/onDestroy, on
+                    // the Looper thread, with a timeout) and then _exit()s.
+                    macapk_terminate_now(0);
+                }];
+        }
 
         // MACAPK_QUIT_PROCESS_GROUP (see macapk_terminate_now): AppKit's own
         // terminate: -- the Dock tile's "Quit", logout/restart, a 'quit' Apple
@@ -4502,34 +4589,36 @@ bool CocoaInit() {
         // are observed too, belt-and-suspenders, in case occlusionState is
         // not reliably re-posted across a miniaturize on some macOS version --
         // the handler is idempotent so a redundant firing is a no-op.
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSWindowDidChangeOcclusionStateNotification
-                        object:g_placeholder_window
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification* /*note*/) {
-                macapk_update_window_hidden_state("occlusion");
-            }];
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSWindowDidMiniaturizeNotification
-                        object:g_placeholder_window
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification* /*note*/) {
-                macapk_update_window_hidden_state("miniaturize");
-            }];
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSWindowDidDeminiaturizeNotification
-                        object:g_placeholder_window
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification* /*note*/) {
-                macapk_update_window_hidden_state("deminiaturize");
-            }];
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSWindowDidChangeScreenNotification
-                        object:g_placeholder_window
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification* /*note*/) {
-                g_window_display_id.store(MacapkScreenDisplayID(g_placeholder_window.screen));
-            }];
+        if (g_placeholder_window) {
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:NSWindowDidChangeOcclusionStateNotification
+                            object:g_placeholder_window
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification* /*note*/) {
+                    macapk_update_window_hidden_state("occlusion");
+                }];
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:NSWindowDidMiniaturizeNotification
+                            object:g_placeholder_window
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification* /*note*/) {
+                    macapk_update_window_hidden_state("miniaturize");
+                }];
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:NSWindowDidDeminiaturizeNotification
+                            object:g_placeholder_window
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification* /*note*/) {
+                    macapk_update_window_hidden_state("deminiaturize");
+                }];
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:NSWindowDidChangeScreenNotification
+                            object:g_placeholder_window
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification* /*note*/) {
+                    g_window_display_id.store(MacapkScreenDisplayID(g_placeholder_window.screen));
+                }];
+        }
 
         // Display-sleep recovery -- see macapk_kick_render_views above for the
         // measured bug and the mechanism. NOTE the notification center: this is
@@ -5032,11 +5121,17 @@ float CocoaBackingScale() {
     void (^body)(void) = ^{
         // Prefer the window the app is actually on (it may be on a second display with a different
         // scale); fall back to the main screen, then to the historical 2.0 default.
-        NSWindow* w = [NSApp keyWindow];
-        if (!w) w = [NSApp mainWindow];
-        if (!w) { NSArray<NSWindow*>* ws = [NSApp windows]; if (ws.count > 0) w = ws.firstObject; }
-        if (w) bs = (float) w.backingScaleFactor;
-        else { NSScreen* scr = MacapkPreferredLaunchScreen(); if (scr) bs = (float) scr.backingScaleFactor; }
+        NSScreen* autoScr = MacApkAutomationMode() ? MacapkExplicitLaunchScreen() : nil;
+        if (autoScr) {
+            bs = (float) autoScr.backingScaleFactor;
+        } else {
+            NSWindow* w = [NSApp keyWindow];
+            if (!w) w = [NSApp mainWindow];
+            if (!w) w = g_placeholder_window;
+            if (!w) { NSArray<NSWindow*>* ws = [NSApp windows]; if (ws.count > 0) w = ws.firstObject; }
+            if (w) bs = (float) w.backingScaleFactor;
+            else { NSScreen* scr = MacapkPreferredLaunchScreen(); if (scr) bs = (float) scr.backingScaleFactor; }
+        }
     };
     if ([NSThread isMainThread]) body(); else dispatch_sync(dispatch_get_main_queue(), body);
     return (bs >= 0.5f && bs <= 8.0f) ? bs : 2.0f;
@@ -7192,108 +7287,224 @@ static bool MacapkTraceVideoLayerGeometry() {
 // reinterpreted as native-endian int32 on this little-endian arm64 host ARE
 // Android's ARGB_8888 int value (0xAARRGGBB) with zero conversion -- the
 // same identity MacApkDecodeImageBytes documents earlier in this file.
-static bool MacapkOfferDecodedFrameToTextureView(void* pixbuf, jobject target = nullptr) {
-    // Unqualified: this function sits inside `namespace macapk` (opened
-    // line 58, closed line 3299), same span as keybind_set_active's
-    // identical GetEnv/attach-if-detached pattern above, which this mirrors.
+struct MacapkJniScope {
     JavaVM* vm = g_touch_vm;
-    if (!vm) return false;
     JNIEnv* env = nullptr;
     bool attached = false;
-    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
-    if (r == JNI_EDETACHED) {
-        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK)
-            return false;
-        attached = true;
-    } else if (r != JNI_OK) {
-        return false;
-    }
-
-    static jclass    s_st_cls          = nullptr;
-    static jmethodID s_has_target_mid  = nullptr;
-    static jmethodID s_queue_frame_mid = nullptr;
-    static jmethodID s_offer_frame_mid = nullptr;
-    static jmethodID s_acq_buf_mid     = nullptr;
-    static jmethodID s_acq_active_mid  = nullptr;
-    static jfieldID  s_active_target_fid = nullptr;
-    static jmethodID s_weak_get_mid     = nullptr;
-    static jfieldID  s_default_w_fid    = nullptr;
-    static jfieldID  s_default_h_fid    = nullptr;
-    static jfieldID  s_has_frame_fid    = nullptr;
-    static jfieldID  s_frame_w_fid      = nullptr;
-    static jfieldID  s_frame_h_fid      = nullptr;
-    static jfieldID  s_latch_bitmap_fid = nullptr;
-    static jfieldID  s_latch_generation_fid = nullptr;
-    static jclass    s_bitmap_cls       = nullptr;
-    static jmethodID s_bitmap_w_mid     = nullptr;
-    static jmethodID s_bitmap_h_mid     = nullptr;
-    static std::atomic<bool> s_st_inited{false};
-    static std::mutex s_st_init_mu;
-
-    if (!s_st_inited.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> init_lock(s_st_init_mu);
-        if (!s_st_inited.load(std::memory_order_relaxed)) {
-            jclass local = env->FindClass("android/graphics/SurfaceTexture");
-            if (local) {
-                s_st_cls          = (jclass)env->NewGlobalRef(local);
-                s_has_target_mid  = env->GetStaticMethodID(s_st_cls, "macapkHasActiveVideoTarget", "()Z");
-                s_queue_frame_mid = env->GetMethodID(s_st_cls, "macapkQueueDecodedFrame", "([IIII)V");
-                s_offer_frame_mid = env->GetStaticMethodID(s_st_cls, "macapkOfferDecodedFrame", "([IIII)Z");
-                s_acq_buf_mid     = env->GetMethodID(s_st_cls, "macapkAcquireVideoBuffer", "(I)[I");
-                s_acq_active_mid  = env->GetStaticMethodID(s_st_cls, "macapkAcquireActiveVideoBuffer", "(I)[I");
-                s_active_target_fid = env->GetStaticFieldID(s_st_cls, "sActiveVideoTarget",
-                                                            "Ljava/lang/ref/WeakReference;");
-                s_default_w_fid = env->GetFieldID(s_st_cls, "mDefaultWidth", "I");
-                s_default_h_fid = env->GetFieldID(s_st_cls, "mDefaultHeight", "I");
-                s_has_frame_fid = env->GetFieldID(s_st_cls, "mHasVideoFrame", "Z");
-                s_frame_w_fid = env->GetFieldID(s_st_cls, "mVideoFrameW", "I");
-                s_frame_h_fid = env->GetFieldID(s_st_cls, "mVideoFrameH", "I");
-                s_latch_bitmap_fid = env->GetFieldID(s_st_cls, "mLatchBitmap", "Landroid/graphics/Bitmap;");
-                s_latch_generation_fid = env->GetFieldID(s_st_cls, "mLatchGeneration", "I");
-                jclass weak = env->FindClass("java/lang/ref/WeakReference");
-                if (weak) {
-                    s_weak_get_mid = env->GetMethodID(weak, "get", "()Ljava/lang/Object;");
-                    env->DeleteLocalRef(weak);
-                }
-                jclass bitmap = env->FindClass("android/graphics/Bitmap");
-                if (bitmap) {
-                    s_bitmap_cls = (jclass)env->NewGlobalRef(bitmap);
-                    s_bitmap_w_mid = env->GetMethodID(bitmap, "getWidth", "()I");
-                    s_bitmap_h_mid = env->GetMethodID(bitmap, "getHeight", "()I");
-                    env->DeleteLocalRef(bitmap);
-                }
-                env->DeleteLocalRef(local);
-            }
-            if (env->ExceptionCheck() || !s_st_cls || !s_has_target_mid
-                || !s_queue_frame_mid || !s_offer_frame_mid || !s_acq_buf_mid || !s_acq_active_mid
-                || !s_active_target_fid || !s_weak_get_mid || !s_default_w_fid
-                || !s_default_h_fid || !s_has_frame_fid || !s_frame_w_fid
-                || !s_frame_h_fid || !s_latch_bitmap_fid || !s_latch_generation_fid
-                || !s_bitmap_cls || !s_bitmap_w_mid || !s_bitmap_h_mid) {
-                if (env->ExceptionCheck()) env->ExceptionClear();
-                if (s_st_cls) env->DeleteGlobalRef(s_st_cls);
-                if (s_bitmap_cls) env->DeleteGlobalRef(s_bitmap_cls);
-                s_st_cls = nullptr;
-                s_bitmap_cls = nullptr;
-                if (attached) vm->DetachCurrentThread();
-                return false;
-            }
-            // Publish only a complete cache. Different decoder threads can arrive
-            // together; observing a half-initialized class/method table is unsafe JNI.
-            s_st_inited.store(true, std::memory_order_release);
+    MacapkJniScope() {
+        if (!vm) return;
+        jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
+        if (r == JNI_EDETACHED) {
+            if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) == JNI_OK)
+                attached = true;
+            else
+                env = nullptr;
+        } else if (r != JNI_OK) {
+            env = nullptr;
         }
     }
+    ~MacapkJniScope() {
+        if (attached && vm) vm->DetachCurrentThread();
+    }
+};
 
-    if (!s_st_cls || !s_has_target_mid) {
-        if (attached) vm->DetachCurrentThread();
+struct MacapkStJniCache {
+    jclass    st_cls               = nullptr;
+    jmethodID try_direct_mid       = nullptr;
+    jmethodID has_target_mid       = nullptr;
+    jmethodID wants_pixbuf_mid     = nullptr;
+    jmethodID queue_pixbuf_mid     = nullptr;
+    jmethodID queue_pixbuf_ts_mid  = nullptr;
+    jmethodID queue_frame_mid      = nullptr;
+    jmethodID queue_frame_ts_mid   = nullptr;
+    jmethodID offer_frame_mid      = nullptr;
+    jmethodID offer_frame_ts_mid   = nullptr;
+    jmethodID acq_buf_mid          = nullptr;
+    jmethodID acq_active_mid       = nullptr;
+    jfieldID  active_target_fid    = nullptr;
+    jmethodID weak_get_mid         = nullptr;
+    jfieldID  default_w_fid        = nullptr;
+    jfieldID  default_h_fid        = nullptr;
+    jfieldID  has_frame_fid        = nullptr;
+    jfieldID  frame_w_fid          = nullptr;
+    jfieldID  frame_h_fid          = nullptr;
+    jfieldID  latch_bitmap_fid     = nullptr;
+    jfieldID  latch_generation_fid = nullptr;
+    jclass    bitmap_cls           = nullptr;
+    jmethodID bitmap_w_mid         = nullptr;
+    jmethodID bitmap_h_mid         = nullptr;
+    std::atomic<bool> inited{false};
+    std::mutex mu;
+};
+static MacapkStJniCache g_st_jni;
+
+static bool MacapkEnsureSurfaceTextureJni(JNIEnv* env) {
+    if (!env) return false;
+    if (g_st_jni.inited.load(std::memory_order_acquire))
+        return g_st_jni.st_cls != nullptr;
+
+    std::lock_guard<std::mutex> init_lock(g_st_jni.mu);
+    if (g_st_jni.inited.load(std::memory_order_relaxed))
+        return g_st_jni.st_cls != nullptr;
+
+    jclass local = env->FindClass("android/graphics/SurfaceTexture");
+    if (local) {
+        g_st_jni.st_cls = (jclass)env->NewGlobalRef(local);
+        g_st_jni.try_direct_mid = env->GetStaticMethodID(
+            g_st_jni.st_cls, "macapkTryDirectVideoLayer", "(Landroid/graphics/SurfaceTexture;)Z");
+        g_st_jni.has_target_mid  = env->GetStaticMethodID(g_st_jni.st_cls, "macapkHasActiveVideoTarget", "()Z");
+        g_st_jni.wants_pixbuf_mid = env->GetMethodID(
+            g_st_jni.st_cls, "macapkWantsNativeVideoPixbuf", "()Z");
+        g_st_jni.queue_pixbuf_mid = env->GetMethodID(
+            g_st_jni.st_cls, "macapkQueueNativeVideoPixbuf", "(JII)Z");
+        g_st_jni.queue_pixbuf_ts_mid = env->GetMethodID(
+            g_st_jni.st_cls, "macapkQueueNativeVideoPixbuf", "(JIIJ)Z");
+        if (env->ExceptionCheck()) { env->ExceptionClear(); g_st_jni.queue_pixbuf_ts_mid = nullptr; }
+        g_st_jni.queue_frame_mid = env->GetMethodID(g_st_jni.st_cls, "macapkQueueDecodedFrame", "([IIII)V");
+        g_st_jni.queue_frame_ts_mid = env->GetMethodID(g_st_jni.st_cls, "macapkQueueDecodedFrame", "([IIIIJ)V");
+        if (env->ExceptionCheck()) { env->ExceptionClear(); g_st_jni.queue_frame_ts_mid = nullptr; }
+        g_st_jni.offer_frame_mid = env->GetStaticMethodID(g_st_jni.st_cls, "macapkOfferDecodedFrame", "([IIII)Z");
+        g_st_jni.offer_frame_ts_mid = env->GetStaticMethodID(g_st_jni.st_cls, "macapkOfferDecodedFrame", "([IIIIJ)Z");
+        if (env->ExceptionCheck()) { env->ExceptionClear(); g_st_jni.offer_frame_ts_mid = nullptr; }
+        g_st_jni.acq_buf_mid     = env->GetMethodID(g_st_jni.st_cls, "macapkAcquireVideoBuffer", "(I)[I");
+        g_st_jni.acq_active_mid  = env->GetStaticMethodID(g_st_jni.st_cls, "macapkAcquireActiveVideoBuffer", "(I)[I");
+        g_st_jni.active_target_fid = env->GetStaticFieldID(
+            g_st_jni.st_cls, "sActiveVideoTarget", "Ljava/lang/ref/WeakReference;");
+        g_st_jni.default_w_fid = env->GetFieldID(g_st_jni.st_cls, "mDefaultWidth", "I");
+        g_st_jni.default_h_fid = env->GetFieldID(g_st_jni.st_cls, "mDefaultHeight", "I");
+        g_st_jni.has_frame_fid = env->GetFieldID(g_st_jni.st_cls, "mHasVideoFrame", "Z");
+        g_st_jni.frame_w_fid   = env->GetFieldID(g_st_jni.st_cls, "mVideoFrameW", "I");
+        g_st_jni.frame_h_fid   = env->GetFieldID(g_st_jni.st_cls, "mVideoFrameH", "I");
+        g_st_jni.latch_bitmap_fid = env->GetFieldID(
+            g_st_jni.st_cls, "mLatchBitmap", "Landroid/graphics/Bitmap;");
+        g_st_jni.latch_generation_fid = env->GetFieldID(g_st_jni.st_cls, "mLatchGeneration", "I");
+        jclass weak = env->FindClass("java/lang/ref/WeakReference");
+        if (weak) {
+            g_st_jni.weak_get_mid = env->GetMethodID(weak, "get", "()Ljava/lang/Object;");
+            env->DeleteLocalRef(weak);
+        }
+        jclass bitmap = env->FindClass("android/graphics/Bitmap");
+        if (bitmap) {
+            g_st_jni.bitmap_cls   = (jclass)env->NewGlobalRef(bitmap);
+            g_st_jni.bitmap_w_mid = env->GetMethodID(bitmap, "getWidth", "()I");
+            g_st_jni.bitmap_h_mid = env->GetMethodID(bitmap, "getHeight", "()I");
+            env->DeleteLocalRef(bitmap);
+        }
+        env->DeleteLocalRef(local);
+    }
+    if (env->ExceptionCheck() || !g_st_jni.st_cls || !g_st_jni.try_direct_mid
+        || !g_st_jni.has_target_mid || !g_st_jni.wants_pixbuf_mid || !g_st_jni.queue_pixbuf_mid
+        || !g_st_jni.queue_frame_mid || !g_st_jni.offer_frame_mid
+        || !g_st_jni.acq_buf_mid || !g_st_jni.acq_active_mid || !g_st_jni.active_target_fid
+        || !g_st_jni.weak_get_mid || !g_st_jni.default_w_fid || !g_st_jni.default_h_fid
+        || !g_st_jni.has_frame_fid || !g_st_jni.frame_w_fid || !g_st_jni.frame_h_fid
+        || !g_st_jni.latch_bitmap_fid || !g_st_jni.latch_generation_fid
+        || !g_st_jni.bitmap_cls || !g_st_jni.bitmap_w_mid || !g_st_jni.bitmap_h_mid) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (g_st_jni.st_cls) env->DeleteGlobalRef(g_st_jni.st_cls);
+        if (g_st_jni.bitmap_cls) env->DeleteGlobalRef(g_st_jni.bitmap_cls);
+        g_st_jni.st_cls = nullptr;
+        g_st_jni.bitmap_cls = nullptr;
         return false;
     }
+    // Publish only a complete cache. Different decoder threads can arrive
+    // together; observing a half-initialized class/method table is unsafe JNI.
+    g_st_jni.inited.store(true, std::memory_order_release);
+    return true;
+}
+
+static bool MacapkTryDirectVideoLayer(JNIEnv* env, jobject target) {
+    if (!env || !MacapkEnsureSurfaceTextureJni(env)) return false;
+    jboolean ok = env->CallStaticBooleanMethod(g_st_jni.st_cls, g_st_jni.try_direct_mid, target);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return ok == JNI_TRUE;
+}
+
+static bool MacapkOfferDecodedFrameToTextureView(JNIEnv* env, void* pixbuf, jobject target = nullptr,
+                                                 int64_t presentationTimeNs = 0,
+                                                 bool hasExplicitTs = false) {
+    if (!env || !MacapkEnsureSurfaceTextureJni(env)) return false;
 
     bool offered = false;
     const bool traceGeometry = MacapkTraceVideoLayerGeometry();
     static std::atomic<uintptr_t> s_last_trace_target{0};
     static std::atomic<unsigned long> s_trace_offers{0};
-    if (target || env->CallStaticBooleanMethod(s_st_cls, s_has_target_mid)) {
+
+    // Zero-copy native CVPixelBuffer/IOSurface handoff for GL-attached SurfaceTextures:
+    // skip CVPixelBufferLockBaseAddress and 25 MB/frame int[] copy altogether.
+    jobject resolvedTarget = target;
+    if (!resolvedTarget) {
+        jobject weak = env->GetStaticObjectField(g_st_jni.st_cls, g_st_jni.active_target_fid);
+        if (weak) {
+            resolvedTarget = env->CallObjectMethod(weak, g_st_jni.weak_get_mid);
+            env->DeleteLocalRef(weak);
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            if (resolvedTarget) env->DeleteLocalRef(resolvedTarget);
+            resolvedTarget = nullptr;
+        }
+    }
+    if (resolvedTarget && g_st_jni.wants_pixbuf_mid && g_st_jni.queue_pixbuf_mid) {
+        jboolean wantsPixbuf = env->CallBooleanMethod(resolvedTarget, g_st_jni.wants_pixbuf_mid);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            wantsPixbuf = JNI_FALSE;
+        }
+        if (wantsPixbuf == JNI_TRUE) {
+            CVPixelBufferRef pb = (CVPixelBufferRef)pixbuf;
+            size_t w = CVPixelBufferGetWidth(pb);
+            size_t h = CVPixelBufferGetHeight(pb);
+            if (w > 0 && h > 0) {
+                CFRetain((CFTypeRef)pb);
+                jboolean queued = (hasExplicitTs && g_st_jni.queue_pixbuf_ts_mid)
+                    ? env->CallBooleanMethod(
+                        resolvedTarget,
+                        g_st_jni.queue_pixbuf_ts_mid,
+                        static_cast<jlong>(reinterpret_cast<intptr_t>(pb)),
+                        static_cast<jint>(w),
+                        static_cast<jint>(h),
+                        static_cast<jlong>(presentationTimeNs))
+                    : env->CallBooleanMethod(
+                        resolvedTarget,
+                        g_st_jni.queue_pixbuf_mid,
+                        static_cast<jlong>(reinterpret_cast<intptr_t>(pb)),
+                        static_cast<jint>(w),
+                        static_cast<jint>(h));
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    CFRelease((CFTypeRef)pb);
+                    queued = JNI_FALSE;
+                }
+                if (queued == JNI_TRUE) {
+                    if (traceGeometry) {
+                        const uintptr_t nowTarget = reinterpret_cast<uintptr_t>(resolvedTarget);
+                        const uintptr_t oldTarget = s_last_trace_target.exchange(
+                            nowTarget, std::memory_order_relaxed);
+                        const unsigned long n = ++s_trace_offers;
+                        if (oldTarget != nowTarget || n <= 3 || (n % 60) == 0) {
+                            std::fprintf(stderr,
+                                "[I] cocoa_v2: texture native-pixbuf offer #%lu target=%p "
+                                "explicit=%d source=%zux%zu\n",
+                                n, (void*)resolvedTarget, target ? 1 : 0, w, h);
+                            std::fflush(stderr);
+                        }
+                    }
+                    if (resolvedTarget != target) env->DeleteLocalRef(resolvedTarget);
+                    return true;
+                }
+            }
+        }
+    }
+    if (resolvedTarget && resolvedTarget != target) {
+        env->DeleteLocalRef(resolvedTarget);
+        resolvedTarget = nullptr;
+    }
+
+    if (target || env->CallStaticBooleanMethod(g_st_jni.st_cls, g_st_jni.has_target_mid)) {
         CVPixelBufferRef pb = (CVPixelBufferRef)pixbuf;
         CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
         size_t w      = CVPixelBufferGetWidth(pb);
@@ -7304,22 +7515,36 @@ static bool MacapkOfferDecodedFrameToTextureView(void* pixbuf, jobject target = 
             jsize nInts = (jsize)((stride / 4) * h);
             // Acquire a reusable buffer from the SurfaceTexture's own bounded pool
             jintArray arr = target
-                ? (s_acq_buf_mid ? (jintArray)env->CallObjectMethod(target, s_acq_buf_mid, nInts) : nullptr)
-                : (s_acq_active_mid ? (jintArray)env->CallStaticObjectMethod(s_st_cls, s_acq_active_mid, nInts) : nullptr);
+                ? (g_st_jni.acq_buf_mid ? (jintArray)env->CallObjectMethod(target, g_st_jni.acq_buf_mid, nInts) : nullptr)
+                : (g_st_jni.acq_active_mid ? (jintArray)env->CallStaticObjectMethod(g_st_jni.st_cls, g_st_jni.acq_active_mid, nInts) : nullptr);
             if (!arr) {
                 if (env->ExceptionCheck()) env->ExceptionClear();
                 arr = env->NewIntArray(nInts);
             }
             if (arr) {
                 env->SetIntArrayRegion(arr, 0, nInts, (const jint*)base);
-                jmethodID offer = target ? s_queue_frame_mid : s_offer_frame_mid;
+                jmethodID offerTs = target ? g_st_jni.queue_frame_ts_mid : g_st_jni.offer_frame_ts_mid;
+                jmethodID offer = (hasExplicitTs && offerTs)
+                    ? offerTs
+                    : (target ? g_st_jni.queue_frame_mid : g_st_jni.offer_frame_mid);
                 if (offer) {
                     jboolean consumed = JNI_TRUE;
                     if (target) {
-                        env->CallVoidMethod(target, offer, arr, (jint)w, (jint)h, (jint)(stride / 4));
+                        if (hasExplicitTs && offerTs) {
+                            env->CallVoidMethod(target, offer, arr, (jint)w, (jint)h,
+                                                (jint)(stride / 4), (jlong)presentationTimeNs);
+                        } else {
+                            env->CallVoidMethod(target, offer, arr, (jint)w, (jint)h, (jint)(stride / 4));
+                        }
                     } else {
-                        consumed = env->CallStaticBooleanMethod(
-                            s_st_cls, offer, arr, (jint)w, (jint)h, (jint)(stride / 4));
+                        if (hasExplicitTs && offerTs) {
+                            consumed = env->CallStaticBooleanMethod(
+                                g_st_jni.st_cls, offer, arr, (jint)w, (jint)h,
+                                (jint)(stride / 4), (jlong)presentationTimeNs);
+                        } else {
+                            consumed = env->CallStaticBooleanMethod(
+                                g_st_jni.st_cls, offer, arr, (jint)w, (jint)h, (jint)(stride / 4));
+                        }
                     }
                     if (env->ExceptionCheck()) { env->ExceptionClear(); consumed = JNI_FALSE; }
                     offered = (consumed == JNI_TRUE);
@@ -7328,24 +7553,24 @@ static bool MacapkOfferDecodedFrameToTextureView(void* pixbuf, jobject target = 
                         jobject observed = target;
                         jobject weak = nullptr;
                         if (!observed) {
-                            weak = env->GetStaticObjectField(s_st_cls, s_active_target_fid);
-                            if (weak) observed = env->CallObjectMethod(weak, s_weak_get_mid);
+                            weak = env->GetStaticObjectField(g_st_jni.st_cls, g_st_jni.active_target_fid);
+                            if (weak) observed = env->CallObjectMethod(weak, g_st_jni.weak_get_mid);
                         }
                         int defaultW = -1, defaultH = -1, frameW = -1, frameH = -1;
                         int latchW = -1, latchH = -1, generation = -1;
                         bool hasFrame = false;
                         jobject latch = nullptr;
                         if (observed) {
-                            defaultW = env->GetIntField(observed, s_default_w_fid);
-                            defaultH = env->GetIntField(observed, s_default_h_fid);
-                            hasFrame = env->GetBooleanField(observed, s_has_frame_fid) == JNI_TRUE;
-                            frameW = env->GetIntField(observed, s_frame_w_fid);
-                            frameH = env->GetIntField(observed, s_frame_h_fid);
-                            generation = env->GetIntField(observed, s_latch_generation_fid);
-                            latch = env->GetObjectField(observed, s_latch_bitmap_fid);
+                            defaultW = env->GetIntField(observed, g_st_jni.default_w_fid);
+                            defaultH = env->GetIntField(observed, g_st_jni.default_h_fid);
+                            hasFrame = env->GetBooleanField(observed, g_st_jni.has_frame_fid) == JNI_TRUE;
+                            frameW = env->GetIntField(observed, g_st_jni.frame_w_fid);
+                            frameH = env->GetIntField(observed, g_st_jni.frame_h_fid);
+                            generation = env->GetIntField(observed, g_st_jni.latch_generation_fid);
+                            latch = env->GetObjectField(observed, g_st_jni.latch_bitmap_fid);
                             if (latch) {
-                                latchW = env->CallIntMethod(latch, s_bitmap_w_mid);
-                                latchH = env->CallIntMethod(latch, s_bitmap_h_mid);
+                                latchW = env->CallIntMethod(latch, g_st_jni.bitmap_w_mid);
+                                latchH = env->CallIntMethod(latch, g_st_jni.bitmap_h_mid);
                             }
                         }
                         const uintptr_t nowTarget = (uintptr_t)observed;
@@ -7358,7 +7583,7 @@ static bool MacapkOfferDecodedFrameToTextureView(void* pixbuf, jobject target = 
                                 "source=%zux%zu stride_px=%zu consumed=%d default=%dx%d queued=%d "
                                 "frame=%dx%d latch=%dx%d gen=%d\n",
                                 n, (void*)observed, target ? 1 : 0,
-                                env->CallStaticBooleanMethod(s_st_cls, s_has_target_mid) == JNI_TRUE,
+                                env->CallStaticBooleanMethod(g_st_jni.st_cls, g_st_jni.has_target_mid) == JNI_TRUE,
                                 w, h, stride / 4, offered ? 1 : 0, defaultW, defaultH,
                                 hasFrame ? 1 : 0, frameW, frameH, latchW, latchH, generation);
                             std::fflush(stderr);
@@ -7374,9 +7599,189 @@ static bool MacapkOfferDecodedFrameToTextureView(void* pixbuf, jobject target = 
         }
         CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     }
-    if (attached) vm->DetachCurrentThread();
     return offered;
 }
+
+// BEGIN_SURFACETEXTURE_NATIVE_PIXBUF
+#ifdef MACAPK_HAS_ANGLE
+static EGLConfig MacapkFindIosurfaceTexture2DConfig(EGLDisplay dpy) {
+    if (dpy == EGL_NO_DISPLAY) return nullptr;
+    const char* exts = eglQueryString(dpy, EGL_EXTENSIONS);
+    if (!exts || !std::strstr(exts, "EGL_ANGLE_iosurface_client_buffer")) return nullptr;
+    EGLint numCfgs = 0;
+    if (eglGetConfigs(dpy, nullptr, 0, &numCfgs) != EGL_TRUE || numCfgs <= 0) return nullptr;
+    std::vector<EGLConfig> cfgs(static_cast<size_t>(numCfgs));
+    if (eglGetConfigs(dpy, cfgs.data(), numCfgs, &numCfgs) != EGL_TRUE) return nullptr;
+    EGLConfig fallback = nullptr;
+    for (int i = 0; i < numCfgs; ++i) {
+        EGLint st = 0, rt = 0, target = 0, b2tRgba = 0;
+        EGLint r = 0, g = 0, b = 0, a = 0, depth = 0, stencil = 0;
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_SURFACE_TYPE, &st);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_RENDERABLE_TYPE, &rt);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_BIND_TO_TEXTURE_TARGET_ANGLE, &target);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_BIND_TO_TEXTURE_RGBA, &b2tRgba);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_RED_SIZE, &r);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_GREEN_SIZE, &g);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_BLUE_SIZE, &b);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_ALPHA_SIZE, &a);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_DEPTH_SIZE, &depth);
+        eglGetConfigAttrib(dpy, cfgs[i], EGL_STENCIL_SIZE, &stencil);
+        if ((st & EGL_PBUFFER_BIT) && (rt & EGL_OPENGL_ES2_BIT)
+            && target == EGL_TEXTURE_2D && r == 8 && g == 8 && b == 8 && a == 8) {
+            if (!fallback) fallback = cfgs[i];
+            if (b2tRgba == EGL_TRUE && depth == 0 && stencil == 0) return cfgs[i];
+        }
+    }
+    return fallback;
+}
+#endif
+
+void CocoaReleaseVideoPixelBuffer(jlong pixbufHandle) {
+    if (pixbufHandle != 0) {
+        CFRelease(reinterpret_cast<CFTypeRef>(static_cast<intptr_t>(pixbufHandle)));
+    }
+}
+
+void CocoaReleaseGlBoundIosurfaceState(jlong boundState[3]) {
+    if (!boundState) return;
+#ifdef MACAPK_HAS_ANGLE
+    if (boundState[0] != 0 && boundState[1] != 0) {
+        EGLDisplay dpy = reinterpret_cast<EGLDisplay>(static_cast<intptr_t>(boundState[0]));
+        EGLSurface surf = reinterpret_cast<EGLSurface>(static_cast<intptr_t>(boundState[1]));
+        eglReleaseTexImage(dpy, surf, EGL_BACK_BUFFER);
+        eglDestroySurface(dpy, surf);
+    }
+#endif
+    if (boundState[2] != 0) {
+        CFRelease(reinterpret_cast<CFTypeRef>(static_cast<intptr_t>(boundState[2])));
+    }
+    boundState[0] = 0;
+    boundState[1] = 0;
+    boundState[2] = 0;
+}
+
+bool CocoaLatchVideoPixelBufferToGl(jlong pixbufHandle, jint texName, jlong boundState[3]) {
+    if (pixbufHandle == 0) return false;
+    CVPixelBufferRef pb = reinterpret_cast<CVPixelBufferRef>(static_cast<intptr_t>(pixbufHandle));
+#ifndef MACAPK_HAS_ANGLE
+    if (boundState) CocoaReleaseGlBoundIosurfaceState(boundState);
+    CFRelease(pb);
+    return false;
+#else
+    if (texName <= 0 || !boundState) {
+        if (boundState) CocoaReleaseGlBoundIosurfaceState(boundState);
+        CFRelease(pb);
+        return false;
+    }
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLContext ctx = eglGetCurrentContext();
+    if (dpy == EGL_NO_DISPLAY || ctx == EGL_NO_CONTEXT) {
+        CocoaReleaseGlBoundIosurfaceState(boundState);
+        CFRelease(pb);
+        return false;
+    }
+
+    GLint savedTex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texName));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    CocoaReleaseGlBoundIosurfaceState(boundState);
+
+    const int width = static_cast<int>(CVPixelBufferGetWidth(pb));
+    const int height = static_cast<int>(CVPixelBufferGetHeight(pb));
+    const OSType pixFmt = CVPixelBufferGetPixelFormatType(pb);
+    bool latched = false;
+
+    if (width > 0 && height > 0 && pixFmt == kCVPixelFormatType_32BGRA) {
+        IOSurfaceRef io = CVPixelBufferGetIOSurface(pb);
+        if (io) {
+            EGLConfig cfg = MacapkFindIosurfaceTexture2DConfig(dpy);
+            if (cfg) {
+                const EGLint attrs[] = {
+                    EGL_WIDTH, width,
+                    EGL_HEIGHT, height,
+                    EGL_IOSURFACE_PLANE_ANGLE, 0,
+                    EGL_TEXTURE_TARGET, EGL_TEXTURE_2D,
+                    EGL_TEXTURE_INTERNAL_FORMAT_ANGLE, 0x80E1 /* GL_BGRA_EXT */,
+                    EGL_TEXTURE_FORMAT, EGL_TEXTURE_RGBA,
+                    EGL_TEXTURE_TYPE_ANGLE, GL_UNSIGNED_BYTE,
+                    EGL_NONE
+                };
+                EGLSurface surf = eglCreatePbufferFromClientBuffer(
+                    dpy, EGL_IOSURFACE_ANGLE, reinterpret_cast<EGLClientBuffer>(io), cfg, attrs);
+                if (surf != EGL_NO_SURFACE) {
+                    if (eglBindTexImage(dpy, surf, EGL_BACK_BUFFER) == EGL_TRUE) {
+                        boundState[0] = static_cast<jlong>(reinterpret_cast<intptr_t>(dpy));
+                        boundState[1] = static_cast<jlong>(reinterpret_cast<intptr_t>(surf));
+                        boundState[2] = pixbufHandle;
+                        latched = true;
+                    } else {
+                        eglDestroySurface(dpy, surf);
+                    }
+                }
+            }
+        }
+
+        if (!latched) {
+            if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
+                const uint8_t* base = static_cast<const uint8_t*>(CVPixelBufferGetBaseAddress(pb));
+                const size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pb);
+                const size_t needBytes = static_cast<size_t>(width) * 4;
+                if (base && bytesPerRow >= needBytes) {
+                    thread_local std::vector<uint32_t> tlsRgba;
+                    const size_t totalPixels =
+                        static_cast<size_t>(width) * static_cast<size_t>(height);
+                    if (tlsRgba.size() < totalPixels) tlsRgba.resize(totalPixels);
+                    if ((bytesPerRow % 4) == 0 && (reinterpret_cast<uintptr_t>(base) % 4) == 0) {
+                        macapk::pixels::ArgbToRgba(
+                            reinterpret_cast<const uint32_t*>(base),
+                            tlsRgba.data(),
+                            width,
+                            height,
+                            static_cast<int>(bytesPerRow / 4),
+                            false);
+                    } else {
+                        thread_local std::vector<uint32_t> tlsRow;
+                        if (tlsRow.size() < static_cast<size_t>(width)) {
+                            tlsRow.resize(static_cast<size_t>(width));
+                        }
+                        for (int y = 0; y < height; ++y) {
+                            std::memcpy(tlsRow.data(),
+                                        base + static_cast<size_t>(y) * bytesPerRow, needBytes);
+                            macapk::pixels::ArgbToRgba(
+                                tlsRow.data(),
+                                tlsRgba.data() + static_cast<size_t>(y) * static_cast<size_t>(width),
+                                width,
+                                1,
+                                width,
+                                false);
+                        }
+                    }
+                    GLint savedUnpack = 4;
+                    glGetIntegerv(GL_UNPACK_ALIGNMENT, &savedUnpack);
+                    if (savedUnpack > 4) glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, tlsRgba.data());
+                    if (savedUnpack > 4) glPixelStorei(GL_UNPACK_ALIGNMENT, savedUnpack);
+                    latched = true;
+                }
+                CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            }
+            CFRelease(pb);
+        }
+    } else {
+        CFRelease(pb);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(savedTex));
+    return latched;
+#endif
+}
+// END_SURFACETEXTURE_NATIVE_PIXBUF
 
 // ---------------------------------------------------------------------------
 // Video-plane geometry: pin the video layer to the guest SurfaceView's rect.
@@ -7466,6 +7871,160 @@ static JNIEnv* MacapkMainThreadEnv() {
     return env;
 }
 
+static std::mutex          g_video_present_mu;
+static CFTypeRef           g_video_pending_pb = nullptr;
+static bool                g_video_drain_scheduled = false;
+static std::atomic<bool>   g_video_ensure_scheduled{false};
+static std::atomic<bool>   g_video_layer_ready{false};
+static std::atomic<uint64_t> g_video_frames_offered{0};
+static std::atomic<uint64_t> g_video_frames_presented{0};
+static std::atomic<uint64_t> g_video_frames_superseded{0};
+
+static dispatch_queue_t MacapkVideoPresentQueue() {
+    static dispatch_queue_t q = [] {
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+        return dispatch_queue_create("com.macapk.video.present", attr);
+    }();
+    return q;
+}
+
+static void MacapkEnsureVideoLayerOnMain();
+
+static void MacapkRequestVideoLayerEnsureOnMain() {
+    if (!g_video_ensure_scheduled.exchange(true, std::memory_order_acq_rel)) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_video_ensure_scheduled.store(false, std::memory_order_release);
+            MacapkEnsureVideoLayerOnMain();
+        });
+    }
+}
+
+static void MacapkDrainVideoPresentQueue() {
+    while (true) {
+        CFTypeRef pb = nullptr;
+        CAMetalLayer* layer = nil;
+        void* presenter = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_video_present_mu);
+            if (!g_video_pending_pb || !g_video_layer_ready.load(std::memory_order_acquire)) {
+                g_video_drain_scheduled = false;
+                if (g_video_pending_pb && !g_video_layer_ready.load(std::memory_order_acquire)) {
+                    MacapkRequestVideoLayerEnsureOnMain();
+                }
+                break;
+            }
+            pb = g_video_pending_pb;
+            g_video_pending_pb = nullptr;
+            layer = g_video_layer;
+            presenter = g_video_presenter;
+        }
+        if (layer && presenter) {
+            if (macapk_vd_present_to_layer(presenter, (__bridge void*)layer, (void*)pb) == 0) {
+                MacapkNoteSurfaceFrame();
+                uint64_t presented = g_video_frames_presented.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (MacapkTraceVideoLayerGeometry() && (presented <= 5 || (presented % 60) == 0)) {
+                    std::fprintf(stderr,
+                        "[I] cocoa_v2: video gpu present #%llu offers=%llu superseded=%llu\n",
+                        (unsigned long long)presented,
+                        (unsigned long long)g_video_frames_offered.load(std::memory_order_relaxed),
+                        (unsigned long long)g_video_frames_superseded.load(std::memory_order_relaxed));
+                    std::fflush(stderr);
+                }
+            }
+        }
+        CFRelease(pb);
+    }
+}
+
+static void MacapkKickVideoPresentDrain() {
+    std::lock_guard<std::mutex> lk(g_video_present_mu);
+    if (g_video_pending_pb && !g_video_drain_scheduled
+        && g_video_layer_ready.load(std::memory_order_acquire)) {
+        g_video_drain_scheduled = true;
+        dispatch_async(MacapkVideoPresentQueue(), ^{
+            MacapkDrainVideoPresentQueue();
+        });
+    }
+}
+
+static bool MacapkApplyVideoLayerGeometry(JNIEnv* env, MTKView* view);
+
+static MTKView* MacapkPreferredVideoHostView() {
+    // Same windowless-Path-A rule as CocoaPresentBitmap (v1.0.997): the
+    // video plane must land on the view that is actually on screen, or the
+    // decoded frames present into an orphaned layer tree and the player box
+    // is black no matter how healthy the decode is.
+    MTKView* view = g_last_metal_view;
+    if (view && view.window == nil && MacapkRewireKeepCanvas()) view = nil;
+    if (!view) view = g_active_render_view ? g_active_render_view : g_last_gl_metal_view;
+    return view;
+}
+
+static void MacapkEnsureVideoLayerOnMain() {
+    MTKView* view = MacapkPreferredVideoHostView();
+    if (!view) {
+        g_video_layer_ready.store(false, std::memory_order_release);
+        return;
+    }
+    if (!g_video_layer || g_video_attached_view != view) {
+        CGFloat scale = view.window ? view.window.backingScaleFactor : 2.0;
+        CAMetalLayer* vl = [CAMetalLayer layer];
+        vl.device           = view.device ?: MTLCreateSystemDefaultDevice();
+        vl.pixelFormat      = MTLPixelFormatBGRA8Unorm;
+        vl.framebufferOnly  = YES;
+        vl.opaque           = YES;
+        vl.contentsScale    = scale;
+        vl.frame            = view.bounds;
+        vl.drawableSize     = CGSizeMake(std::round(view.bounds.size.width  * scale),
+                                         std::round(view.bounds.size.height * scale));
+        vl.actions = @{ @"contents": [NSNull null], @"bounds": [NSNull null], @"position": [NSNull null] };
+        // v1.0.997: 0.25, not 0.75. AOSP composites a SurfaceView BELOW the
+        // window (setZOrderOnTop(false) is the default and our
+        // setZOrderOnTop is a no-op stub, so "below" is the only case we
+        // model), which means the plane must sit under the app's View-tree
+        // chrome in EVERY hosting arrangement. 0.75 only satisfied that
+        // against a Path-A canvas overlay at zPosition 1.0; when the overlay
+        // is hosted on a GL MTKView it sits at 0.5 (so a Dialog at 1.0 can
+        // still cover the app's widgets), and 0.75 then put the video ON TOP
+        // of the player's own transport controls. 0.25 is below both overlay
+        // z-values and still above the framework angleLayer at 0.
+        vl.zPosition = 0.25;
+        // Crop, don't distort: when the sink view scrolls partly off the
+        // window, the plane's frame extends past the view and the
+        // SUPERLAYER's mask clips it at the edge -- content stays at its
+        // own scale and is cropped, exactly what a device's window does to
+        // a surface. Scoped to video-hosting views only (every other
+        // sublayer -- angle/canvas/unity -- is view-sized already).
+        view.layer.masksToBounds = YES;
+        [view.layer addSublayer:vl];
+
+        CAMetalLayer* oldLayer = nil;
+        void* vp = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_video_present_mu);
+            oldLayer = g_video_layer;
+            g_video_layer = vl;
+            g_video_attached_view = view;
+            if (!g_video_presenter)
+                g_video_presenter = macapk_vd_present_create((__bridge void*)vl.device);
+            vp = g_video_presenter;
+        }
+        if (oldLayer && oldLayer != vl) {
+            [oldLayer removeFromSuperlayer];
+        }
+        std::fprintf(stderr,
+            "[I] cocoa_v2: video layer (re)attached to MTKView=%p zPos=%.2f bounds=%.0fx%.0f presenter=%p\n",
+            (void*)view, (double)vl.zPosition,
+            view.layer.bounds.size.width, view.layer.bounds.size.height, vp);
+    } else if (!g_video_presenter) {
+        std::lock_guard<std::mutex> lk(g_video_present_mu);
+        if (!g_video_presenter && g_video_layer)
+            g_video_presenter = macapk_vd_present_create((__bridge void*)g_video_layer.device);
+    }
+    MacapkApplyVideoLayerGeometry(MacapkMainThreadEnv(), view);
+}
+
 /** Position g_video_layer for this frame. Returns false when the sink is
  *  hidden and the present must be skipped. Main thread only. */
 static bool MacapkApplyVideoLayerGeometry(JNIEnv* env, MTKView* view) {
@@ -7476,6 +8035,7 @@ static bool MacapkApplyVideoLayerGeometry(JNIEnv* env, MTKView* view) {
                        ? MacapkQueryVideoSinkRectPacked(env) : 0;
     if (packed == -1) {
         if (!g_video_layer.hidden) g_video_layer.hidden = YES;
+        g_video_layer_ready.store(false, std::memory_order_release);
         return false;
     }
     CGRect  wantFrame;
@@ -7495,6 +8055,7 @@ static bool MacapkApplyVideoLayerGeometry(JNIEnv* env, MTKView* view) {
         int     hpx = (int)     ( packed        & 0xffff);
         if (wpx <= 0 || hpx <= 0) {
             if (!g_video_layer.hidden) g_video_layer.hidden = YES;
+            g_video_layer_ready.store(false, std::memory_order_release);
             return false;
         }
         // Surface px (top-left origin, full-display space -- the same space
@@ -7543,106 +8104,68 @@ static bool MacapkApplyVideoLayerGeometry(JNIEnv* env, MTKView* view) {
     if (drawableChanged)
         g_video_layer.drawableSize = wantDrawable;
     if (g_video_layer.hidden) g_video_layer.hidden = NO;
+    const bool readyNow = (g_video_layer != nil && g_video_presenter != nullptr);
+    const bool wasReady = g_video_layer_ready.exchange(readyNow, std::memory_order_acq_rel);
+    if (!wasReady && readyNow) {
+        MacapkKickVideoPresentDrain();
+    }
     return true;
 }
 
-static std::atomic<int> g_pending_video_presents{0};
-
-static void MacapkPresentVideoFrame(void* pixbuf, jobject target, bool explicitTarget) {
+static void MacapkPresentVideoFrame(void* pixbuf, jobject target, bool explicitTarget,
+                                    int64_t presentationTimeNs = 0,
+                                    bool hasExplicitTs = false) {
     if (!pixbuf) return;
-    // Route to a registered TextureView target FIRST, synchronously, on the
-    // caller's own thread -- before the CFRetain/dispatch_async hop below,
-    // and using the ORIGINAL pixbuf directly. This is safe because control
-    // has not yet returned to Java: MediaCodec.releaseOutputBuffer calls
-    // nativeVidRender (this call's synchronous caller) and only THEN calls
-    // nativeVidReleaseFrame, so the caller's own CVPixelBufferRef reference
-    // is still guaranteed live for the duration of this function. A
-    // consumed frame returns immediately, skipping the fullscreen
-    // g_video_layer machinery entirely -- a TextureView-bound video must
-    // not ALSO flash fullscreen behind its own composited position.
-    if ((!explicitTarget || target) && MacapkOfferDecodedFrameToTextureView(pixbuf, target)) {
-        MacapkNoteSurfaceFrame();
-        return;
+    // TextureView routing: prefer the direct zero-copy GPU layer + Canvas hole
+    // path whenever the host TextureView meets fast-path invariants; fall back
+    // to software Bitmap offer only for rotated/skewed, GL-attached, external-
+    // listener, or lockCanvas TextureViews.
+    bool routedDirect = false;
+    if (!explicitTarget || target) {
+        MacapkJniScope jni;
+        routedDirect = MacapkTryDirectVideoLayer(jni.env, target);
+        if (!routedDirect && MacapkOfferDecodedFrameToTextureView(
+                jni.env, pixbuf, target, presentationTimeNs, hasExplicitTs)) {
+            MacapkNoteSurfaceFrame();
+            return;
+        }
     }
     // An explicit abandoned/failing texture must never fall through to a
     // different surface or to the window's full video layer.
-    if (explicitTarget && target) return;
+    if (!routedDirect && explicitTarget && target) return;
 
-    // Flow control for main thread presentation queue:
-    // If the Cocoa main queue is backlogged with >= 3 unrendered video frames,
-    // drop this frame immediately to avoid piling up uncompressed CVPixelBuffers in RAM.
-    if (![NSThread isMainThread] && g_pending_video_presents.load(std::memory_order_relaxed) >= 3) {
-        return;
-    }
-    g_pending_video_presents.fetch_add(1, std::memory_order_relaxed);
-
-    // Retain across the (possibly async) hop to main: the caller's own
-    // reference may be released the instant this call returns.
+    // Publish latest decoded frame for off-main-thread Metal presentation.
+    // Superseding an unpresented frame avoids queueing uncompressed
+    // CVPixelBuffers while keeping the Cocoa UI/main thread unblocked.
     CFTypeRef pb = CFRetain((CFTypeRef)pixbuf);
-    void (^mainBlock)(void) = ^{
-        g_pending_video_presents.fetch_sub(1, std::memory_order_relaxed);
-        // Same windowless-Path-A rule as CocoaPresentBitmap (v1.0.997): the
-        // video plane must land on the view that is actually on screen, or the
-        // decoded frames present into an orphaned layer tree and the player box
-        // is black no matter how healthy the decode is.
-        MTKView* view = g_last_metal_view;
-        if (view && view.window == nil && MacapkRewireKeepCanvas()) view = nil;
-        if (!view) view = g_active_render_view ? g_active_render_view
-                                               : g_last_gl_metal_view;
-        if (!view) { CFRelease(pb); return; }
-        if (!g_video_layer || g_video_attached_view != view) {
-            if (g_video_layer) { [g_video_layer removeFromSuperlayer]; g_video_layer = nil; }
-            CGFloat scale = view.window ? view.window.backingScaleFactor : 2.0;
-            CAMetalLayer* vl = [CAMetalLayer layer];
-            vl.device           = view.device ?: MTLCreateSystemDefaultDevice();
-            vl.pixelFormat      = MTLPixelFormatBGRA8Unorm;
-            vl.framebufferOnly  = YES;
-            vl.opaque           = YES;
-            vl.contentsScale    = scale;
-            vl.frame            = view.bounds;
-            vl.drawableSize     = CGSizeMake(std::round(view.bounds.size.width  * scale),
-                                             std::round(view.bounds.size.height * scale));
-            vl.actions = @{ @"contents": [NSNull null], @"bounds": [NSNull null], @"position": [NSNull null] };
-            // v1.0.997: 0.25, not 0.75. AOSP composites a SurfaceView BELOW the
-            // window (setZOrderOnTop(false) is the default and our
-            // setZOrderOnTop is a no-op stub, so "below" is the only case we
-            // model), which means the plane must sit under the app's View-tree
-            // chrome in EVERY hosting arrangement. 0.75 only satisfied that
-            // against a Path-A canvas overlay at zPosition 1.0; when the overlay
-            // is hosted on a GL MTKView it sits at 0.5 (so a Dialog at 1.0 can
-            // still cover the app's widgets), and 0.75 then put the video ON TOP
-            // of the player's own transport controls. 0.25 is below both overlay
-            // z-values and still above the framework angleLayer at 0.
-            vl.zPosition = 0.25;
-            // Crop, don't distort: when the sink view scrolls partly off the
-            // window, the plane's frame extends past the view and the
-            // SUPERLAYER's mask clips it at the edge -- content stays at its
-            // own scale and is cropped, exactly what a device's window does to
-            // a surface. Scoped to video-hosting views only (every other
-            // sublayer -- angle/canvas/unity -- is view-sized already).
-            view.layer.masksToBounds = YES;
-            [view.layer addSublayer:vl];
-            g_video_layer = vl;
-            g_video_attached_view = view;
-            std::fprintf(stderr,
-                "[I] cocoa_v2: video layer (re)attached to MTKView=%p zPos=%.2f bounds=%.0fx%.0f\n",
-                (void*)view, (double)vl.zPosition,
-                view.layer.bounds.size.width, view.layer.bounds.size.height);
+    bool kickMain = false;
+    bool kickDrain = false;
+    {
+        std::lock_guard<std::mutex> lk(g_video_present_mu);
+        if (g_video_pending_pb) {
+            CFRelease(g_video_pending_pb);
+            g_video_frames_superseded.fetch_add(1, std::memory_order_relaxed);
         }
-        // v1.0.996: the plane's geometry is the sink SurfaceView's on-screen
-        // rect (see MacapkApplyVideoLayerGeometry above), not the whole
-        // window. A hidden sink skips the present entirely.
-        if (!MacapkApplyVideoLayerGeometry(MacapkMainThreadEnv(), view)) {
-            CFRelease(pb);
-            return;
+        g_video_pending_pb = pb;
+        g_video_frames_offered.fetch_add(1, std::memory_order_relaxed);
+        if (!g_video_layer_ready.load(std::memory_order_acquire)) {
+            kickMain = true;
+        } else if (!g_video_drain_scheduled) {
+            g_video_drain_scheduled = true;
+            kickDrain = true;
         }
-        if (!g_video_presenter) g_video_presenter = macapk_vd_present_create((__bridge void*)g_video_layer.device);
-        if (g_video_presenter) macapk_vd_present_to_layer(g_video_presenter, (__bridge void*)g_video_layer, (void*)pb);
-        MacapkNoteSurfaceFrame();
-        CFRelease(pb);
-    };
-    if ([NSThread isMainThread]) mainBlock();
-    else dispatch_async(dispatch_get_main_queue(), mainBlock);
+    }
+    if (kickMain) {
+        if ([NSThread isMainThread]) {
+            MacapkEnsureVideoLayerOnMain();
+        } else {
+            MacapkRequestVideoLayerEnsureOnMain();
+        }
+    } else if (kickDrain) {
+        dispatch_async(MacapkVideoPresentQueue(), ^{
+            MacapkDrainVideoPresentQueue();
+        });
+    }
 }
 
 extern "C" void CocoaPresentVideoFrame(void* pixbuf, int, int) {
@@ -7650,7 +8173,13 @@ extern "C" void CocoaPresentVideoFrame(void* pixbuf, int, int) {
 }
 
 extern "C" void CocoaPresentVideoFrameToSurface(void* pixbuf, int, int, jobject target) {
-    MacapkPresentVideoFrame(pixbuf, target, true);
+    MacapkPresentVideoFrame(pixbuf, target, true, 0, false);
+}
+
+extern "C" __attribute__((visibility("default")))
+void CocoaPresentVideoFrameToSurfaceAtTime(void* pixbuf, int, int, jobject target,
+                                           int64_t presentationTimeNs, bool hasExplicitTs) {
+    MacapkPresentVideoFrame(pixbuf, target, true, presentationTimeNs, hasExplicitTs);
 }
 
 // Premultiply a straight-alpha ARGB buffer in place of a plain copy.
@@ -8945,7 +9474,7 @@ extern "C" void* CocoaEnsureNativeEglLayerForSurfaceKey(int key, int* outW, int*
             CGFloat scale = host.window ? host.window.backingScaleFactor : 2.0;
             if (scale <= 0) scale = 2.0;
             const char* preserveAlpha = std::getenv("MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA");
-            CAMetalLayer* layer = preserveAlpha && std::strcmp(preserveAlpha, "1") == 0
+            CAMetalLayer* layer = (!preserveAlpha || std::strcmp(preserveAlpha, "0") != 0)
                 ? [MacApkSurfaceMetalLayer layer] : [CAMetalLayer layer];
             layer.device = host.device;
             layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -9225,8 +9754,9 @@ static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* 
                 key, xs, ys, wpx, hpx, effectiveZ);
         layer.hidden = NO;
     }
+    const char* alphaProbe = std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE");
     if ([layer isKindOfClass:[CAMetalLayer class]] &&
-        std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE")) {
+        alphaProbe && std::strcmp(alphaProbe, "1") == 0) {
         static std::unordered_map<int, unsigned> samples;
         unsigned n = samples[key]++;
         if (n < 3 || n % 120 == 0) {
@@ -9586,10 +10116,16 @@ static bool MacapkSurfaceIOSurfacePresentEnabled() {
     return on;
 }
 
-bool MacapkWriteSurfaceIOSurface(int key, int width, int height,
-                                 const uint32_t* pixels,
-                                 IOSurfaceRef* image, int* slotIndex);
-void MacapkFinishSurfaceIOSurface(int key, int slotIndex);
+namespace {
+struct MacapkSurfaceIOSurfaceRing;
+using SurfaceRingLease = std::shared_ptr<MacapkSurfaceIOSurfaceRing>;
+
+SurfaceRingLease MacapkWriteSurfaceIOSurface(int key, int width, int height,
+                                            const uint32_t* pixels,
+                                            IOSurfaceRef* image, int* slotIndex);
+bool MacapkSurfaceIOSurfaceRingIsLive(const SurfaceRingLease& ring);
+void MacapkFinishSurfaceIOSurface(const SurfaceRingLease& ring, int slotIndex);
+}
 
 // A CALayer does not synchronously publish every new `contents` object. If the
 // producer replaces contents at display rate, Core Animation can briefly lose
@@ -9710,6 +10246,7 @@ bool CocoaPresentSurfaceIOSurfaceFrom(int surfaceKey, int width, int height,
         release(context);
         return true;
     }
+    const SurfacePresentGeometry geometry;
     int pending = g_pending_surface_presents.load(std::memory_order_relaxed);
     do {
         if (pending >= 3) return false;
@@ -9733,8 +10270,12 @@ bool CocoaPresentSurfaceIOSurfaceFrom(int surfaceKey, int width, int height,
             surfaceKey, pending + 1, width, height);
     const int key = surfaceKey;
     void (^publish)(void) = ^{
-        CALayer* layer = MacapkEnsureSurfaceLayer(key, width, height);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        CALayer* layer = geometry.isCurrent()
+            ? MacapkEnsureSurfaceLayer(key, width, height) : nil;
         if (!layer) {
+            [CATransaction commit];
             CFRelease(image);
             g_pending_surface_presents.fetch_sub(1, std::memory_order_relaxed);
             release(context);
@@ -9761,8 +10302,6 @@ bool CocoaPresentSurfaceIOSurfaceFrom(int surfaceKey, int width, int height,
             g_pending_surface_presents.fetch_sub(1, std::memory_order_relaxed);
             release(context);
         };
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
         [CATransaction setCompletionBlock:finished];
         // ANGLE's IOSurface rows are bottom-up while a CALayer's contents are
         // displayed top-down. Keep this experiment reversible if a backend
@@ -9779,8 +10318,12 @@ bool CocoaPresentSurfaceIOSurfaceFrom(int surfaceKey, int width, int height,
     if ([NSThread isMainThread]) {
         // Run once immediately so an unavailable layer can still fall back in
         // this same swap. The queued-off-main form reports pressure later.
-        CALayer* layer = MacapkEnsureSurfaceLayer(key, width, height);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        CALayer* layer = geometry.isCurrent()
+            ? MacapkEnsureSurfaceLayer(key, width, height) : nil;
         if (!layer) {
+            [CATransaction commit];
             CFRelease(image);
             g_pending_surface_presents.fetch_sub(1, std::memory_order_relaxed);
             return false;
@@ -9806,8 +10349,6 @@ bool CocoaPresentSurfaceIOSurfaceFrom(int surfaceKey, int width, int height,
             g_pending_surface_presents.fetch_sub(1, std::memory_order_relaxed);
             release(context);
         };
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
         [CATransaction setCompletionBlock:finished];
         CATransform3D flip = CATransform3DIdentity;
         const char* flipEnv = std::getenv("MACAPK_GL_WINDOW_NATIVE_LAYER_FLIP");
@@ -9831,6 +10372,7 @@ void CocoaPresentSurfaceBitmapFrom(int surface_key, int width, int height,
     // thread, whose pool never pops).
     @autoreleasepool {
         if (width <= 0 || height <= 0) return;
+        const SurfacePresentGeometry geometry;
         MacapkNoteSurfaceFrame();
         // A blocked Cocoa thread must not retain an unbounded queue of full
         // video images. Drop before allocating/copying, shared across surfaces.
@@ -9854,20 +10396,28 @@ void CocoaPresentSurfaceBitmapFrom(int surface_key, int width, int height,
             if (MacapkSurfaceIOSurfacePresentEnabled()) {
                 IOSurfaceRef image = nullptr;
                 int slotIndex = -1;
-                if (MacapkWriteSurfaceIOSurface(surface_key, width, height, pixels,
-                                                &image, &slotIndex)) {
+                auto ring = MacapkWriteSurfaceIOSurface(surface_key, width, height, pixels,
+                                                       &image, &slotIndex);
+                if (ring) {
                     win.close();
-                    CFRetain(image);
                     const int key = surface_key;
                     void (^mainBlock)(void) = ^{
-                        (void)presentLease;
-                        CALayer* layer = MacapkEnsureSurfaceLayer(key, width, height);
-                        if (layer) {
-                            layer.transform = CATransform3DIdentity;
-                            layer.contents = (__bridge id)image;
+                        [CATransaction begin];
+                        [CATransaction setDisableActions:YES];
+                        CALayer* layer = geometry.isCurrent() && MacapkSurfaceIOSurfaceRingIsLive(ring)
+                            ? MacapkEnsureSurfaceLayer(key, width, height) : nil;
+                        if (!layer) {
+                            [CATransaction commit];
+                            MacapkFinishSurfaceIOSurface(ring, slotIndex);
+                            return;
                         }
-                        MacapkFinishSurfaceIOSurface(key, slotIndex);
-                        CFRelease(image);
+                        [CATransaction setCompletionBlock:^{
+                            (void)presentLease;
+                            MacapkFinishSurfaceIOSurface(ring, slotIndex);
+                        }];
+                        layer.transform = CATransform3DIdentity;
+                        layer.contents = (__bridge id)image;
+                        [CATransaction commit];
                     };
                     if ([NSThread isMainThread]) mainBlock();
                     else dispatch_async(dispatch_get_main_queue(), mainBlock);
@@ -9881,7 +10431,8 @@ void CocoaPresentSurfaceBitmapFrom(int surface_key, int width, int height,
             // every pixel's alpha is 0 (the pixels are there, the layer is
             // transparent). Count the non-transparent pixels BEFORE the
             // premultiply so the number is the producer's own alpha channel.
-            if (std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE")) {
+            const char* alphaCoverageProbe = std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE");
+            if (alphaCoverageProbe && std::strcmp(alphaCoverageProbe, "1") == 0) {
                 static std::atomic<int> alphaProbeSeq{0};
                 int seq = alphaProbeSeq.fetch_add(1);
                 if (seq < 4 || seq % 60 == 0) {
@@ -9928,10 +10479,15 @@ void CocoaPresentSurfaceBitmapFrom(int surface_key, int width, int height,
             // Host selection + the overlay's (re)attach: the surface layer is
             // its sibling, so the overlay must exist even before the view tree
             // presented anything (it is transparent until then).
+            if (!geometry.isCurrent()) return;
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
             CALayer* layer = MacapkEnsureSurfaceLayer(key, width, height);
-            if (!layer) return;
-            layer.transform = CATransform3DIdentity;
-            layer.contents = imageObj;
+            if (layer) {
+                layer.transform = CATransform3DIdentity;
+                layer.contents = imageObj;
+            }
+            [CATransaction commit];
         };
         if ([NSThread isMainThread]) mainBlock();
         else dispatch_async(dispatch_get_main_queue(), mainBlock);
@@ -10081,65 +10637,64 @@ IOSurfaceRef MacapkCreateCanvasSurface(int w, int h) {
     }
 }
 
-namespace {
 struct MacapkSurfaceIOSurfaceSlot {
     IOSurfaceRef image = nullptr;
     bool dispatched = false;
 };
 struct MacapkSurfaceIOSurfaceRing {
     std::mutex mutex;
+    bool retired = false;
     int width = 0;
     int height = 0;
     std::vector<MacapkSurfaceIOSurfaceSlot> slots;
+
+    ~MacapkSurfaceIOSurfaceRing() {
+        for (auto& slot : slots) CFRelease(slot.image);
+    }
 };
 
 std::mutex g_surface_iosurface_rings_mu;
-std::unordered_map<int, MacapkSurfaceIOSurfaceRing*> g_surface_iosurface_rings;
+std::unordered_map<int, SurfaceRingLease> g_surface_iosurface_rings;
 std::atomic<uint64_t> g_surface_iosurface_frames{0};
 std::atomic<uint64_t> g_surface_iosurface_fallbacks{0};
 
-MacapkSurfaceIOSurfaceRing* MacapkSurfaceIOSurfaceRingFor(int key) {
-    std::lock_guard<std::mutex> lock(g_surface_iosurface_rings_mu);
-    MacapkSurfaceIOSurfaceRing*& ring = g_surface_iosurface_rings[key];
-    if (!ring) ring = new MacapkSurfaceIOSurfaceRing();
-    return ring;
-}
-}  // namespace
-
-static void MacapkReleaseSurfaceIOSurfaceRingForKeyImpl(int key) {
-    if (key <= 0) return;
-    MacapkSurfaceIOSurfaceRing* ring = nullptr;
+void MacapkRetireSurfaceIOSurfaceRing(int key) {
+    SurfaceRingLease ring;
     {
         std::lock_guard<std::mutex> lock(g_surface_iosurface_rings_mu);
         auto found = g_surface_iosurface_rings.find(key);
         if (found == g_surface_iosurface_rings.end()) return;
-        ring = found->second;
+        ring = std::move(found->second);
+        g_surface_iosurface_rings.erase(found);
     }
-    // Keep the empty ring keyed by SurfaceView id so an already-dispatched
-    // frame can still finish without dereferencing freed state. Reusing the
-    // same key later allocates a fresh pool; the map entry itself is tiny.
+    // Completion owns the old ring and must never touch a replacement for key.
     std::lock_guard<std::mutex> lock(ring->mutex);
-    for (auto& slot : ring->slots) {
-        if (slot.image) CFRelease(slot.image);
-        slot.image = nullptr;
-        slot.dispatched = false;
-    }
-    ring->slots.clear();
-    ring->width = 0;
-    ring->height = 0;
+    ring->retired = true;
 }
 
-bool MacapkWriteSurfaceIOSurfaceImpl(int key, int width, int height,
-                                     const uint32_t* pixels,
-                                     IOSurfaceRef* image, int* slotIndex) {
-    if (key <= 0 || width <= 0 || height <= 0 || !pixels || !image || !slotIndex)
-        return false;
-    MacapkSurfaceIOSurfaceRing* ring = MacapkSurfaceIOSurfaceRingFor(key);
+bool MacapkSurfaceIOSurfaceRingIsLive(const SurfaceRingLease& ring) {
     std::lock_guard<std::mutex> lock(ring->mutex);
+    return !ring->retired;
+}
+
+SurfaceRingLease MacapkWriteSurfaceIOSurface(int key, int width, int height,
+                                            const uint32_t* pixels,
+                                            IOSurfaceRef* image, int* slotIndex) {
+    if (key <= 0 || width <= 0 || height <= 0 || !pixels || !image || !slotIndex)
+        return {};
+    SurfaceRingLease ring;
+    {
+        std::lock_guard<std::mutex> lock(g_surface_iosurface_rings_mu);
+        auto& current = g_surface_iosurface_rings[key];
+        if (!current) current = std::make_shared<MacapkSurfaceIOSurfaceRing>();
+        ring = current;
+    }
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    if (ring->retired) return {};
     if (ring->width != width || ring->height != height) {
         bool anyDispatched = false;
         for (const auto& slot : ring->slots) anyDispatched |= slot.dispatched;
-        if (anyDispatched) return false;
+        if (anyDispatched) return {};
         for (auto& slot : ring->slots)
             if (slot.image) { CFRelease(slot.image); slot.image = nullptr; }
         ring->slots.clear();
@@ -10167,17 +10722,17 @@ bool MacapkWriteSurfaceIOSurfaceImpl(int key, int width, int height,
         if (fallbacks <= 5 || fallbacks % 300 == 0)
             std::fprintf(stderr, "[surface-iosurface] busy fallback=%llu key=%d\n",
                          (unsigned long long)fallbacks, key);
-        return false;
+        return {};
     }
     MacapkSurfaceIOSurfaceSlot& slot = ring->slots[(size_t) selected];
     if (!slot.image
         || IOSurfaceLock(slot.image, 0, nullptr) != kIOReturnSuccess)
-        return false;
+        return {};
     auto* base = static_cast<uint32_t*>(IOSurfaceGetBaseAddress(slot.image));
     const size_t stridePx = IOSurfaceGetBytesPerRow(slot.image) / 4;
     if (!base || stridePx < (size_t) width) {
         IOSurfaceUnlock(slot.image, 0, nullptr);
-        return false;
+        return {};
     }
     for (int y = 0; y < height; ++y)
         macapk_premultiply_argb(base + (size_t) y * stridePx,
@@ -10194,11 +10749,10 @@ bool MacapkWriteSurfaceIOSurfaceImpl(int key, int width, int height,
                      "[surface-iosurface] frame=%llu key=%d slot=%d size=%dx%d id=%u\n",
                      (unsigned long long)frames, key, selected, width, height,
                      (unsigned)IOSurfaceGetID(slot.image));
-    return true;
+    return ring;
 }
 
-void MacapkFinishSurfaceIOSurfaceImpl(int key, int slotIndex) {
-    MacapkSurfaceIOSurfaceRing* ring = MacapkSurfaceIOSurfaceRingFor(key);
+void MacapkFinishSurfaceIOSurface(const SurfaceRingLease& ring, int slotIndex) {
     std::lock_guard<std::mutex> lock(ring->mutex);
     if (slotIndex >= 0 && (size_t) slotIndex < ring->slots.size())
         ring->slots[(size_t) slotIndex].dispatched = false;
@@ -10314,17 +10868,7 @@ void MacapkNoteHeartbeatDiff(const MacapkStaleSet& chg, int w) {
 }  // namespace
 
 static void MacapkReleaseSurfaceIOSurfaceRingForKey(int key) {
-    MacapkReleaseSurfaceIOSurfaceRingForKeyImpl(key);
-}
-
-bool MacapkWriteSurfaceIOSurface(int key, int width, int height,
-                                 const uint32_t* pixels,
-                                 IOSurfaceRef* image, int* slotIndex) {
-    return MacapkWriteSurfaceIOSurfaceImpl(key, width, height, pixels, image, slotIndex);
-}
-
-void MacapkFinishSurfaceIOSurface(int key, int slotIndex) {
-    MacapkFinishSurfaceIOSurfaceImpl(key, slotIndex);
+    MacapkRetireSurfaceIOSurfaceRing(key);
 }
 
 // Flags, mirrored by NativeCocoa.PRESENT_FLAG_*.
@@ -11932,15 +12476,16 @@ static void recenter_placeholder_next_cycle() {
         // Phase 2a: a fullscreen window (or one mid-transition) has no frame
         // of ours to centre -- AppKit owns it.
         if (window_is_fullscreen() || g_fs_transition) return;
-        NSScreen* screen = [g_placeholder_window screen];
-        if (!screen) screen = MacapkPreferredLaunchScreen();
+        NSScreen* screen = MacapkAnchorScreenForPlaceholder(g_placeholder_window);
         if (!screen) return;
+        g_window_display_id.store(MacapkScreenDisplayID(screen));
         NSRect vis = [screen visibleFrame];
         NSRect fr  = [g_placeholder_window frame];
+        fr.origin.x = vis.origin.x + (vis.size.width  - fr.size.width)  / 2.0;
+        fr.origin.y = vis.origin.y + (vis.size.height - fr.size.height) / 2.0;
+        fr = MacapkClampFrameToVisible(fr, vis);
         ++g_own_frame_change;
-        [g_placeholder_window setFrameOrigin:NSMakePoint(
-            vis.origin.x + (vis.size.width  - fr.size.width)  / 2.0,
-            vis.origin.y + (vis.size.height - fr.size.height) / 2.0)];
+        [g_placeholder_window setFrameOrigin:fr.origin];
         --g_own_frame_change;
     });
 }
@@ -11971,8 +12516,8 @@ static void reshape_placeholder_to_globals_main(ReshapeAnchor anchor) {
     SFTRACE("reshape ENTER phone=%dx%d curFrame=%.0fx%.0f",
             nw, nh, [g_placeholder_window frame].size.width,
             [g_placeholder_window frame].size.height);
-    NSScreen* screen = [g_placeholder_window screen];
-    if (!screen) screen = MacapkPreferredLaunchScreen();
+    NSScreen* screen = MacapkAnchorScreenForPlaceholder(g_placeholder_window);
+    if (screen) g_window_display_id.store(MacapkScreenDisplayID(screen));
     NSRect vis = screen ? [screen visibleFrame] : NSMakeRect(0, 0, nw, nh);
     // Fit the CONTENT budget (visible frame minus the title bar), so the frame
     // set below is never one AppKit has to constrain -- see
@@ -12016,14 +12561,11 @@ static void reshape_placeholder_to_globals_main(ReshapeAnchor anchor) {
         const NSRect old = [g_placeholder_window frame];
         newFrame.origin.x = NSMidX(old) - newFrame.size.width / 2.0;
         newFrame.origin.y = NSMidY(old) - newFrame.size.height / 2.0;
-        if (NSMaxX(newFrame) > NSMaxX(vis)) newFrame.origin.x = NSMaxX(vis) - newFrame.size.width;
-        if (newFrame.origin.x < vis.origin.x) newFrame.origin.x = vis.origin.x;
-        if (NSMaxY(newFrame) > NSMaxY(vis)) newFrame.origin.y = NSMaxY(vis) - newFrame.size.height;
-        if (newFrame.origin.y < vis.origin.y) newFrame.origin.y = vis.origin.y;
     } else {
         newFrame.origin.x = vis.origin.x + (vis.size.width  - newFrame.size.width)  / 2.0;
         newFrame.origin.y = vis.origin.y + (vis.size.height - newFrame.size.height) / 2.0;
     }
+    newFrame = MacapkClampFrameToVisible(newFrame, vis);
     ++g_own_frame_change;   // ours, not a user resize (windowDidResize)
     [g_placeholder_window setFrame:newFrame display:YES animate:NO];
     --g_own_frame_change;
@@ -12368,8 +12910,10 @@ void CocoaShowWindow(void* window) {
     NSWindow* w = (__bridge NSWindow*)window;
     dispatch_main_async_void(^{
         if (MacApkServiceHost()) { /* background service process: never shown */ }
-        else if (MacApkHarnessNoActivate()) [w orderBack:nil];
-        else {
+        else if (MacApkHarnessNoActivate()) {
+            if (MacApkAutomationMode()) [w orderFrontRegardless];
+            else [w orderBack:nil];
+        } else {
             [w makeKeyAndOrderFront:nil];
             [g_app activateIgnoringOtherApps:YES];
             MacApkFocusLogAfterShow("window shown +1.5s");
@@ -13201,6 +13745,141 @@ static bool MacApkMousePointerEnabled() {
     return YES;
 }
 
+// RELATIVE MOUSE (MACAPK_MOUSE_RELATIVE, default OFF): the mcpelauncher recipe
+// (game-window src/window_sdl3.cpp:347-379 and mcpelauncher-client
+// src/window_callbacks.cpp:221-239). An absolute pointer can never turn a
+// camera: once the window holds the pointer, everything is a DELTA. Taking the
+// pointer away is CGAssociateMouseAndMouseCursorPosition(false) (SDL equivalent:
+// SDL_SetWindowRelativeMouseMode) plus a hidden cursor, and each motion is then
+// handed over as SOURCE_MOUSE_RELATIVE + HOVER_MOVE with x/y = dx/dy -- the pair
+// Android's CursorInputMapper sends for a captured pointer, which our own NDK
+// shim already forwards verbatim (bionic_shim_nativeactivity.cpp:632,
+// :658-660). Default OFF and opt-in per app (launcher Get Info > environment):
+// the capture is process-wide and hides the Mac cursor for every window this
+// runtime owns.
+//
+// WHO decides: the app, through Android's own captured-pointer API
+// (View.requestPointerCapture / releasePointerCapture, granted by
+// TouchDispatcher). Taking the cursor on the first motion instead hid the
+// pointer before the first click: Minecraft's menus own an ordinary pointer
+// and became unreachable. macapkHostPointerCaptureWanted polls the app's
+// request, so a menu that released the capture keeps its cursor.
+static bool MacApkMouseRelativeEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("MACAPK_MOUSE_RELATIVE");
+        // An extension of the host-mouse path, not a replacement: with
+        // MACAPK_MOUSE_POINTER=0 the clicks still go out as a finger and a held
+        // cursor would leave the app with a frozen pointer, a delta stream and
+        // a touchscreen click at that stuck point.
+        return v && std::strcmp(v, "1") == 0 && MacApkMousePointerEnabled();
+    }();
+    return on;
+}
+static bool g_rel_mouse_on = false;   // main thread only, like g_host_mouse_buttons
+// Set when the user asked the cursor back (Cmd). A capture that returned on the
+// very next motion would make that request useless: the pointer is frozen
+// exactly where it was released, inside the view, so every attempt to move it
+// away would re-capture it and the cursor could never reach the menu bar or the
+// Dock. Only a press re-engages look mode.
+static bool g_rel_mouse_released = false;
+
+// Mirrors the capture state into TouchDispatcher.setHostMouseRelative, so a
+// click made while the cursor is held stays a mouse click (SOURCE_MOUSE with a
+// button) instead of falling back to the touchscreen-finger path a TAKEN input
+// queue otherwise gives it (TouchDispatcher.dispatchHostMouse).
+- (void)macapkSetRelativeMouse:(BOOL)on {
+    if (!MacApkMouseRelativeEnabled() || on == g_rel_mouse_on) return;
+    g_rel_mouse_on = on;
+    // Both effects are process-local: the WindowServer drops the association
+    // and NSCursor's hidden count when this process exits, so a crash cannot
+    // leave the Mac without a cursor. Paired by state, never by call count.
+    CGAssociateMouseAndMouseCursorPosition(!on);
+    if (on) [NSCursor hide]; else [NSCursor unhide];
+    if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) return;
+    JNIEnv* env = nullptr;
+    JavaVM* vm = macapk::g_touch_vm;
+    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
+    if (r == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return;
+    } else if (r != JNI_OK || !env) return;
+    static jmethodID mid = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
+        mid = env->GetMethodID(cls, "setHostMouseRelative", "(Z)V");
+        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+    }
+    if (!mid) return;
+    env->CallVoidMethod(macapk::g_touch_dispatcher, mid, (jboolean) on);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+// Gives the cursor back and keeps it free until the user presses in the view.
+- (void)macapkReleaseRelativeMouse {
+    g_rel_mouse_released = true;
+    [self macapkSetRelativeMouse:NO];
+}
+
+// One motion as a relative event. AppKit's deltaX/deltaY are exactly what
+// SDL3's cocoa backend passes as xrel / yrel, so sign and scale match
+// mcpelauncher's stream with nothing to convert; the game applies its own
+// sensitivity. Return YES = handled (the absolute paths must not run too).
+- (BOOL)macapkHostMouseRelative:(NSEvent*)event {
+    if (!MacApkMouseRelativeEnabled() || !g_rel_mouse_on) return NO;
+    if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) return NO;
+    JNIEnv* env = nullptr;
+    JavaVM* vm = macapk::g_touch_vm;
+    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
+    if (r == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return NO;
+    } else if (r != JNI_OK || !env) return NO;
+    static jmethodID mid = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
+        mid = env->GetMethodID(cls, "dispatchHostMouseRelative", "(FF)V");
+        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+    }
+    if (!mid) return NO;
+    macapk::MacApkInputPriorityBegin();
+    env->CallVoidMethod(macapk::g_touch_dispatcher, mid,
+                        (jfloat) [event deltaX], (jfloat) [event deltaY]);
+    macapk::MacApkInputPriorityEnd();
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    return YES;
+}
+
+// Does the APP hold pointer capture? Polled rather than pushed: the runtime
+// has no Java-to-Cocoa callback in this build, and the only moment the answer
+// matters is an event that arrives while the cursor is still free.
+- (BOOL)macapkHostPointerCaptureWanted {
+    if (!MacApkMouseRelativeEnabled()) return NO;
+    if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) return NO;
+    JNIEnv* env = nullptr;
+    JavaVM* vm = macapk::g_touch_vm;
+    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
+    if (r == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return NO;
+    } else if (r != JNI_OK || !env) return NO;
+    static jmethodID mid = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
+        mid = env->GetMethodID(cls, "hostPointerCaptureWanted", "()Z");
+        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+    }
+    if (!mid) return NO;
+    jboolean want = env->CallBooleanMethod(macapk::g_touch_dispatcher, mid);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return NO; }
+    return want == JNI_TRUE;
+}
+
 // HOVER (GitHub #25, MACAPK_HOVER_EVENTS default ON): AppKit sends mouseMoved: /
 // mouseExited: to a view only through a tracking area. Pointer movement with no
 // button held goes through macapkHostMouse:press:0 (an unchanged, empty button
@@ -13217,7 +13896,10 @@ static bool MacApkHoverEnabled() {
 }
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
-    if (!MacApkHoverEnabled() || !MacApkMousePointerEnabled()) return;
+    if (!MacApkMousePointerEnabled()) return;
+    // Relative mode needs this area too: its NSTrackingMouseMoved option is the
+    // only way a buttonless motion reaches the view at all.
+    if (!MacApkHoverEnabled() && !MacApkMouseRelativeEnabled()) return;
     for (NSTrackingArea* ta in [self.trackingAreas copy]) {
         if (ta.owner == self && ta.userInfo[@"macapk.hover"]) [self removeTrackingArea:ta];
     }
@@ -13230,6 +13912,20 @@ static bool MacApkHoverEnabled() {
     [self addTrackingArea:ta];
 }
 - (void)mouseMoved:(NSEvent*)event {
+    // While the cursor is held there is no pointer left to hover: the motion is
+    // a delta. Capture is taken only while the app holds it (its own
+    // requestPointerCapture) and is given back as soon as the app drops it, so a
+    // menu that released the capture gets its pointer on the very next motion.
+    // It also ends in macapkWindowResignedKey:, flagsChanged: (Cmd) or
+    // viewWillMoveToWindow:; after an explicit release it takes a press, see
+    // g_rel_mouse_released.
+    if (MacApkMouseRelativeEnabled() && !g_rel_mouse_released
+            && [[self window] isKeyWindow] && [self macapkHostPointerCaptureWanted]) {
+        [self macapkSetRelativeMouse:YES];
+    } else if (g_rel_mouse_on) {
+        [self macapkSetRelativeMouse:NO];
+    }
+    if ([self macapkHostMouseRelative:event]) return;
     if (!MacApkHoverEnabled() || ![self macapkHostMouse:event press:0]) [super mouseMoved:event];
 }
 - (void)mouseExited:(NSEvent*)event {
@@ -13269,12 +13965,34 @@ static bool MacApkHoverEnabled() {
         [w makeKeyAndOrderFront:nil];
         [NSApp activate];
     }
+    // A press is the deliberate way back into look mode after a release, but
+    // only the app can make look mode available at all: without its capture
+    // request this click stays an ordinary click in the menu.
+    if (MacApkMouseRelativeEnabled() && [[self window] isKeyWindow]
+            && [self macapkHostPointerCaptureWanted]) {
+        g_rel_mouse_released = false;
+        [self macapkSetRelativeMouse:YES];
+    }
     if ([self macapkHostMouse:event press:1]) return;
     [self dispatchMouseAction:0 atEvent:event];
 }
 - (void)mouseDragged:(NSEvent*)event {
+    if ([self macapkHostMouseRelative:event]) return;
     if ([self macapkHostMouse:event press:0]) return;
     [self dispatchMouseAction:2 atEvent:event];
+}
+
+// Cmd is the way back out of a held cursor: the game consumes Esc, and every
+// Mac gesture the user may need next (Cmd+Tab, Cmd+Q, Cmd+click on the Dock)
+// needs a real pointer. The cursor stays free (macapkReleaseRelativeMouse) so
+// the pointer can actually travel to where it is needed; a press over the view
+// re-engages look mode.
+- (void)flagsChanged:(NSEvent*)event {
+    if (MacApkMouseRelativeEnabled()
+            && ([event modifierFlags] & NSEventModifierFlagCommand) != 0) {
+        [self macapkReleaseRelativeMouse];
+    }
+    [super flagsChanged:event];
 }
 
 // HOST TRACKPAD CONTACTS -> Android multi-pointer (MACAPK_TRACKPAD_MULTITOUCH, default ON).
@@ -13321,10 +14039,12 @@ static int g_tpNextId = 0;
 // tells the mapper every contact is gone (it CANCELs a live hold and forgets them),
 // so no ghost pointer outlives the view that owned it.
 - (void)viewWillMoveToWindow:(NSWindow*)newWindow {
-    if (MacapkTrackpadMultitouchOn()) {
+    // Loss of key ends BOTH a live trackpad contact and a held cursor, so the
+    // observer is registered for either feature.
+    if (MacapkTrackpadMultitouchOn() || MacApkMouseRelativeEnabled()) {
         NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
         if (self.window) {
-            [self macapkTrackpadReset];
+            if (MacapkTrackpadMultitouchOn()) [self macapkTrackpadReset];
             [nc removeObserver:self name:NSWindowDidResignKeyNotification object:self.window];
         }
         if (newWindow) {
@@ -13332,12 +14052,18 @@ static int g_tpNextId = 0;
                        name:NSWindowDidResignKeyNotification object:newWindow];
         }
     }
+    // A view leaving its window can never legitimately keep the cursor: the
+    // window it held it for is gone.
+    if (!newWindow) [self macapkSetRelativeMouse:NO];
     [super viewWillMoveToWindow:newWindow];
 }
 
 - (void)macapkWindowResignedKey:(NSNotification*)note {
     (void)note;
-    [self macapkTrackpadReset];
+    // Plain release, no latch: a window the user comes back to hands the cursor
+    // over again on the first motion over the view, as before.
+    [self macapkSetRelativeMouse:NO];
+    if (MacapkTrackpadMultitouchOn()) [self macapkTrackpadReset];
 }
 
 - (void)macapkTrackpadReset {
@@ -13366,8 +14092,14 @@ static int g_tpNextId = 0;
     [self macapkTrackpadClaimForButton];
     if (![self macapkHostMouse:event press:1]) [super otherMouseDown:event];
 }
-- (void)rightMouseDragged:(NSEvent*)event { if (![self macapkHostMouse:event press:0]) [super rightMouseDragged:event]; }
-- (void)otherMouseDragged:(NSEvent*)event { if (![self macapkHostMouse:event press:0]) [super otherMouseDragged:event]; }
+- (void)rightMouseDragged:(NSEvent*)event {
+    if ([self macapkHostMouseRelative:event]) return;
+    if (![self macapkHostMouse:event press:0]) [super rightMouseDragged:event];
+}
+- (void)otherMouseDragged:(NSEvent*)event {
+    if ([self macapkHostMouseRelative:event]) return;
+    if (![self macapkHostMouse:event press:0]) [super otherMouseDragged:event];
+}
 - (void)rightMouseUp:(NSEvent*)event { if (![self macapkHostMouse:event press:-1]) [super rightMouseUp:event]; }
 - (void)otherMouseUp:(NSEvent*)event { if (![self macapkHostMouse:event press:-1]) [super otherMouseUp:event]; }
 
@@ -15103,6 +15835,8 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
 @implementation MacApkV2RenderDelegate
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {
+    if (lastDrawableW != (int)size.width || lastDrawableH != (int)size.height)
+        macapk::g_surface_drawable_epoch.fetch_add(1, std::memory_order_acq_rel);
     lastDrawableW = (int)size.width;
     lastDrawableH = (int)size.height;
     // v1.0.503: keep the render sublayers' GEOMETRY (frame) matched to the view
@@ -15855,8 +16589,12 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
             std::fflush(stderr);
         }
     }
-    if (macapk::g_video_layer && macapk::g_video_attached_view == view)
-        macapk::MacapkApplyVideoLayerGeometry(env, view);
+    if (macapk::g_video_layer) {
+        if (macapk::g_video_attached_view == view)
+            macapk::MacapkApplyVideoLayerGeometry(env, view);
+        else if (view == macapk::MacapkPreferredVideoHostView())
+            macapk::MacapkEnsureVideoLayerOnMain();
+    }
     // 2026-09-26: the per-surface layers (CocoaPresentSurfaceBitmapFrom) follow
     // their views between frames too; one nil/count check when there are none.
     macapk::MacapkApplySurfaceLayersGeometry(env);
@@ -16113,6 +16851,37 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
             if (!angleInitOk) {
                 std::fprintf(stderr, "[E] cocoa_v2: AngleInit failed -- frames will no-op\n");
             }
+        }
+    } else if (angleInitOk && view.window
+               && !macapk::g_native_egl_surface_live.load(std::memory_order_relaxed)
+               && macapk::AngleBoundLayer() != (__bridge void*)self.angleLayer) {
+        // This view drew before and its ANGLE surface was taken by another
+        // view since. The framework EGL surface is process-wide: AngleInit
+        // rebinds it to whichever MTKView initializes LAST, so when an
+        // activity starts on top (a translucent WebView activity, say), its
+        // fresh view moves the surface to its own angleLayer. When that
+        // activity finishes and this view is back in the window, nothing
+        // moved the surface back -- angleInitTried was already YES here -- so
+        // every frame kept presenting into the departed view's layer and the
+        // window froze on the last frame drawn before the activity started,
+        // while the app itself kept running and taking input. Android gives
+        // the returning activity's SurfaceView a valid surface again on
+        // resume; this is that step. Only a window-attached view draws (see
+        // g_active_render_view above), so two views can't trade the surface
+        // back and forth, and a steady-state tick costs one pointer compare.
+        // Not once a native-EGL engine owns rendering: AngleInit makes the
+        // framework context current again after AngleFinish drained and
+        // released it, and the guest_owns path below neither ends that frame
+        // nor drains again, so a framework buffer would be stranded on the
+        // shared Metal FIFO -- the v1.0.573 hazard the AngleResize calls guard
+        // the same way. Such an engine presents on its own layer anyway.
+        CGSize sz = self.angleLayer.drawableSize;
+        if (sz.width > 0 && sz.height > 0) {
+            angleInitOk = macapk::AngleInit((__bridge void*)self.angleLayer,
+                                             (int)sz.width, (int)sz.height);
+            std::fprintf(stderr,
+                "[I] cocoa_v2: ANGLE surface rebound to the returning view's layer%s\n",
+                angleInitOk ? "" : " FAILED -- frames will no-op");
         }
     }
     // v1.0.573: once a native-EGL engine (Unity / bgfx-RenderDragon / custom)

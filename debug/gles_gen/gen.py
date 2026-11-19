@@ -574,10 +574,28 @@ def emit_egl_java(cls):
             out.append("    public static final int %s = %s;\n" % (name, val))
     if consts: out.append("\n")
     # Object handle fields: EGL_NO_DISPLAY etc. = handle 0 wrappers.
-    for typ, name in objfields:
-        out.append("    public static final %s %s = new %s(0L);\n"
-                   % (typ, name, typ))
-    if objfields: out.append("\n")
+    if objfields:
+        if cls == "EGL15":
+            out.append("    // The five handle sentinels. AOSP EGL15 declares these `public static final`\n")
+            out.append("    // (EGL14's same-named fields are non-final). They ALIAS EGL14's instances on\n")
+            out.append("    // purpose: apps compare handles with reference equality against values that\n")
+            out.append("    // came back from EGL14 entry points, so two distinct \"no display\" objects\n")
+            out.append("    // would make `display == EGL15.EGL_NO_DISPLAY` answer false for a display\n")
+            out.append("    // EGL14 itself reported as absent.\n")
+            for typ, name in objfields:
+                if name in ("EGL_NO_CONTEXT", "EGL_NO_DISPLAY", "EGL_NO_SURFACE"):
+                    out.append("    public static final %s %s = EGL14.%s;\n" % (typ, name, name))
+                elif name == "EGL_NO_IMAGE":
+                    out.append("    public static final %s   %s   = new %s(0L);\n" % (typ, name, typ))
+                elif name == "EGL_NO_SYNC":
+                    out.append("    public static final %s    %s    = new %s(0L);\n" % (typ, name, typ))
+                else:
+                    out.append("    public static final %s %s = new %s(0L);\n" % (typ, name, typ))
+        else:
+            for typ, name in objfields:
+                out.append("    public static final %s %s = new %s(0L);\n"
+                           % (typ, name, typ))
+        out.append("\n")
     for ret, name, params in natives:
         dp = ", ".join("%s a%d" % (egl_jtype(p), i)
                        for i, p in enumerate(params))
@@ -592,6 +610,29 @@ def emit_egl_java(cls):
     if cls == "EGL14":
         out.append("    public static native EGLSurface eglCreateWindowSurface("
                    "EGLDisplay a0, EGLConfig a1, Object a2, int[] a3, int a4);\n")
+    if cls == "EGLExt":
+        out.append("\n")
+        out.append("    /**\n")
+        out.append("     * AOSP EGLExt.eglDupNativeFenceFDANDROID(EGLDisplay, EGLSync) (API 33):\n")
+        out.append("     * duplicate an EGLSync's underlying Linux sync_file fd as a SyncFence.\n")
+        out.append("     *\n")
+        out.append("     * Deliberately NOT a native bridge. Mac.apk has no sync_file: host GPU\n")
+        out.append("     * synchronisation is a Metal shared event behind ANGLE, and no fd ever\n")
+        out.append("     * reaches guest Java. AOSP's documented answer when the fence cannot be\n")
+        out.append("     * duplicated is an INVALID SyncFence, and that is exactly what we can\n")
+        out.append("     * honestly produce -- isValid() false, getSignalTime() SIGNAL_TIME_INVALID,\n")
+        out.append("     * await returning immediately. Callers already branch on isValid(), because\n")
+        out.append("     * real devices return invalid fences too (querying a frame that produced\n")
+        out.append("     * none).\n")
+        out.append("     *\n")
+        out.append("     * A fence claiming it signalled would make a caller believe it waited for\n")
+        out.append("     * GPU work that never happened, and it would then read a half-drawn buffer\n")
+        out.append("     * -- a failure that surfaces far from here. Absent-and-honest beats plausible.\n")
+        out.append("     */\n")
+        out.append("    public static android.hardware.SyncFence eglDupNativeFenceFDANDROID(\n")
+        out.append("            EGLDisplay display, EGLSync sync) {\n")
+        out.append("        return android.hardware.SyncFence.createEmpty();\n")
+        out.append("    }\n")
     out.append("}\n")
     with open(os.path.join(JAVA_DIR, cls + ".java"), "w") as f:
         f.write("".join(out))

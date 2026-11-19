@@ -242,7 +242,8 @@ public final class VideoImageSelfTest {
                         byte[] au = vcl.get(nextVcl).withStartCode;
                         ib.clear();
                         ib.put(au);
-                        codec.queueInputBuffer(ii, 0, au.length, pts, 0);
+                        int flags = (nextVcl + 1 >= vcl.size()) ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0;
+                        codec.queueInputBuffer(ii, 0, au.length, pts, flags);
                         pts += 100000;
                         nextVcl++;
                         fed++;
@@ -257,20 +258,26 @@ public final class VideoImageSelfTest {
                     NativeLog.i(TAG, "output format changed: " + codec.getOutputFormat());
                 } else if (oi >= 0) {
                     progressed = true;
-                    Image img = codec.getOutputImage(oi);
-                    if (img != null) {
-                        NativeLog.i(TAG, "frame " + decodedRgb.size() + ": format=0x"
-                            + Integer.toHexString(img.getFormat()) + " " + img.getWidth() + "x"
-                            + img.getHeight() + " planes=" + img.getPlanes().length
-                            + " crop=" + img.getCropRect() + " pts=" + img.getTimestamp());
-                        int[] rgb = imageToRgb(img);
-                        decodedRgb.add(rgb);
-                        lastW = img.getWidth(); lastH = img.getHeight();
-                        img.close();
-                    } else {
-                        NativeLog.e(TAG, "getOutputImage(" + oi + ") returned null");
+                    boolean isEos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                    if (info.size > 0) {
+                        Image img = codec.getOutputImage(oi);
+                        if (img != null) {
+                            NativeLog.i(TAG, "frame " + decodedRgb.size() + ": format=0x"
+                                + Integer.toHexString(img.getFormat()) + " " + img.getWidth() + "x"
+                                + img.getHeight() + " planes=" + img.getPlanes().length
+                                + " crop=" + img.getCropRect() + " pts=" + img.getTimestamp());
+                            int[] rgb = imageToRgb(img);
+                            decodedRgb.add(rgb);
+                            lastW = img.getWidth(); lastH = img.getHeight();
+                            img.close();
+                        } else {
+                            NativeLog.e(TAG, "getOutputImage(" + oi + ") returned null");
+                        }
                     }
                     codec.releaseOutputBuffer(oi, false);
+                    if (isEos || decodedRgb.size() >= vcl.size()) {
+                        break;
+                    }
                 }
                 if (progressed) emptyPolls = 0;
                 else {

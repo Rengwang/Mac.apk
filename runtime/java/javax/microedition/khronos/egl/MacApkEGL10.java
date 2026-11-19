@@ -232,6 +232,12 @@ public final class MacApkEGL10 implements EGL10 {
      *  framework's and the NDK's (both EGL_DEFAULT_DISPLAY = 0): ASCII "JE10". */
     private static final long DISPLAY_TOKEN = 0x4A453130L;
     private static final int EGL_CLIENT_APIS = 0x308D;
+    /** MACAPK_EGL10_KEYED_SURFACEVIEW (default ON): render SurfaceView-backed
+     *  EGL10 window surfaces directly into their keyed per-surface CAMetalLayer
+     *  via ANGLE, avoiding Pbuffer + synchronous CPU glReadPixels. =0 reverts
+     *  to the SurfaceTexture / MacApkGlWindow path. */
+    private static final boolean KEYED_SURFACEVIEW_WINDOW =
+        !"0".equals(System.getenv("MACAPK_EGL10_KEYED_SURFACEVIEW"));
 
     /** EGLDisplayImpl: our one ANGLE display, AOSP's refcounted
      *  initialize/terminate (frameworks/native opengl/libs/EGL/
@@ -282,12 +288,28 @@ public final class MacApkEGL10 implements EGL10 {
      *  back this same object, so no second wrapper can disagree). */
     static final class RealSurface extends EGLSurface {
         final RealDisplay dpy;
-        final android.opengl.EGLSurface pbuffer;   // null for a window
-        final MacApkGlWindow window;               // null for a pbuffer
+        final android.opengl.EGLSurface pbuffer;   // null for a SurfaceTexture window
+        final MacApkGlWindow window;               // null for a pbuffer or direct keyed layer
+        final android.view.SurfaceView directSurfaceView; // non-null for keyed SurfaceView layer
+        final SurfaceTexture directSurfaceTexture;        // non-null for keyed TextureView layer
+        final int directSurfaceKey;
+        volatile boolean directFirstFrameNoted;
         private final int hash;
         volatile boolean destroyed;
         RealSurface(RealDisplay d, android.opengl.EGLSurface pbuffer, MacApkGlWindow window) {
+            this(d, pbuffer, window, null, 0, null);
+        }
+        RealSurface(RealDisplay d, android.opengl.EGLSurface pbuffer, MacApkGlWindow window,
+                android.view.SurfaceView directSurfaceView, int directSurfaceKey) {
+            this(d, pbuffer, window, directSurfaceView, directSurfaceKey, null);
+        }
+        RealSurface(RealDisplay d, android.opengl.EGLSurface pbuffer, MacApkGlWindow window,
+                android.view.SurfaceView directSurfaceView, int directSurfaceKey,
+                SurfaceTexture directSurfaceTexture) {
             dpy = d; this.pbuffer = pbuffer; this.window = window;
+            this.directSurfaceView = directSurfaceView;
+            this.directSurfaceKey = directSurfaceKey;
+            this.directSurfaceTexture = directSurfaceTexture;
             hash = Long.hashCode(nativeSurface().getNativeHandle());
         }
         android.opengl.EGLSurface nativeSurface() {
@@ -562,24 +584,14 @@ public final class MacApkEGL10 implements EGL10 {
             return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
         }
         // EGLImpl.eglCreateWindowSurface's dispatch, in its order.
-        SurfaceTexture st;
+        android.view.Surface s = null;
+        SurfaceTexture st = null;
         if (nativeWindow instanceof android.view.SurfaceView) {
-            android.view.Surface s = ((android.view.SurfaceView) nativeWindow).getHolder().getSurface();
-            st = s != null ? s.macapkEnsureEglStream() : null;
-            if (st == null) return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
+            s = ((android.view.SurfaceView) nativeWindow).getHolder().getSurface();
         } else if (nativeWindow instanceof android.view.SurfaceHolder) {
-            android.view.Surface s = ((android.view.SurfaceHolder) nativeWindow).getSurface();
-            st = s != null ? s.macapkEnsureEglStream() : null;
-            if (st == null) return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
+            s = ((android.view.SurfaceHolder) nativeWindow).getSurface();
         } else if (nativeWindow instanceof android.view.Surface) {
-            android.view.Surface s = (android.view.Surface) nativeWindow;
-            st = s.macapkEnsureEglStream();
-            if (st == null) return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
-            if (!s.isValid()) {
-                // jni_eglCreateWindowSurface's not_valid_surface branch.
-                throw new IllegalArgumentException(
-                    "Make sure the SurfaceView or associated SurfaceHolder has a valid Surface");
-            }
+            s = (android.view.Surface) nativeWindow;
         } else if (nativeWindow instanceof SurfaceTexture) {
             st = (SurfaceTexture) nativeWindow;
         } else {
@@ -587,11 +599,29 @@ public final class MacApkEGL10 implements EGL10 {
                 "eglCreateWindowSurface() can only be called with an instance of "
                 + "Surface, SurfaceView, SurfaceHolder or SurfaceTexture at the moment.");
         }
+        if (nativeWindow != st) {
+            if (s == null) return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
+            if (!s.isValid()) {
+                // jni_eglCreateWindowSurface's not_valid_surface branch.
+                throw new IllegalArgumentException(
+                    "Make sure the SurfaceView or associated SurfaceHolder has a valid Surface");
+            }
+            st = s.macapkGetSurfaceTexture();
+            if (st == null && config instanceof RealConfig) {
+                RealSurface direct = tryCreateKeyedSurfaceViewWindow(
+                    d, (RealConfig) config, s, nativeWindow, attribList);
+                if (direct != null) return direct;
+            }
+            if (st == null) st = s.macapkEnsureEglStream();
+            if (st == null) return legacyCreateWindowSurface(display, config, nativeWindow, attribList);
+        }
         if (!(config instanceof RealConfig)) {
             setError(EGL_BAD_CONFIG);
             return EGL_NO_SURFACE;
         }
         RealConfig c = (RealConfig) config;
+        RealSurface directTv = tryCreateKeyedTextureViewWindow(d, c, st, nativeWindow, attribList);
+        if (directTv != null) return directTv;
         nativeCall();
         MacApkGlWindow.Created made = MacApkGlWindow.create(d.h, c.h, st, true);
         if (made.window == null) {
@@ -611,6 +641,79 @@ public final class MacApkEGL10 implements EGL10 {
         return new RealSurface(d, null, made.window);
     }
 
+    /** Direct zero-readback ANGLE CAMetalLayer window surface for a SurfaceView-backed
+     *  Surface when no SurfaceTexture stream is already attached. */
+    private static RealSurface tryCreateKeyedSurfaceViewWindow(
+            RealDisplay d, RealConfig c, android.view.Surface s,
+            Object nativeWindow, int[] attribList) {
+        if (!KEYED_SURFACEVIEW_WINDOW || !keyedSurfaceNativeBound()) return null;
+        android.view.SurfaceView sv = s.macapkGetOwnerSurfaceView();
+        if (sv == null) return null;
+        int key = sv.macapkNativeWindowSurfaceKey();
+        if (key <= 0) return null;
+        if (attribList != null && (attribList.length < 1
+                || attribList[attribList.length - 1] != EGL_NONE)) {
+            throw new IllegalArgumentException();
+        }
+        nativeCall();
+        android.opengl.EGLSurface direct =
+            nativeCreateKeyedSurfaceViewWindow(d.h, c.h, key, attribList);
+        if (direct == null || direct.getNativeHandle() == 0) {
+            EGL14.eglGetError();
+            return null;
+        }
+        if (shouldLogReal()) {
+            NativeLog.i(TAG, "eglCreateWindowSurface(" + nativeWindow.getClass().getName()
+                + " key=" + key + ") -> direct CAMetalLayer window 0x"
+                + Long.toHexString(direct.getNativeHandle()));
+        }
+        return new RealSurface(d, direct, null, sv, key);
+    }
+
+    /** Direct zero-readback ANGLE CAMetalLayer window surface for a TextureView-hosted
+     *  SurfaceTexture when eligible (MACAPK_TEXTUREVIEW_DIRECT_GL_LAYER, default ON). */
+    private static RealSurface tryCreateKeyedTextureViewWindow(
+            RealDisplay d, RealConfig c, SurfaceTexture st,
+            Object nativeWindow, int[] attribList) {
+        if (st == null || !KEYED_SURFACEVIEW_WINDOW || !keyedSurfaceNativeBound()) return null;
+        if (attribList != null && (attribList.length < 1
+                || attribList[attribList.length - 1] != EGL_NONE)) {
+            throw new IllegalArgumentException();
+        }
+        int key = st.macapkConnectDirectGlLayerKey();
+        if (key <= 0) return null;
+        nativeCall();
+        android.opengl.EGLSurface direct =
+            nativeCreateKeyedSurfaceViewWindow(d.h, c.h, key, attribList);
+        if (direct == null || direct.getNativeHandle() == 0) {
+            EGL14.eglGetError();
+            st.macapkDisconnectDirectGlLayerKey(key);
+            return null;
+        }
+        if (shouldLogReal()) {
+            NativeLog.i(TAG, "eglCreateWindowSurface(" + nativeWindow.getClass().getName()
+                + " key=" + key + ") -> direct TextureView CAMetalLayer window 0x"
+                + Long.toHexString(direct.getNativeHandle()));
+        }
+        return new RealSurface(d, direct, null, null, key, st);
+    }
+
+    private static void noteDirectSurfaceFirstFrame(RealSurface s) {
+        s.directFirstFrameNoted = true;
+        int w = 0, h = 0;
+        try {
+            int[] q = new int[1];
+            if (EGL14.eglQuerySurface(s.dpy.h, s.pbuffer, EGL_WIDTH, q, 0)) w = q[0];
+            if (EGL14.eglQuerySurface(s.dpy.h, s.pbuffer, EGL_HEIGHT, q, 0)) h = q[0];
+            EGL14.eglGetError();
+        } catch (Throwable ignored) {}
+        s.directSurfaceView.macapkNoteSurfaceLayerFrame(w, h);
+        if (shouldLogReal()) {
+            NativeLog.i(TAG, "eglSwapBuffers -> direct keyed SurfaceView layer (key "
+                + s.directSurfaceKey + ") frame #1 (" + w + "x" + h + ")");
+        }
+    }
+
     @Override public boolean eglDestroySurface(EGLDisplay display, EGLSurface surface) {
         if (!realOn() || !(surface instanceof RealSurface)) return legacyDestroySurface(display, surface);
         RealSurface s = (RealSurface) surface;
@@ -619,6 +722,9 @@ public final class MacApkEGL10 implements EGL10 {
             return false;
         }
         s.destroyed = true;
+        if (s.directSurfaceTexture != null && s.directSurfaceKey > 0) {
+            s.directSurfaceTexture.macapkDisconnectDirectGlLayerKey(s.directSurfaceKey);
+        }
         nativeCall();
         return s.window != null ? s.window.destroy() : EGL14.eglDestroySurface(s.dpy.h, s.pbuffer);
     }
@@ -694,6 +800,24 @@ public final class MacApkEGL10 implements EGL10 {
             return false;
         }
         if (s.window == null) {
+            if (s.directSurfaceView != null || s.directSurfaceTexture != null) {
+                Current cur = CURRENT.get();
+                if (cur.ctx == null || cur.draw != s) {
+                    setError(EGL_BAD_SURFACE);
+                    return false;
+                }
+                nativeCall();
+                boolean ok = EGL14.eglSwapBuffers(s.dpy.h, s.pbuffer);
+                if (ok) {
+                    SurfaceTexture.macapkNoteEglDirectSwap();
+                    if (s.directSurfaceView != null && !s.directFirstFrameNoted) {
+                        noteDirectSurfaceFirstFrame(s);
+                    } else if (s.directSurfaceTexture != null && s.directSurfaceKey > 0) {
+                        s.directSurfaceTexture.macapkNoteDirectGlSwapInstance(s.directSurfaceKey);
+                    }
+                }
+                return ok;
+            }
             // EGL 1.4 §3.9.3: a swap on a pbuffer has no effect beyond the
             // implicit flush.
             nativeCall();
@@ -1037,8 +1161,25 @@ public final class MacApkEGL10 implements EGL10 {
     private static native android.opengl.EGLSurface nativeCreateSurfaceViewWindow(
         android.opengl.EGLDisplay dpy, android.opengl.EGLConfig config, int[] attribList);
 
+    private static native android.opengl.EGLSurface nativeCreateKeyedSurfaceViewWindow(
+        android.opengl.EGLDisplay dpy, android.opengl.EGLConfig config, int surfaceKey, int[] attribList);
+
     /** 0 = not probed yet, 1 = bound, -1 = missing. */
     private static volatile int sSurvivorNative;
+    private static volatile int sKeyedSurfaceNative;
+
+    private static boolean keyedSurfaceNativeBound() {
+        int v = sKeyedSurfaceNative;
+        if (v != 0) return v > 0;
+        try {
+            nativeCreateKeyedSurfaceViewWindow(null, null, 0, null);
+            v = 1;
+        } catch (UnsatisfiedLinkError e) {
+            v = -1;
+        }
+        sKeyedSurfaceNative = v;
+        return v > 0;
+    }
 
     private static boolean survivorNativeBound() {
         int v = sSurvivorNative;

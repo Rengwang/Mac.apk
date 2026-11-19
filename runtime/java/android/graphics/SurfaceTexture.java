@@ -137,6 +137,134 @@ public class SurfaceTexture {
     };
     private long mCurrentTimestamp;
     private int mCurrentDataSpace;
+    private boolean mHasCountedLatchTs;
+    private long mLastCountedLatchTsNs;
+
+    // ---- Zero-overhead consumer pipeline telemetry ------------------------
+    private static final int LATCH_WALL_RING_SIZE = 1024;
+    private static final int LATCH_WALL_RING_MASK = LATCH_WALL_RING_SIZE - 1;
+    private static final long UNSET_TS_SENTINEL = Long.MIN_VALUE;
+    private static final java.util.concurrent.atomic.AtomicLong sStatRingAccepted =
+        new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sStatRingEvicted =
+        new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sStatUpdateTexLatched =
+        new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sStatUniqueTimestampLatched =
+        new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sStatFirstLatchedTsNs =
+        new java.util.concurrent.atomic.AtomicLong(UNSET_TS_SENTINEL);
+    private static final java.util.concurrent.atomic.AtomicLong sStatLastLatchedTsNs =
+        new java.util.concurrent.atomic.AtomicLong(0L);
+    private static final java.util.concurrent.atomic.AtomicLong sStatEglDirectSwaps =
+        new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sStatEglPbufferSwaps =
+        new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLongArray sLatchWallRing =
+        new java.util.concurrent.atomic.AtomicLongArray(LATCH_WALL_RING_SIZE);
+    private static final java.util.concurrent.atomic.AtomicLong sLatchWallWriteSeq =
+        new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sLatchWallResetSeq =
+        new java.util.concurrent.atomic.AtomicLong();
+
+    private void recordUpdateTexLatchLocked(long latchedTsNs) {
+        sStatUpdateTexLatched.incrementAndGet();
+        if (!mHasCountedLatchTs || latchedTsNs != mLastCountedLatchTsNs) {
+            mHasCountedLatchTs = true;
+            mLastCountedLatchTsNs = latchedTsNs;
+            sStatUniqueTimestampLatched.incrementAndGet();
+        }
+        sStatFirstLatchedTsNs.compareAndSet(UNSET_TS_SENTINEL, latchedTsNs);
+        sStatLastLatchedTsNs.set(latchedTsNs);
+        long slot = sLatchWallWriteSeq.getAndIncrement();
+        sLatchWallRing.set((int) (slot & LATCH_WALL_RING_MASK), System.nanoTime());
+    }
+
+    public static void macapkNoteEglDirectSwap() {
+        sStatEglDirectSwaps.incrementAndGet();
+    }
+
+    public static void macapkNoteEglPbufferSwap() {
+        sStatEglPbufferSwaps.incrementAndGet();
+    }
+
+    /** Returns [ringAccepted, ringEvicted, updateTexLatched, uniqueTimestampLatched,
+     *  firstLatchedTsNs, lastLatchedTsNs, eglDirectSwaps, eglPbufferSwaps]. */
+    public static long[] macapkSnapshotConsumerStats() {
+        long first = sStatFirstLatchedTsNs.get();
+        return new long[] {
+            sStatRingAccepted.get(),
+            sStatRingEvicted.get(),
+            sStatUpdateTexLatched.get(),
+            sStatUniqueTimestampLatched.get(),
+            first == UNSET_TS_SENTINEL ? 0L : first,
+            sStatLastLatchedTsNs.get(),
+            sStatEglDirectSwaps.get(),
+            sStatEglPbufferSwaps.get(),
+        };
+    }
+
+    /** Returns [intervalCount, p50Ms, p95Ms, p99Ms, maxMs, gt50msCount, gt80msCount]. */
+    public static double[] macapkSnapshotLatchIntervals() {
+        long written = sLatchWallWriteSeq.get();
+        long resetAt = sLatchWallResetSeq.get();
+        int n = (int) Math.min((long) LATCH_WALL_RING_SIZE, Math.max(0L, written - resetAt));
+        if (n < 2) {
+            return new double[] { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+        }
+        long start = written - n;
+        long[] samples = new long[n];
+        for (int i = 0; i < n; i++) {
+            samples[i] = sLatchWallRing.get((int) ((start + i) & LATCH_WALL_RING_MASK));
+        }
+        double[] deltas = new double[n - 1];
+        int valid = 0;
+        long gt50 = 0L;
+        long gt80 = 0L;
+        for (int i = 1; i < n; i++) {
+            long prev = samples[i - 1];
+            long cur = samples[i];
+            if (prev > 0L && cur >= prev) {
+                double ms = (cur - prev) / 1_000_000.0;
+                deltas[valid++] = ms;
+                if (ms > 50.0) gt50++;
+                if (ms > 80.0) gt80++;
+            }
+        }
+        if (valid == 0) {
+            return new double[] { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+        }
+        java.util.Arrays.sort(deltas, 0, valid);
+        double p50 = roundMs2(percentileSorted(deltas, valid, 0.50));
+        double p95 = roundMs2(percentileSorted(deltas, valid, 0.95));
+        double p99 = roundMs2(percentileSorted(deltas, valid, 0.99));
+        double max = roundMs2(deltas[valid - 1]);
+        return new double[] { valid, p50, p95, p99, max, gt50, gt80 };
+    }
+
+    private static double percentileSorted(double[] sorted, int len, double q) {
+        if (len <= 0) return 0.0;
+        int idx = (int) Math.ceil(q * len) - 1;
+        if (idx < 0) idx = 0;
+        if (idx >= len) idx = len - 1;
+        return sorted[idx];
+    }
+
+    private static double roundMs2(double v) {
+        return Math.round(v * 100.0) / 100.0;
+    }
+
+    public static void macapkResetConsumerStats() {
+        sStatRingAccepted.set(0L);
+        sStatRingEvicted.set(0L);
+        sStatUpdateTexLatched.set(0L);
+        sStatUniqueTimestampLatched.set(0L);
+        sStatFirstLatchedTsNs.set(UNSET_TS_SENTINEL);
+        sStatLastLatchedTsNs.set(0L);
+        sStatEglDirectSwaps.set(0L);
+        sStatEglPbufferSwaps.set(0L);
+        sLatchWallResetSeq.set(sLatchWallWriteSeq.get());
+    }
 
     /** The one queued-but-not-yet-latched frame (the producer side). */
     private boolean mFrameAvailable;
@@ -150,6 +278,54 @@ public class SurfaceTexture {
     private long mCamSession;
     private int mCamWidth;
     private int mCamHeight;
+
+    // ---- Host TextureView binding (direct GPU CAMetalLayer path) ----------
+    private volatile java.lang.ref.WeakReference<android.view.TextureView> mHostTextureView;
+    private volatile OnFrameAvailableListener mHostUpdateListener;
+    private volatile OnFrameAvailableListener mFrameAvailableListener;
+    private volatile boolean mHasExternalFrameListener;
+    private volatile boolean mDirectVideoFrameSeen;
+
+    /** Associates this SurfaceTexture with its owning TextureView and internal
+     *  invalidate listener so MediaCodec video can composite directly through
+     *  the GPU CAMetalLayer when no external GL/callback consumer took over. */
+    public void macapkSetHostTextureView(android.view.TextureView tv,
+                                         OnFrameAvailableListener hostListener) {
+        int staleDirectKey = 0;
+        android.view.TextureView staleTv = null;
+        synchronized (mLock) {
+            android.view.TextureView prevTv = mHostTextureView != null ? mHostTextureView.get() : null;
+            if (prevTv != tv && mDirectGlLayerKey > 0) {
+                staleDirectKey = mDirectGlLayerKey;
+                staleTv = prevTv;
+                if (mProducer != null && mProducer == mDirectGlProducer) {
+                    mProducer = null;
+                }
+                mDirectGlProducer = null;
+                mDirectGlLayerKey = 0;
+                mDirectGlFirstFrameSeen = false;
+            }
+            mHostTextureView = (tv != null) ? new java.lang.ref.WeakReference<>(tv) : null;
+            mHostUpdateListener = hostListener;
+            mHasExternalFrameListener = (mFrameAvailableListener != null
+                    && mFrameAvailableListener != hostListener);
+            if (tv == null) {
+                mDirectVideoFrameSeen = false;
+                java.lang.ref.WeakReference<SurfaceTexture> ref = sDirectVideoLayerTarget;
+                if (ref != null && ref.get() == this) {
+                    sDirectVideoLayerTarget = null;
+                }
+            }
+        }
+        if (staleDirectKey > 0) {
+            sDirectGlOwnerByKey.remove(staleDirectKey);
+            if (staleTv != null) {
+                staleTv.macapkDisconnectDirectGlLayer(staleDirectKey);
+            } else {
+                android.view.SurfaceView.macapkUnpublishExternalKeyedSurface(staleDirectKey);
+            }
+        }
+    }
 
     // ---- Decoded-video frame source (guarded by mLock) --------------------
     // An ALTERNATIVE producer shape to the camera session above, for a
@@ -166,10 +342,23 @@ public class SurfaceTexture {
     private int[]   mVideoFrameArgb;
     private int     mVideoFrameW, mVideoFrameH, mVideoFrameStride;
     private boolean mHasVideoFrame;
-    // The pushed frame's owner-supplied hooks (macapkQueueProducerFrame): who
-    // gets the int[] back once it is consumed or superseded, and the frame's
-    // own texture transform. Both null for a decoded-video frame, which keeps
-    // that path byte-for-byte what it was before the GL producer existed.
+    // Zero-copy native CVPixelBufferRef bounded 4-slot FIFO ring queued for a
+    // GL-attached SurfaceTexture (guarded by mLock), and consumer-side bound
+    // IOSurface state [eglDisplay, eglSurface, retainedPixbuf] (guarded by mGlBoundLock).
+    private static final int NATIVE_PIXBUF_RING_CAP = 4;
+    private final long[] mVideoNativeRing = new long[NATIVE_PIXBUF_RING_CAP];
+    private final long[] mVideoNativeTimestamps = new long[NATIVE_PIXBUF_RING_CAP];
+    private int mVideoNativeHead;
+    private int mVideoNativeCount;
+    private final Object mGlBoundLock = new Object();
+    private final long[] mGlBoundIosurfaceState = new long[3];
+    /** MACAPK_SURFACETEXTURE_IOSURFACE_GL (default ON): queue retained
+     *  CVPixelBufferRef handles for GL-attached SurfaceTextures and bind
+     *  their IOSurface directly to GL_TEXTURE_2D in updateTexImage(). */
+    private static final boolean sNativeVideoPixbuf =
+        !"0".equals(System.getenv("MACAPK_SURFACETEXTURE_IOSURFACE_GL"));
+    // Return the pushed frame's buffer on consumption, replacement or abandon.
+    // Each queued frame also carries its own texture transform.
     private java.util.function.Consumer<int[]> mVideoFrameRecycler;
     private float[] mVideoFrameTransform;
     // True when the pushed frame came from a PREMULTIPLIED producer buffer (a
@@ -181,6 +370,12 @@ public class SurfaceTexture {
     // native_window_api_connect fails and eglCreateWindowSurface reports
     // EGL_BAD_ALLOC. Guarded by mLock.
     private Object mProducer;
+    private int mDirectGlLayerKey;
+    private Object mDirectGlProducer;
+    private volatile boolean mDirectGlFirstFrameSeen;
+    private static final java.util.concurrent.ConcurrentHashMap<Integer,
+            java.lang.ref.WeakReference<SurfaceTexture>> sDirectGlOwnerByKey =
+        new java.util.concurrent.ConcurrentHashMap<>();
     private java.lang.ref.WeakReference<android.view.SurfaceView> mOwnerSurfaceView;
 
     public void macapkSetOwnerSurfaceView(android.view.SurfaceView owner) {
@@ -217,13 +412,15 @@ public class SurfaceTexture {
     private boolean mGlUploadCheckedOnce;
     private volatile int mLatchGeneration;              // bumps per fresh latch
 
-    // Per-stream pool of reusable int[] buffers for decoded video (BufferQueue analogue).
-    // Bounded to 3 buffers: filling (native), queued, latching (consumer).
+    // Per-stream pool of reusable decoded-video arrays. Check the limit and
+    // abandon state together so no recycler can refill a released pool.
     private final java.util.concurrent.ConcurrentLinkedQueue<int[]> mVideoBufferPool =
         new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final java.util.function.Consumer<int[]> mVideoBufferRecycler = buf -> {
-        if (buf != null && !mAbandoned && mVideoBufferPool.size() < 4) {
-            mVideoBufferPool.add(buf);
+        synchronized (mLock) {
+            if (buf != null && !mAbandoned && mVideoBufferPool.size() < 4) {
+                mVideoBufferPool.add(buf);
+            }
         }
     };
 
@@ -311,6 +508,17 @@ public class SurfaceTexture {
      */
     public void setOnFrameAvailableListener(final OnFrameAvailableListener listener,
             Handler handler) {
+        synchronized (mLock) {
+            mFrameAvailableListener = listener;
+            mHasExternalFrameListener = (listener != null && listener != mHostUpdateListener);
+            if (mHasExternalFrameListener) {
+                mDirectVideoFrameSeen = false;
+                java.lang.ref.WeakReference<SurfaceTexture> ref = sDirectVideoLayerTarget;
+                if (ref != null && ref.get() == this) {
+                    sDirectVideoLayerTarget = null;
+                }
+            }
+        }
         if (listener != null) {
             // AOSP: although the thread is documented as arbitrary, the callback
             // is sent on the supplied handler's looper, else the creating
@@ -376,6 +584,8 @@ public class SurfaceTexture {
     public void updateTexImage() {
         long cam;
         int tex;
+        long vNativePixbuf = 0L;
+        Handler repostHandler = null;
         int[] vArgb = null;
         int vW = 0, vH = 0, vStride = 0;
         java.util.function.Consumer<int[]> vRecycle = null;
@@ -399,29 +609,92 @@ public class SurfaceTexture {
                 throw new IllegalStateException(
                     "Unable to update texture contents (see logcat for details)");
             }
-            mCurrentTimestamp = mPendingTimestamp;
-            mCurrentDataSpace = mPendingDataSpace;
-            if (mPendingTransformMatrix != null) {
-                System.arraycopy(mPendingTransformMatrix, 0, mCurrentTransformMatrix, 0, 16);
-                mPendingTransformMatrix = null;
-            }
-            mFrameAvailable = false;
             cam = mCamSession;
             tex = mTexName;
-            if (cam == 0 && mHasVideoFrame) {
-                vArgb = mVideoFrameArgb; vW = mVideoFrameW; vH = mVideoFrameH;
-                vStride = mVideoFrameStride;
-                vPremul = mVideoFrameGlPremul;
-                mHasVideoFrame = false;
-                vRecycle = takeFrameHooksLocked();
+            if (cam == 0 && mVideoNativeCount > 0) {
+                vNativePixbuf = mVideoNativeRing[mVideoNativeHead];
+                long headTs = mVideoNativeTimestamps[mVideoNativeHead];
+                mVideoNativeRing[mVideoNativeHead] = 0L;
+                mVideoNativeTimestamps[mVideoNativeHead] = 0L;
+                mVideoNativeHead = (mVideoNativeHead + 1) & (NATIVE_PIXBUF_RING_CAP - 1);
+                mVideoNativeCount--;
+                mCurrentTimestamp = headTs;
+                mCurrentDataSpace = mPendingDataSpace;
+                System.arraycopy(VIDEO_TRANSFORM_MATRIX, 0, mCurrentTransformMatrix, 0, 16);
+                recordUpdateTexLatchLocked(headTs);
+                if (mVideoNativeCount > 0) {
+                    mPendingTimestamp = mVideoNativeTimestamps[mVideoNativeHead];
+                    mPendingTransformMatrix = VIDEO_TRANSFORM_MATRIX;
+                    mFrameAvailable = true;
+                    repostHandler = mOnFrameAvailableHandler;
+                } else {
+                    mPendingTimestamp = 0L;
+                    mFrameAvailable = false;
+                    mPendingTransformMatrix = null;
+                }
+                if (mHasVideoFrame) {
+                    vArgb = mVideoFrameArgb; vW = mVideoFrameW; vH = mVideoFrameH;
+                    vStride = mVideoFrameStride;
+                    vPremul = mVideoFrameGlPremul;
+                    mHasVideoFrame = false;
+                    vRecycle = takeFrameHooksLocked();
+                }
+            } else {
+                mCurrentTimestamp = mPendingTimestamp;
+                mCurrentDataSpace = mPendingDataSpace;
+                if (mPendingTransformMatrix != null) {
+                    System.arraycopy(mPendingTransformMatrix, 0, mCurrentTransformMatrix, 0, 16);
+                    mPendingTransformMatrix = null;
+                }
+                mFrameAvailable = false;
+                if (cam == 0) {
+                    recordUpdateTexLatchLocked(mCurrentTimestamp);
+                }
+                if (cam == 0 && mHasVideoFrame) {
+                    vArgb = mVideoFrameArgb; vW = mVideoFrameW; vH = mVideoFrameH;
+                    vStride = mVideoFrameStride;
+                    vPremul = mVideoFrameGlPremul;
+                    mHasVideoFrame = false;
+                    vRecycle = takeFrameHooksLocked();
+                }
             }
         }
         // The GL-side half of the latch, outside mLock: the native pixel copy
-        // (camera) or the ARGB->RGBA channel reorder (decoded video) takes
-        // real time, and the producer must be able to keep queueing.
+        // (camera), zero-copy IOSurface bind (native pixbuf), or the ARGB->RGBA
+        // channel reorder (decoded video) must not block the producer thread.
         if (cam != 0) {
             latchCameraFrameToGl(cam, tex);
+        } else if (vNativePixbuf != 0L) {
+            if (vRecycle != null && vArgb != null) vRecycle.accept(vArgb);
+            boolean latched = false;
+            synchronized (mGlBoundLock) {
+                boolean stillValid;
+                synchronized (mLock) {
+                    stillValid = !mAbandoned && mAttached && mTexName == tex;
+                }
+                if (stillValid) {
+                    try {
+                        latched = com.macapk.loader.NativeCocoa.latchVideoPixelBufferToGl(
+                            vNativePixbuf, tex, mGlBoundIosurfaceState);
+                    } catch (UnsatisfiedLinkError missingRuntime) {
+                        releaseVideoPixelBufferSafe(vNativePixbuf);
+                        releaseGlBoundStateSafe(mGlBoundIosurfaceState);
+                    }
+                } else {
+                    releaseVideoPixelBufferSafe(vNativePixbuf);
+                    releaseGlBoundStateSafe(mGlBoundIosurfaceState);
+                }
+            }
+            if (latched) {
+                mLatchGeneration++;
+            }
+            if (repostHandler != null) {
+                repostHandler.sendEmptyMessage(0);
+            }
         } else if (vArgb != null) {
+            synchronized (mGlBoundLock) {
+                releaseGlBoundStateSafe(mGlBoundIosurfaceState);
+            }
             macapkTracePixels("gl-latch", vArgb, vW, vH);
             latchDecodedFrameToGl(vArgb, vW, vH, vStride, tex, vPremul);
             if (vRecycle != null) vRecycle.accept(vArgb);
@@ -692,6 +965,7 @@ public class SurfaceTexture {
      * image content producer take ownership of the image buffer.
      */
     public void releaseTexImage() {
+        long[] pendingNative;
         synchronized (mLock) {
             // GLConsumer::releaseTexImage rejects only an abandoned consumer;
             // a DETACHED one is explicitly fine ("if we're detached, no need
@@ -702,6 +976,17 @@ public class SurfaceTexture {
             checkNotAbandoned();
             mCurrentTimestamp = 0;
             mCurrentDataSpace = 0;
+            mHasCountedLatchTs = false;
+            pendingNative = drainNativePixbufRingLocked();
+            if (pendingNative != null && !mHasVideoFrame && mCamSession == 0) {
+                mPendingTimestamp = 0L;
+                mFrameAvailable = false;
+                mPendingTransformMatrix = null;
+            }
+        }
+        releaseVideoPixelBuffersSafe(pendingNative);
+        synchronized (mGlBoundLock) {
+            releaseGlBoundStateSafe(mGlBoundIosurfaceState);
         }
     }
 
@@ -712,6 +997,7 @@ public class SurfaceTexture {
      */
     public void detachFromGLContext() {
         boolean err;
+        long[] pendingNative = null;
         synchronized (mLock) {
             // GLConsumer::detachFromContext returns NO_INIT when abandoned and
             // INVALID_OPERATION when not currently attached; the Java layer
@@ -720,6 +1006,11 @@ public class SurfaceTexture {
             if (!err) {
                 mAttached = false;
                 mTexName = 0;
+                pendingNative = drainNativePixbufRingLocked();
+                if (pendingNative != null && !mHasVideoFrame && mCamSession == 0) {
+                    mFrameAvailable = false;
+                    mPendingTransformMatrix = null;
+                }
             }
         }
         if (err) {
@@ -729,6 +1020,10 @@ public class SurfaceTexture {
         mGlUploadedTex = 0;
         mGlUploadedW = 0;
         mGlUploadedH = 0;
+        releaseVideoPixelBuffersSafe(pendingNative);
+        synchronized (mGlBoundLock) {
+            releaseGlBoundStateSafe(mGlBoundIosurfaceState);
+        }
     }
 
     /**
@@ -744,10 +1039,15 @@ public class SurfaceTexture {
             if (!err) {
                 mAttached = true;
                 mTexName = texName;
+                mDirectVideoFrameSeen = false;
             }
         }
         if (err) {
             throw new RuntimeException("Error during attachToGLContext (see logcat for details)");
+        }
+        java.lang.ref.WeakReference<SurfaceTexture> directRef = sDirectVideoLayerTarget;
+        if (directRef != null && directRef.get() == this) {
+            sDirectVideoLayerTarget = null;
         }
     }
 
@@ -798,6 +1098,16 @@ public class SurfaceTexture {
      * @see #isReleased()
      */
     public void release() {
+        int[] pending;
+        java.util.function.Consumer<int[]> recycler;
+        long[] pendingNative;
+        int directGlKey = 0;
+        android.view.TextureView hostTv = null;
+        android.view.TextureView tvToClear = null;
+        java.lang.ref.WeakReference<SurfaceTexture> directRef = sDirectVideoLayerTarget;
+        if (directRef != null && directRef.get() == this) {
+            sDirectVideoLayerTarget = null;
+        }
         synchronized (mLock) {
             // SurfaceTexture::abandon is idempotent, and it does not clear the
             // attachment bookkeeping; every later call fails on mAbandoned
@@ -806,18 +1116,35 @@ public class SurfaceTexture {
             mFrameAvailable = false;
             mPendingTransformMatrix = null;
             mCamSession = 0;
+            if (mHostTextureView != null) {
+                hostTv = mHostTextureView.get();
+                if (mDirectVideoFrameSeen) {
+                    tvToClear = hostTv;
+                }
+            }
+            mDirectVideoFrameSeen = false;
+            mHostTextureView = null;
+            mHostUpdateListener = null;
             // Same hygiene as mCamSession above: functionally inert either way
             // (every reader checks mAbandoned first and returns before ever
             // reaching mHasVideoFrame), but a released instance should not
             // pin a decoded frame's backing array (up to several MB for a
             // 1080p+ frame) until the next unrelated GC happens to collect it.
             mHasVideoFrame = false;
+            pending = mVideoFrameArgb;
+            recycler = mVideoFrameRecycler;
             mVideoFrameArgb = null;
             mVideoFrameRecycler = null;
             mVideoFrameTransform = null;
+            pendingNative = drainNativePixbufRingLocked();
+            directGlKey = mDirectGlLayerKey;
+            mDirectGlLayerKey = 0;
+            mDirectGlProducer = null;
+            mDirectGlFirstFrameSeen = false;
             // abandon() disconnects the producer side too; a later swap from
             // the EGL window finds the stream abandoned and drops its frame.
             mProducer = null;
+            mVideoBufferPool.clear();
         }
         // Free the latch scratch: abandon() frees the consumer's buffers on
         // real Android too. A latch racing this in another thread re-checks
@@ -830,7 +1157,22 @@ public class SurfaceTexture {
         mGlUploadedTex = 0;
         mGlUploadedW = 0;
         mGlUploadedH = 0;
-        mVideoBufferPool.clear();
+        if (directGlKey > 0) {
+            sDirectGlOwnerByKey.remove(directGlKey);
+            if (hostTv != null) {
+                hostTv.macapkDisconnectDirectGlLayer(directGlKey);
+            } else {
+                android.view.SurfaceView.macapkUnpublishExternalKeyedSurface(directGlKey);
+            }
+        }
+        releaseVideoPixelBuffersSafe(pendingNative);
+        synchronized (mGlBoundLock) {
+            releaseGlBoundStateSafe(mGlBoundIosurfaceState);
+        }
+        if (recycler != null) recycler.accept(pending);
+        if (tvToClear != null) {
+            try { tvToClear.postInvalidate(); } catch (Throwable ignored) {}
+        }
     }
 
     /**
@@ -922,11 +1264,14 @@ public class SurfaceTexture {
      * @param height        the negotiated frame height
      */
     public void macapkAttachCameraSource(long sessionHandle, int width, int height) {
+        long[] supersededNative;
         synchronized (mLock) {
             mCamSession = sessionHandle;
             mCamWidth = width;
             mCamHeight = height;
+            supersededNative = drainNativePixbufRingLocked();
         }
+        releaseVideoPixelBuffersSafe(supersededNative);
     }
 
     /** Unbind. The last latched image deliberately survives, exactly as
@@ -983,6 +1328,117 @@ public class SurfaceTexture {
     // decode/render thread, or MediaCodec's own async dispatch thread) --
     // a plain field has no cross-thread visibility guarantee for that.
     private static volatile java.lang.ref.WeakReference<SurfaceTexture> sActiveVideoTarget;
+    private static volatile java.lang.ref.WeakReference<SurfaceTexture> sDirectVideoLayerTarget;
+
+    private long[] drainNativePixbufRingLocked() {
+        int n = mVideoNativeCount;
+        if (n <= 0) return null;
+        long[] out = new long[n];
+        for (int i = 0; i < n; i++) {
+            int idx = (mVideoNativeHead + i) & (NATIVE_PIXBUF_RING_CAP - 1);
+            out[i] = mVideoNativeRing[idx];
+            mVideoNativeRing[idx] = 0L;
+            mVideoNativeTimestamps[idx] = 0L;
+        }
+        mVideoNativeHead = 0;
+        mVideoNativeCount = 0;
+        return out;
+    }
+
+    private static void releaseVideoPixelBuffersSafe(long[] handles) {
+        if (handles == null) return;
+        for (long h : handles) {
+            releaseVideoPixelBufferSafe(h);
+        }
+    }
+
+    private static void releaseVideoPixelBufferSafe(long handle) {
+        if (handle == 0L) return;
+        try {
+            com.macapk.loader.NativeCocoa.releaseVideoPixelBuffer(handle);
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
+    private static void releaseGlBoundStateSafe(long[] state) {
+        if (state == null || state.length < 3) return;
+        if (state[0] == 0L && state[1] == 0L && state[2] == 0L) return;
+        try {
+            com.macapk.loader.NativeCocoa.releaseGlBoundIosurfaceState(state);
+        } catch (UnsatisfiedLinkError ignored) {
+            state[0] = 0L;
+            state[1] = 0L;
+            state[2] = 0L;
+        }
+    }
+
+    /** Mac.apk framework-internal: true when this GL-attached stream wants
+     *  decoded MediaCodec frames handed over as retained CVPixelBufferRef
+     *  handles for zero-copy IOSurface binding in updateTexImage(). */
+    public boolean macapkWantsNativeVideoPixbuf() {
+        synchronized (mLock) {
+            return sNativeVideoPixbuf && !mAbandoned && mAttached && mTexName != 0 && mCamSession == 0;
+        }
+    }
+
+    /** Mac.apk framework-internal: queue a retained CVPixelBufferRef handle
+     *  (ownership transferred from the native caller's CFRetain) for lazy
+     *  zero-copy IOSurface binding inside updateTexImage(). */
+    public boolean macapkQueueNativeVideoPixbuf(long pixbufHandle, int w, int h) {
+        return macapkQueueNativeVideoPixbuf(pixbufHandle, w, h, System.nanoTime());
+    }
+
+    public boolean macapkQueueNativeVideoPixbuf(long pixbufHandle, int w, int h, long timestampNs) {
+        if (pixbufHandle == 0L) return false;
+        Handler hnd = null;
+        long supersededNative = 0L;
+        int[] supersededArgb = null;
+        java.util.function.Consumer<int[]> supersededRecycler = null;
+        boolean accepted;
+        synchronized (mLock) {
+            accepted = sNativeVideoPixbuf && !mAbandoned && mAttached
+                    && mTexName != 0 && mCamSession == 0 && w > 0 && h > 0;
+            if (accepted) {
+                sStatRingAccepted.incrementAndGet();
+                if (mVideoNativeCount >= NATIVE_PIXBUF_RING_CAP) {
+                    supersededNative = mVideoNativeRing[mVideoNativeHead];
+                    mVideoNativeRing[mVideoNativeHead] = 0L;
+                    mVideoNativeTimestamps[mVideoNativeHead] = 0L;
+                    mVideoNativeHead = (mVideoNativeHead + 1) & (NATIVE_PIXBUF_RING_CAP - 1);
+                    mVideoNativeCount--;
+                    sStatRingEvicted.incrementAndGet();
+                }
+                int tail = (mVideoNativeHead + mVideoNativeCount) & (NATIVE_PIXBUF_RING_CAP - 1);
+                mVideoNativeRing[tail] = pixbufHandle;
+                mVideoNativeTimestamps[tail] = timestampNs;
+                mVideoNativeCount++;
+                if (mHasVideoFrame) {
+                    supersededArgb = mVideoFrameArgb;
+                    supersededRecycler = mVideoFrameRecycler;
+                    mHasVideoFrame = false;
+                    mVideoFrameArgb = null;
+                    mVideoFrameRecycler = null;
+                    mVideoFrameTransform = null;
+                }
+                mFrameAvailable = true;
+                mPendingTimestamp = mVideoNativeTimestamps[mVideoNativeHead];
+                mPendingTransformMatrix = VIDEO_TRANSFORM_MATRIX;
+                hnd = mOnFrameAvailableHandler;
+            }
+        }
+        if (!accepted) {
+            releaseVideoPixelBufferSafe(pixbufHandle);
+            return false;
+        }
+        if (supersededNative != 0L) {
+            releaseVideoPixelBufferSafe(supersededNative);
+        }
+        if (supersededRecycler != null && supersededArgb != null) {
+            supersededRecycler.accept(supersededArgb);
+        }
+        if (hnd != null) hnd.sendEmptyMessage(0);
+        return true;
+    }
 
     /** Mac.apk framework-internal: register this instance as the current
      *  candidate destination for a decoded-video frame. Called by
@@ -999,12 +1455,122 @@ public class SurfaceTexture {
         if (sActiveVideoTarget != null && sActiveVideoTarget.get() == this) {
             sActiveVideoTarget = null;
         }
+        macapkClearDirectVideoState();
     }
 
     public static void macapkUnregisterVideoTarget(SurfaceTexture target) {
         if (sActiveVideoTarget != null && (target == null || sActiveVideoTarget.get() == target)) {
+            SurfaceTexture old = sActiveVideoTarget.get();
             sActiveVideoTarget = null;
+            if (old != null) old.macapkClearDirectVideoState();
         }
+    }
+
+    private void macapkClearDirectVideoState() {
+        java.lang.ref.WeakReference<SurfaceTexture> directRef = sDirectVideoLayerTarget;
+        if (directRef != null && directRef.get() == this) {
+            sDirectVideoLayerTarget = null;
+        }
+        android.view.TextureView tv = null;
+        synchronized (mLock) {
+            if (mDirectVideoFrameSeen && mHostTextureView != null) {
+                tv = mHostTextureView.get();
+            }
+            mDirectVideoFrameSeen = false;
+        }
+        if (tv != null) {
+            try { tv.postInvalidate(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private boolean macapkCanUseDirectVideoLayerLocked() {
+        if (mAbandoned || mCamSession != 0 || mProducer != null
+                || mAttached || mHasExternalFrameListener) {
+            return false;
+        }
+        android.view.TextureView tv = mHostTextureView != null ? mHostTextureView.get() : null;
+        return tv != null && tv.macapkDirectVideoLayerMode();
+    }
+
+    /** True while this stream is presenting directly via g_video_layer. */
+    public boolean macapkIsDirectVideoLayerActive() {
+        synchronized (mLock) {
+            return mDirectVideoFrameSeen && macapkCanUseDirectVideoLayerLocked();
+        }
+    }
+
+    /** Native entry (cocoa_bridge.mm): claim this frame for zero-copy GPU
+     *  CAMetalLayer compositing when backed by an eligible TextureView. */
+    public static boolean macapkTryDirectVideoLayer(SurfaceTexture explicitTarget) {
+        SurfaceTexture target = explicitTarget != null
+                ? explicitTarget
+                : (sActiveVideoTarget != null ? sActiveVideoTarget.get() : null);
+        if (target == null) return false;
+        android.view.TextureView tv;
+        boolean punchNeeded = false;
+        int[] cleared = null;
+        java.util.function.Consumer<int[]> clearedRecycler = null;
+        long[] clearedNative = null;
+        synchronized (target.mLock) {
+            if (!target.macapkCanUseDirectVideoLayerLocked()) {
+                target.mDirectVideoFrameSeen = false;
+                java.lang.ref.WeakReference<SurfaceTexture> directRef = sDirectVideoLayerTarget;
+                if (directRef != null && directRef.get() == target) {
+                    sDirectVideoLayerTarget = null;
+                }
+                return false;
+            }
+            tv = target.mHostTextureView != null ? target.mHostTextureView.get() : null;
+            if (!target.mDirectVideoFrameSeen) {
+                target.mDirectVideoFrameSeen = true;
+                punchNeeded = true;
+            }
+            if (target.mHasVideoFrame) {
+                cleared = target.mVideoFrameArgb;
+                clearedRecycler = target.mVideoFrameRecycler;
+                target.mHasVideoFrame = false;
+                target.mVideoFrameArgb = null;
+                target.mVideoFrameRecycler = null;
+            }
+            clearedNative = target.drainNativePixbufRingLocked();
+        }
+        java.lang.ref.WeakReference<SurfaceTexture> directRef = sDirectVideoLayerTarget;
+        if (directRef == null || directRef.get() != target) {
+            sDirectVideoLayerTarget = new java.lang.ref.WeakReference<>(target);
+        }
+        if (clearedRecycler != null && cleared != null) clearedRecycler.accept(cleared);
+        releaseVideoPixelBuffersSafe(clearedNative);
+        if (tv != null) tv.macapkPostDirectVideoFrameHook(punchNeeded);
+        return true;
+    }
+
+    /** Packed window rect for g_video_layer when a TextureView direct sink is
+     *  active, or 0L if none is active. */
+    public static long macapkActiveVideoRectPacked() {
+        java.lang.ref.WeakReference<SurfaceTexture> directRef = sDirectVideoLayerTarget;
+        SurfaceTexture direct = directRef != null ? directRef.get() : null;
+        android.view.TextureView tv = null;
+        if (direct != null) {
+            synchronized (direct.mLock) {
+                if (direct.mDirectVideoFrameSeen && direct.macapkCanUseDirectVideoLayerLocked()) {
+                    tv = direct.mHostTextureView != null ? direct.mHostTextureView.get() : null;
+                } else if (sDirectVideoLayerTarget == directRef) {
+                    sDirectVideoLayerTarget = null;
+                }
+            }
+        }
+        if (tv == null) {
+            java.lang.ref.WeakReference<SurfaceTexture> activeRef = sActiveVideoTarget;
+            SurfaceTexture target = activeRef != null ? activeRef.get() : null;
+            if (target != null) {
+                synchronized (target.mLock) {
+                    if (target.mDirectVideoFrameSeen && target.macapkCanUseDirectVideoLayerLocked()) {
+                        tv = target.mHostTextureView != null ? target.mHostTextureView.get() : null;
+                    }
+                }
+            }
+        }
+        return tv != null ? tv.macapkDirectVideoRectPacked() : 0L;
     }
 
     /** Cheap peek for cocoa_bridge.mm's CocoaPresentVideoFrame to make
@@ -1030,9 +1596,14 @@ public class SurfaceTexture {
      */
     public static boolean macapkOfferDecodedFrame(int[] argb, int width, int height,
                                                   int strideInPixels) {
+        return macapkOfferDecodedFrame(argb, width, height, strideInPixels, System.nanoTime());
+    }
+
+    public static boolean macapkOfferDecodedFrame(int[] argb, int width, int height,
+                                                  int strideInPixels, long timestampNs) {
         SurfaceTexture target = sActiveVideoTarget != null ? sActiveVideoTarget.get() : null;
         if (target == null || target.mAbandoned) return false;
-        target.macapkQueueDecodedFrame(argb, width, height, strideInPixels);
+        target.macapkQueueDecodedFrame(argb, width, height, strideInPixels, timestampNs);
         return true;
     }
 
@@ -1047,11 +1618,15 @@ public class SurfaceTexture {
      *  (the sole caller is macapkOfferDecodedFrame above). Unlike
      *  macapkQueueFrame (the metadata-only, pull-the-pixels-later shape the
      *  camera producer uses), the pixels are already in hand here, so they
-     *  are stored directly rather than triggering a later pull. Now a thin
-     *  delegate of the per-instance macapkQueueProducerFrame below, with no
-     *  transform and no recycler, which is exactly what it always did. */
+     *  are stored directly with the video transform and the decoder's recycler. */
     void macapkQueueDecodedFrame(int[] argb, int width, int height, int strideInPixels) {
-        macapkQueueProducerFrame(argb, width, height, strideInPixels, VIDEO_TRANSFORM_MATRIX, mVideoBufferRecycler, false);
+        macapkQueueDecodedFrame(argb, width, height, strideInPixels, System.nanoTime());
+    }
+
+    void macapkQueueDecodedFrame(int[] argb, int width, int height, int strideInPixels,
+                                 long timestampNs) {
+        macapkQueueProducerFrame(null, argb, width, height, strideInPixels,
+            VIDEO_TRANSFORM_MATRIX, mVideoBufferRecycler, false, timestampNs);
     }
 
     // ---- Per-instance pixel producer (EGL window surfaces) ----------------
@@ -1100,10 +1675,134 @@ public class SurfaceTexture {
         }
     }
 
+    /** Connect this SurfaceTexture to its host TextureView's direct keyed GL
+     *  CAMetalLayer when eligible, reserving the single-producer slot. Returns
+     *  the allocated positive surface key, or 0 when ineligible. */
+    public int macapkConnectDirectGlLayerKey() {
+        android.view.TextureView tv;
+        synchronized (mLock) {
+            if (mAbandoned || mCamSession != 0 || mProducer != null
+                    || mAttached || mTexName != 0 || mHasExternalFrameListener) {
+                return 0;
+            }
+            tv = mHostTextureView != null ? mHostTextureView.get() : null;
+        }
+        if (tv == null) return 0;
+        int key = tv.macapkConnectDirectGlLayer();
+        if (key <= 0) return 0;
+        Object token = new Object();
+        int[] clearedArgb = null;
+        java.util.function.Consumer<int[]> clearedRecycler = null;
+        long[] clearedNative = null;
+        boolean connected = false;
+        synchronized (mLock) {
+            if (!mAbandoned && mCamSession == 0 && mProducer == null
+                    && !mAttached && mTexName == 0 && !mHasExternalFrameListener
+                    && mHostTextureView != null && mHostTextureView.get() == tv) {
+                mProducer = token;
+                mDirectGlProducer = token;
+                mDirectGlLayerKey = key;
+                mDirectGlFirstFrameSeen = false;
+                mDirectVideoFrameSeen = false;
+                if (mHasVideoFrame) {
+                    clearedArgb = mVideoFrameArgb;
+                    clearedRecycler = mVideoFrameRecycler;
+                    mHasVideoFrame = false;
+                    mVideoFrameArgb = null;
+                    mVideoFrameRecycler = null;
+                    mVideoFrameTransform = null;
+                }
+                clearedNative = drainNativePixbufRingLocked();
+                mFrameAvailable = false;
+                connected = true;
+            }
+        }
+        if (!connected) {
+            tv.macapkDisconnectDirectGlLayer(key);
+            return 0;
+        }
+        java.lang.ref.WeakReference<SurfaceTexture> directRef = sDirectVideoLayerTarget;
+        if (directRef != null && directRef.get() == this) {
+            sDirectVideoLayerTarget = null;
+        }
+        sDirectGlOwnerByKey.put(key, new java.lang.ref.WeakReference<>(this));
+        if (clearedRecycler != null && clearedArgb != null) clearedRecycler.accept(clearedArgb);
+        releaseVideoPixelBuffersSafe(clearedNative);
+        return key;
+    }
+
+    /** Disconnect a previously connected direct keyed GL layer and release the producer slot. */
+    public void macapkDisconnectDirectGlLayerKey(int key) {
+        if (key <= 0) return;
+        sDirectGlOwnerByKey.remove(key);
+        android.view.TextureView tv = null;
+        synchronized (mLock) {
+            if (mDirectGlLayerKey == key) {
+                if (mProducer != null && mProducer == mDirectGlProducer) {
+                    mProducer = null;
+                }
+                mDirectGlProducer = null;
+                mDirectGlLayerKey = 0;
+                mDirectGlFirstFrameSeen = false;
+            }
+            if (mHostTextureView != null) {
+                tv = mHostTextureView.get();
+            }
+        }
+        if (tv != null) {
+            tv.macapkDisconnectDirectGlLayer(key);
+        } else {
+            android.view.SurfaceView.macapkUnpublishExternalKeyedSurface(key);
+        }
+    }
+
+    public static void macapkDisconnectDirectGlLayerByKey(int key) {
+        if (key <= 0) return;
+        java.lang.ref.WeakReference<SurfaceTexture> ref = sDirectGlOwnerByKey.remove(key);
+        SurfaceTexture st = ref != null ? ref.get() : null;
+        if (st != null) {
+            st.macapkDisconnectDirectGlLayerKey(key);
+        } else {
+            android.view.SurfaceView.macapkUnpublishExternalKeyedSurface(key);
+        }
+    }
+
+    public boolean macapkIsDirectGlLayerActive(int key) {
+        synchronized (mLock) {
+            return !mAbandoned && key > 0 && mDirectGlLayerKey == key
+                    && mProducer != null && mProducer == mDirectGlProducer;
+        }
+    }
+
+    public static void macapkNoteDirectGlLayerSwap(int key) {
+        if (key <= 0) return;
+        java.lang.ref.WeakReference<SurfaceTexture> ref = sDirectGlOwnerByKey.get(key);
+        SurfaceTexture st = ref != null ? ref.get() : null;
+        if (st != null) st.macapkNoteDirectGlSwapInstance(key);
+    }
+
+    public void macapkNoteDirectGlSwapInstance(int key) {
+        android.view.TextureView tv = null;
+        boolean first = false;
+        synchronized (mLock) {
+            if (mAbandoned || mDirectGlLayerKey != key) return;
+            if (!mDirectGlFirstFrameSeen) {
+                mDirectGlFirstFrameSeen = true;
+                first = true;
+            }
+            if (mHostTextureView != null) tv = mHostTextureView.get();
+        }
+        if (tv != null) {
+            tv.macapkPostDirectVideoFrameHook(first);
+        }
+    }
+
     /**
      * Mac.apk framework-internal PRODUCER entry point: queue one frame of
      * pixels that are already in hand (the BufferQueue queueBuffer analogue).
      *
+     * @param producer the EGL connection that dequeued the frame, or null
+     *     for the instance-targeted decoder path
      * @param argb ARGB_8888, NON-premultiplied int values (0xAARRGGBB) with
      *     row stride {@code strideInPixels}, row 0 at the TOP of the image: the
      *     layout Bitmap.setPixels takes, which is what macapkLatchBitmap does
@@ -1111,63 +1810,68 @@ public class SurfaceTexture {
      * @param transform the frame's 4x4 column-major texture transform, reported
      *     by getTransformMatrix once updateTexImage latches this frame, or null
      *     to leave the current one (the decoded-video behaviour).
-     * @param recycler receives {@code argb} back once the frame is consumed by
-     *     either latch or superseded by a newer frame, so a producer can reuse
-     *     its buffers (at most three in flight: filling, queued, latching) the
-     *     way a BufferQueue slot is dequeued again. null = nobody wants it.
+     * @param recycler receives {@code argb} once the frame is latched,
+     *     superseded or discarded, allowing the producer to reuse its buffer.
+     *     Null means the producer does not need the buffer back.
      * @param premultipliedSource the producer's own buffer held premultiplied
      *     colour (a GL window surface), so updateTexImage re-premultiplies it
      *     for a GL consumer; false for decoded video.
      */
-    public void macapkQueueProducerFrame(int[] argb, int width, int height,
+    public void macapkQueueProducerFrame(Object producer, int[] argb, int width, int height,
                                          int strideInPixels, float[] transform,
                                          java.util.function.Consumer<int[]> recycler,
                                          boolean premultipliedSource) {
+        macapkQueueProducerFrame(producer, argb, width, height, strideInPixels,
+            transform, recycler, premultipliedSource, System.nanoTime());
+    }
+
+    public void macapkQueueProducerFrame(Object producer, int[] argb, int width, int height,
+                                         int strideInPixels, float[] transform,
+                                         java.util.function.Consumer<int[]> recycler,
+                                         boolean premultipliedSource, long timestampNs) {
         macapkTracePixels("queue", argb, width, height);
         Handler h;
         int[] superseded = null;
         java.util.function.Consumer<int[]> supersededRecycler = null;
+        long[] supersededNative = null;
+        boolean accepted;
         synchronized (mLock) {
-            if (mAbandoned || argb == null || width <= 0 || height <= 0) {
-                // Dropped, exactly as the buffer queue drops a late frame;
-                // hand the buffer straight back.
-                if (recycler != null && argb != null) recycler.accept(argb);
-                return;
+            // A new EGL window gets a new connection identity. Check it after
+            // readback, under the same lock that disconnect uses.
+            accepted = !mAbandoned && (producer == null || mProducer == producer)
+                && argb != null && width > 0 && height > 0;
+            if (accepted) {
+                if (mHasVideoFrame && mVideoFrameArgb != null && mVideoFrameArgb != argb) {
+                    // The previous frame was never latched: latest-wins, and its
+                    // buffer goes back to its producer.
+                    superseded = mVideoFrameArgb;
+                    supersededRecycler = mVideoFrameRecycler;
+                }
+                supersededNative = drainNativePixbufRingLocked();
+                if (supersededNative != null) {
+                    mPendingTransformMatrix = null;
+                }
+                mVideoFrameArgb = argb;
+                mVideoFrameW = width;
+                mVideoFrameH = height;
+                mVideoFrameStride = strideInPixels > 0 ? strideInPixels : width;
+                mVideoFrameRecycler = recycler;
+                mVideoFrameTransform = (transform != null && transform.length == 16)
+                    ? transform.clone() : null;
+                mVideoFrameGlPremul = premultipliedSource;
+                mHasVideoFrame = true;
+                mFrameAvailable = true;
+                mPendingTimestamp = timestampNs;
+                h = mOnFrameAvailableHandler;
+            } else {
+                h = null;
             }
-            if (mHasVideoFrame && mVideoFrameArgb != null && mVideoFrameArgb != argb) {
-                // The previous frame was never latched: latest-wins, and its
-                // buffer goes back to its producer.
-                superseded = mVideoFrameArgb;
-                supersededRecycler = mVideoFrameRecycler;
-            }
-            mVideoFrameArgb = argb;
-            mVideoFrameW = width;
-            mVideoFrameH = height;
-            mVideoFrameStride = strideInPixels > 0 ? strideInPixels : width;
-            mVideoFrameRecycler = recycler;
-            mVideoFrameTransform = (transform != null && transform.length == 16)
-                ? transform.clone() : null;
-            mVideoFrameGlPremul = premultipliedSource;
-            mHasVideoFrame = true;
-            mFrameAvailable = true;
-            // KNOWN LIMITATION, honestly stamped rather than left stale or
-            // invented as a decode PTS: MediaCodec.releaseOutputBuffer(index,
-            // true) -> NativeMedia.nativeVidRender(pixbufHandle, width,
-            // height) carries no presentationTimeUs at all (see that
-            // method's own signature/doc), so the frame's real decode PTS
-            // never crosses into this class. Wall-clock-at-arrival is a
-            // monotonically increasing, honest stand-in that satisfies
-            // getTimestamp()'s documented contract ("normally... measured
-            // with the same clock as... elapsedRealtimeNanos", i.e.
-            // monotonic, not tied to a specific stream's PTS) without
-            // freezing at a stale value the way leaving mPendingTimestamp
-            // untouched would. A real fix threads BufferInfo.presentationTimeUs
-            // through nativeVidRender and NativeMedia.nativeVidRender -- a
-            // MediaCodec.java/NativeMedia.java change outside this class's
-            // owned files; see the deliverable report.
-            mPendingTimestamp = System.nanoTime();
-            h = mOnFrameAvailableHandler;
         }
+        if (!accepted) {
+            if (recycler != null && argb != null) recycler.accept(argb);
+            return;
+        }
+        releaseVideoPixelBuffersSafe(supersededNative);
         if (supersededRecycler != null) supersededRecycler.accept(superseded);
         if (mOwnerSurfaceView != null) {
             android.view.SurfaceView sv = mOwnerSurfaceView.get();
@@ -1220,6 +1924,7 @@ public class SurfaceTexture {
             mVideoFrameTransform = null;
         }
         java.util.function.Consumer<int[]> r = mVideoFrameRecycler;
+        mVideoFrameArgb = null;
         mVideoFrameRecycler = null;
         return r;
     }

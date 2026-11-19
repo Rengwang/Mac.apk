@@ -1,0 +1,173 @@
+{
+  "schema_version": "1.0.0",
+  "aosp_anchor": "android-16.0.0_r2 (API 36, Apache-2.0)",
+  "android_compared": false,
+  "cts_certified": false,
+  "oracle_task": "ORACLE-001 (DEFERRED)",
+  "runtime_target_sdk_ceiling": 36,
+  "cases": [
+    {
+      "id": "CTR-PARCEL-001",
+      "capability_id": "IPC-001",
+      "gap_id": null,
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/os/Parcel.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "Parcel int/String/StrongBinder wire round-trip; truncated EOFException & oversized IOException."
+    },
+    {
+      "id": "CTR-BINDER-001",
+      "capability_id": "IPC-002",
+      "gap_id": null,
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/os/Binder.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "queryLocalInterface hit/miss, local transact dataPosition(0) reset, clear/restoreCallingIdentity."
+    },
+    {
+      "id": "CTR-BUNDLE-001",
+      "capability_id": "IPC-001",
+      "gap_id": null,
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/os/Bundle.java & BaseBundle.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "Bundle.EMPTY immutability (putString throws, remove no-op), Parcel round-trip, getParcelable(k,Class) mismatch returns null."
+    },
+    {
+      "id": "CTR-INTENT-001",
+      "capability_id": "RES-001",
+      "gap_id": null,
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/content/Intent.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "filterEquals ignores extras/flags, fillIn obeys FILL_IN_* mask, parseUri strips grant bits, typed extra list check."
+    },
+    {
+      "id": "CTR-FILTER-001",
+      "capability_id": "RES-001",
+      "gap_id": null,
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/content/IntentFilter.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "IntentFilter type-only scheme matrix (null/content vs http NO_MATCH_DATA), empty actionsIterator, NPE, MalformedMimeTypeException."
+    },
+    {
+      "id": "CTR-PM-MATCH-001",
+      "capability_id": "RES-001",
+      "gap_id": null,
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/os/PatternMatcher.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "PatternMatcher LITERAL, PREFIX, SUFFIX, and SIMPLE_GLOB matching plus null safety."
+    },
+    {
+      "id": "CTR-AUDIO-001",
+      "capability_id": "MED-003",
+      "gap_id": null,
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/media/java/android/media/AudioTrack.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "AudioTrack.getMinBufferSize valid 48kHz stereo PCM16 >= 4096, native sample rate > 0, volume bounds 0..1."
+    },
+    {
+      "id": "CTR-IPC-XFAIL-001",
+      "capability_id": "IPC-004",
+      "gap_id": "GAP-IPC-001",
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/os/ServiceManager.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "ServiceManager.getServiceOrThrow throws ServiceNotFoundException when service is absent."
+    },
+    {
+      "id": "CTR-IPC-XFAIL-002",
+      "capability_id": "IPC-002",
+      "gap_id": "GAP-IPC-002",
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/os/Binder.java:386 (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "Binder.getCallingUidOrThrow() throws IllegalStateException outside incoming transaction."
+    },
+    {
+      "id": "CTR-BUNDLE-XFAIL-001",
+      "capability_id": "IPC-001",
+      "gap_id": "GAP-CONTRACT-BUNDLE-001",
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/os/Bundle.java API 33 typed getters (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "33..36",
+      "expected_status": "PASS",
+      "summary": "API 33 Bundle.getParcelableArrayList(k,Class)/getSerializable(k,Class) enforce element/value type instead of unchecked cast."
+    },
+    {
+      "id": "CTR-INTENT-XFAIL-001",
+      "capability_id": "LIFE-001",
+      "gap_id": "GAP-CONTRACT-INTENT-001",
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/content/Intent.java#parseUri URI_ANDROID_APP_SCHEME (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "Intent.parseUri with URI_ANDROID_APP_SCHEME resolves package and inner scheme data URI."
+    },
+    {
+      "id": "CTR-PM-XFAIL-001",
+      "capability_id": "RES-001",
+      "gap_id": "GAP-CONTRACT-PM-001",
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/core/java/android/os/PatternMatcher.java PATTERN_ADVANCED_GLOB (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "26..36",
+      "expected_status": "PASS",
+      "summary": "PatternMatcher PATTERN_ADVANCED_GLOB supports regex/character-class syntax and validates pattern syntax."
+    },
+    {
+      "id": "CTR-AUDIO-XFAIL-001",
+      "capability_id": "MED-003",
+      "gap_id": "GAP-CONTRACT-AUDIO-001",
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/media/java/android/media/AudioTrack.java#getMinBufferSize (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "AudioTrack.getMinBufferSize returns ERROR_BAD_VALUE (-2) for invalid sampleRateInHz, channelConfig, or audioFormat."
+    },
+    {
+      "id": "CTR-MEDIA-XFAIL-001",
+      "capability_id": "MED-002",
+      "gap_id": "GAP-MED-001",
+      "harness": "bare_jvm",
+      "aosp_source": "frameworks/base/media/java/android/media/MediaExtractor.java (android-16.0.0_r2, Apache-2.0)",
+      "target_sdk": "29..36",
+      "expected_status": "PASS",
+      "summary": "MediaExtractor rejects unopenable https URI and validates out-of-range track index on getTrackFormat."
+    }
+  ],
+  "deferred_hardware_contracts": [
+    {
+      "test_id": "RemoteServiceProcessTest",
+      "capability_id": "IPC-003",
+      "gap_id": "GAP-IPC-003",
+      "required_harness": "macapk-runtime + macapk-system broker",
+      "reason": "Cross-process :worker PID/static isolation requires running broker; falls back in-process in bare JVM."
+    },
+    {
+      "test_id": "gpu_pixel",
+      "capability_id": "SURF-002",
+      "gap_id": "GAP-GFX-001",
+      "required_harness": "GUI + Metal/ANGLE + Sidecar display",
+      "reason": "EGL IOSurface/SharedGL/AGSL pixel composition cannot run headless."
+    },
+    {
+      "test_id": "MediaCodecDequeueTest / AMEDIA_SELFTEST / VideoImageSelfTest",
+      "capability_id": "MED-001",
+      "gap_id": "GAP-MED-002",
+      "required_harness": "macapk-runtime (AudioToolbox / VideoToolbox)",
+      "reason": "Native hardware codecs require macapk-runtime; pure Java dequeue test covered in bare_jvm."
+    }
+  ]
+}

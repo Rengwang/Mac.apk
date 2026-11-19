@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Comp UI Resources Probe</string>
+    <string name="probe_banner">COMP-001 UI &amp; Resources Fixture</string>
+</resources>

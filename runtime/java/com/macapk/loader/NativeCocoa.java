@@ -386,6 +386,16 @@ public final class NativeCocoa {
     public static native boolean convertGlPbufferToArgb(java.nio.ByteBuffer rgbaDirect, int[] argb, int width, int height);
     public static native boolean convertVideoArgbToRgba(int[] argb, java.nio.ByteBuffer rgbaDirect,
                                                        int width, int height, int stride, boolean premultiply);
+    /** Release a retained CVPixelBufferRef handle held by SurfaceTexture. */
+    public static native void releaseVideoPixelBuffer(long pixbufHandle);
+    /** Bind a retained CVPixelBufferRef into GL_TEXTURE_2D `texName` on the
+     *  calling thread's current EGL context (zero-copy IOSurface via
+     *  EGL_ANGLE_iosurface_client_buffer when supported, else native NEON
+     *  BGRA->RGBA upload). `boundState` is [eglDisplay, eglSurface, retainedPixbuf]. */
+    public static native boolean latchVideoPixelBufferToGl(long pixbufHandle, int texName, long[] boundState);
+    /** Release any prior GL-bound IOSurface pbuffer and retained CVPixelBufferRef
+     *  stored in `boundState` [eglDisplay, eglSurface, retainedPixbuf]. */
+    public static native void releaseGlBoundIosurfaceState(long[] boundState);
 
     /** Hide/clear the GL overlay layer once WindowOverlayStack goes back to
      *  empty, so the last-rendered dialog frame does not stick on screen. */

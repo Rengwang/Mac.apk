@@ -60,6 +60,11 @@ public final class MediaCodec {
     public static final int VIDEO_SCALING_MODE_SCALE_TO_FIT = 1;
     public static final int VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING = 2;
 
+    public static final String PARAMETER_KEY_REQUEST_SYNC_FRAME = "request-sync";
+    public static final String PARAMETER_KEY_VIDEO_BITRATE = "video-bitrate";
+    public static final String PARAMETER_KEY_SUSPEND = "drop-input-frames";
+    public static final String PARAMETER_KEY_OFFSET_TIME = "time-offset-us";
+
     public static final class BufferInfo {
         public int offset;
         public int size;
@@ -188,7 +193,12 @@ public final class MediaCodec {
     }
 
     private MediaCodec() {}
-    private MediaCodec(String name) { mName = name; }
+    private MediaCodec(String name) {
+        mName = name;
+        if (name != null && name.startsWith("OMX.macapk.enc.")) {
+            mIsEncoder = true;
+        }
+    }
     private String mName = "macapk.null.codec";
 
     /** Can this build actually decode `mime`?
@@ -243,28 +253,30 @@ public final class MediaCodec {
         return new MediaCodec("OMX.macapk.dec." + type);
     }
 
-    /** There is NO encoder behind MediaCodec at all -- MediaCodecList registers
-     *  zero of them, configure() ignores CONFIGURE_FLAG_ENCODE entirely, and
-     *  createInputSurface() returns null. So this returned a DECODER under an
-     *  encoder name: an app "encoding" got its PCM fed through an AAC decoder,
-     *  or NPE'd on the null input surface.
-     *
-     *  Throwing IOException here rather than IllegalArgumentException at
-     *  configure() is deliberate. IOException is what AOSP documents for "the
-     *  codec cannot be created", it is a CHECKED exception the callers already
-     *  handle, and it lands inside the corpus caller's protected range: Subway
-     *  Surfers' NatCorder wraps createEncoderByType in a try/catch(IOException)
-     *  but invokes createInputSurface() OUTSIDE it, so today's null-surface NPE
-     *  escapes its constructor while this throw takes its graceful path.
-     *
-     *  macOS itself reports 16 encode formats including AAC, so this is a
-     *  Mac.apk gap, not a host gap -- the honest interim answer, not the
-     *  terminal one. Rung 1 is AudioConverter + VTCompressionSession; see
-     *  docs/media-audio-camera-parity-audit_2026-08-30.md. */
+    private static boolean macapkCanEncode(String mime) {
+        if (mime == null) return false;
+        if (MediaFormat.MIMETYPE_AUDIO_AAC.equals(mime)) return true;
+        if (mime.startsWith("video/")) {
+            try { return isVideoEncodeMimeSupported(mime); } catch (Throwable t) { return false; }
+        }
+        return false;
+    }
+
+    private static boolean isVideoEncodeMimeSupported(String mime) {
+        String[] supported = com.macapk.loader.NativeMedia.nativeVideoEncodeSupportedMimes();
+        if (supported == null) return false;
+        for (String s : supported) {
+            if (mime.equals(s)) return true;
+        }
+        return false;
+    }
+
     public static MediaCodec createEncoderByType(String type) throws java.io.IOException {
         java.util.Objects.requireNonNull(type, "type");
-        throw new java.io.IOException("no encoder for " + type
-                + " on this host (MediaCodec encoding is not implemented)");
+        if (!macapkCanEncode(type)) {
+            throw new java.io.IOException("no encoder for " + type + " on this host");
+        }
+        return new MediaCodec("OMX.macapk.enc." + type);
     }
 
     public static MediaCodec createByCodecName(String name) throws java.io.IOException {
@@ -290,6 +302,8 @@ public final class MediaCodec {
     // every hook below is a no-op on a normal launch.
     private final com.macapk.loader.MediaStats.Codec mStat = com.macapk.loader.MediaStats.newCodec();
     private String mStatMime = "";
+    static final boolean CODEC_OBS = "1".equals(System.getenv("MACAPK_CODEC_OBS"));
+    private final ObsRecorder mObs = CODEC_OBS ? new ObsRecorder() : null;
 
     // ---- Video-decoder backing (VideoToolbox via NativeMedia). See the file
     // header. mIsVideo is decided at configure() time from
@@ -298,11 +312,53 @@ public final class MediaCodec {
     // the actual native session, opened at start().
     private long mVidDec = 0;
     private boolean mIsVideo = false;
+    private boolean mIsEncoder = false;
+    private boolean mConfigured = false;
+    private boolean mReleased = false;
+    private long mEnc = 0;     // AudioToolbox AAC encoder handle
+    private long mVidEnc = 0;  // VideoToolbox encoder handle
+    private int mEncBitrate = 0;
+    private float mEncFrameRate = 30.0f;
+    private float mEncIFrameInterval = 1.0f;
+    private int mEncColorFormat = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible;
+    private int mEncStride = 0;
+    private int mEncSliceHeight = 0;
+    private int mEncProfile = 0;
+    private int mEncBitrateMode = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR;
+    private boolean mEncEosQueued = false;
+    private MediaFormat mInputFormat;
+    private MediaFormat mEncOutFormat;
+    private android.view.Surface mInputSurface;
+    private boolean mOwnsInputSurface = false;
     private String mVidMime;
     private int mVidWidth, mVidHeight;
     private byte[] mCsd0Vid, mCsd1Vid;
-    private android.view.Surface mSurface;
-    private boolean mHasSurface = false;
+    private static final class OutputTarget {
+        final android.view.Surface surface;
+        final boolean hasSurface;
+        final long gen;
+        OutputTarget(android.view.Surface surface, boolean hasSurface, long gen) {
+            this.surface = surface;
+            this.hasSurface = hasSurface;
+            this.gen = gen;
+        }
+    }
+    private final java.util.concurrent.atomic.AtomicLong mCodecSurfaceGen =
+            new java.util.concurrent.atomic.AtomicLong(1L);
+    private volatile OutputTarget mOutputTarget = new OutputTarget(null, false, 1L);
+
+    private OutputTarget setOutputTargetLocked(android.view.Surface surface) {
+        long gen = mCodecSurfaceGen.incrementAndGet();
+        OutputTarget next = new OutputTarget(surface, surface != null && surface.isValid(), gen);
+        mOutputTarget = next;
+        return next;
+    }
+
+    private void bumpOutputGen() {
+        long gen = mCodecSurfaceGen.incrementAndGet();
+        OutputTarget cur = mOutputTarget;
+        mOutputTarget = new OutputTarget(cur.surface, cur.hasSurface, gen);
+    }
     // Parallel to mOut (index-for-index): holds the native retained
     // CVPixelBufferRef (as a long) for whichever output slots currently carry
     // a polled-but-not-yet-released video frame. 0 = empty slot. Video output
@@ -334,7 +390,7 @@ public final class MediaCodec {
     //       (65536 < 81979)   [then 87702, then 92900]
     // Video decode died on the first keyframe while audio kept playing, which
     // is exactly the "audio works, video is black" the owner reported.
-    private static final int IN_BUFS = 8, OUT_BUFS = 8, IN_CAP = 1 << 16;
+    private static final int IN_BUFS = 8, OUT_BUFS = 8, VIDEO_OUT_BUFS = 24, IN_CAP = 1 << 16;
     /** Per-instance input capacity, resolved in configure(). Never below
      *  IN_CAP, so every audio path keeps the size it has always had. */
     private int mInCap = IN_CAP;
@@ -368,15 +424,58 @@ public final class MediaCodec {
     private Thread mAsyncThread;
     private volatile boolean mAsyncRunning;
     private volatile boolean mAsyncPaused;
+    private int mVidWaiters = 0;
+    private volatile long mFlushSeq = 0;
+    private long[] mStashedVidFrame = null;
 
     // Descriptor (Landroid/media/MediaFormat;Landroid/view/Surface;Landroid/media/MediaCrypto;I)V.
     public void configure(MediaFormat format, android.view.Surface surface,
                           MediaCrypto crypto, int flags) {
+        if (mReleased) throw new IllegalStateException("MediaCodec has been released");
         if (format == null) return;
         String mime = format.getString(MediaFormat.KEY_MIME, "");
+        boolean flagEncode = (flags & CONFIGURE_FLAG_ENCODE) != 0;
+        if (flagEncode) mIsEncoder = true;
+        releaseOwnedInputSurface();
+
         mStatMime = mime;
         mFormatId = 0;
         mIsVideo = false;
+        mInputFormat = new MediaFormat(format);
+        mEncOutFormat = null;
+        mEncEosQueued = false;
+
+        if (mIsEncoder) {
+            if (MediaFormat.MIMETYPE_AUDIO_AAC.equals(mime)) {
+                mFormatId = 1;
+            } else if (mime.startsWith("video/") && isVideoEncodeMimeSupported(mime)) {
+                mIsVideo = true;
+            }
+            mSampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE, 44100);
+            mChannels   = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT, 2);
+            mEncBitrate = format.getInteger(MediaFormat.KEY_BIT_RATE, 0);
+            mEncFrameRate = format.getFloat(MediaFormat.KEY_FRAME_RATE, 30.0f);
+            mEncIFrameInterval = format.getFloat(MediaFormat.KEY_I_FRAME_INTERVAL, 1.0f);
+            mEncColorFormat = format.getInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+            mVidMime = mIsVideo ? mime : null;
+            mVidWidth  = format.getInteger(MediaFormat.KEY_WIDTH, 0);
+            mVidHeight = format.getInteger(MediaFormat.KEY_HEIGHT, 0);
+            mEncStride = format.getInteger(MediaFormat.KEY_STRIDE, mVidWidth);
+            mEncSliceHeight = format.getInteger(MediaFormat.KEY_SLICE_HEIGHT, mVidHeight);
+            mEncProfile = format.getInteger(MediaFormat.KEY_PROFILE, 0);
+            mEncBitrateMode = format.getInteger(MediaFormat.KEY_BIT_RATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
+            mInCap = resolveEncoderInputCapacity(
+                    format, mIsVideo, mEncColorFormat, mVidWidth, mVidHeight, mEncStride, mEncSliceHeight);
+            setOutputTargetLocked(null);
+            mCsd0 = null;
+            mCsd0Vid = null;
+            mCsd1Vid = null;
+            mConfigured = true;
+            return;
+        }
+
         // formatId 1-2 pre-date this table; 3-13 route to the AudioToolbox
         // (and, for Vorbis, stb_vorbis) formats media_decode.mm's
         // macapk_md_dec_open added -- one mime compare per row, matching
@@ -428,23 +527,17 @@ public final class MediaCodec {
             mCsd0Vid = c0 != null ? bufToBytes(c0) : null;
             ByteBuffer c1 = format.getByteBuffer("csd-1", null);
             mCsd1Vid = c1 != null ? bufToBytes(c1) : null;
-            mSurface = surface;
-            mHasSurface = (surface != null && surface.isValid());
+            OutputTarget next = setOutputTargetLocked(surface);
             // Bind the video plane's geometry to the Surface's owner view (a
             // no-op registry clear for SurfaceTexture-backed and bare
             // Surfaces). Done at configure time because that is the moment
             // the codec-output-to-surface association exists on real Android.
-            if (mHasSurface) {
-                if (surface.macapkGetSurfaceTexture() != null && surface.macapkGetOwnerSurfaceView() == null) {
-                    surface.macapkGetSurfaceTexture().macapkRegisterVideoTarget();
-                }
-                android.view.SurfaceView.macapkRegisterVideoSink(surface);
-            }
+            updateVideoSink(null, next.hasSurface ? next.surface : null);
         } else {
             mVidMime = null;
-            mSurface = null;
-            mHasSurface = false;
+            setOutputTargetLocked(null);
         }
+        mConfigured = true;
     }
     private static byte[] bufToBytes(ByteBuffer b) {
         byte[] out = new byte[b.remaining()];
@@ -529,39 +622,155 @@ public final class MediaCodec {
     // already succeeded for whichever backend isVp8()/isVp9() names, so no
     // LinkageError guard is needed here (see safeVp8Open's doc: open is the
     // only site that can observe the not-yet-registered window).
-    private void vidDecode(byte[] au, long presentationTimeUs, boolean eos) {
-        if (isVp8()) com.macapk.loader.NativeMedia.nativeVp8Decode(mVidDec, au, presentationTimeUs, eos);
-        else if (isVp9()) com.macapk.loader.NativeMedia.nativeVp9Decode(mVidDec, au, presentationTimeUs, eos);
-        else com.macapk.loader.NativeMedia.nativeVidDecode(mVidDec, au, presentationTimeUs, eos);
+    private void vidDecode(long dec, byte[] au, long presentationTimeUs, boolean eos) {
+        if (dec == 0) return;
+        if (isVp8()) com.macapk.loader.NativeMedia.nativeVp8Decode(dec, au, presentationTimeUs, eos);
+        else if (isVp9()) com.macapk.loader.NativeMedia.nativeVp9Decode(dec, au, presentationTimeUs, eos);
+        else com.macapk.loader.NativeMedia.nativeVidDecode(dec, au, presentationTimeUs, eos);
     }
     // AOSP: registering a callback before start() (or after flush(), which
     // must be followed by start() again in async mode -- see flush() below)
     // is what switches this codec into asynchronous mode.
-    public void setCallback(Callback cb) { mCallback = cb; }
-    public void setCallback(Callback cb, android.os.Handler handler) { mCallback = cb; }
+    public void setCallback(Callback cb) {
+        synchronized (mAsyncLock) {
+            mCallback = cb;
+            mAsyncLock.notifyAll();
+        }
+    }
+    public void setCallback(Callback cb, android.os.Handler handler) {
+        setCallback(cb);
+    }
     public void setOnFrameRenderedListener(OnFrameRenderedListener listener, android.os.Handler handler) {}
     public void setVideoScalingMode(int mode) {}
     // AOSP allows swapping the output surface after configure() (adaptive
     // surface change). Our present path targets one shared per-window video
-    // layer regardless of which Surface object was handed in (see
-    // cocoa_bridge.mm's CocoaPresentVideoFrame); what IS surface-identity-
-    // specific is the geometry -- a SurfaceView-owned Surface pins the video
-    // plane to that view's on-screen rect (SurfaceView.
-    // macapkRegisterVideoSink), which is why the registration must follow
-    // every swap.
+    // layer for a SurfaceView-owned or bare Surface, and the Surface's own
+    // SurfaceTexture when it has one (routeVideoTo, below; see cocoa_bridge.mm's
+    // CocoaPresentVideoFrame). The geometry is surface-specific too -- a
+    // SurfaceView-owned Surface pins the video plane to that view's on-screen
+    // rect (SurfaceView.macapkRegisterVideoSink) -- which is why both must
+    // follow every swap.
     public void setOutputSurface(android.view.Surface surface) {
-        mSurface = surface;
-        mHasSurface = (surface != null && surface.isValid());
-        if (mHasSurface) {
-            if (surface.macapkGetSurfaceTexture() != null && surface.macapkGetOwnerSurfaceView() == null) {
-                surface.macapkGetSurfaceTexture().macapkRegisterVideoTarget();
-            }
-            android.view.SurfaceView.macapkRegisterVideoSink(surface);
+        android.view.Surface previous;
+        OutputTarget next;
+        synchronized (mAsyncLock) {
+            previous = mOutputTarget.surface;
+            next = setOutputTargetLocked(surface);
         }
+        synchronized (mTimedLock) {
+            mTimedLock.notifyAll();
+        }
+        updateVideoSink(previous, next.hasSurface ? next.surface : null);
     }
+
+    private static void updateVideoSink(android.view.Surface previous, android.view.Surface next) {
+        if (previous != null && previous != next && previous.macapkIsRemote()) {
+            previous.macapkNoteVideoSinkActive(false);
+        }
+        if (next != null) {
+            next.macapkNoteVideoSinkActive(true);
+        }
+        routeVideoTo(previous, next);
+    }
+
+    // Decoded frames go first to SurfaceTexture's one active video target
+    // (most recent registration wins; see SurfaceTexture.macapkOfferDecodedFrame),
+    // and only otherwise to the window's video plane. `new Surface(texture)`
+    // registers its texture, so a Surface made BEFORE the real output kept the
+    // frames: Media3 configures the codec with its PlaceholderSurface (a
+    // SurfaceTexture-backed Surface) when prepare() runs before the app's view
+    // is attached, then switches here with setOutputSurface, and the video
+    // stayed black with its sound playing (GitHub #147). So the target follows
+    // this codec's output, as the BufferQueue behind a Surface does on a
+    // device: the previous output's texture gives the target up, if it still
+    // holds it, and a texture-backed new output takes it. SurfaceView-owned
+    // SurfaceTextures are excluded because SurfaceView manages its own sink.
+    private static void routeVideoTo(android.view.Surface previous, android.view.Surface next) {
+        boolean prevUnowned = previous != null && previous.macapkGetOwnerSurfaceView() == null;
+        boolean nextUnowned = next != null && next.macapkGetOwnerSurfaceView() == null;
+        android.graphics.SurfaceTexture was =
+                prevUnowned ? previous.macapkGetSurfaceTexture() : null;
+        android.graphics.SurfaceTexture now =
+                nextUnowned ? next.macapkGetSurfaceTexture() : null;
+        if (was != null && was != now) was.macapkUnregisterVideoTargetIfSelf();
+        // A released texture would displace a live target with one that
+        // takes no frames (macapkHasActiveVideoTarget reads it as none).
+        if (now != null && !now.isReleased()) now.macapkRegisterVideoTarget();
+    }
+
+    private final Object mEncSubmitLock = new Object();
 
     public void start() {
         synchronized (mAsyncLock) {
+            if (mReleased) throw new IllegalStateException("MediaCodec has been released");
+            if (mIsEncoder) {
+                mEncEosQueued = false;
+                mFormatReported = false;
+                mOutQ.clear();
+                if (mFormatId == 1 && mSampleRate > 0 && mChannels > 0) {
+                    mEnc = com.macapk.loader.NativeMedia.nativeAudioEncOpen(
+                            mFormatId, mSampleRate, mChannels, mEncBitrate);
+                    if (mEnc == 0) {
+                        throw new CodecException(0, "AudioToolbox: failed to open AAC encoder");
+                    }
+                    MediaFormat outFmt = MediaFormat.createAudioFormat(
+                            MediaFormat.MIMETYPE_AUDIO_AAC, mSampleRate, mChannels);
+                    if (mEncBitrate > 0) outFmt.setInteger(MediaFormat.KEY_BIT_RATE, mEncBitrate);
+                    outFmt.setInteger(MediaFormat.KEY_AAC_PROFILE,
+                            MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+                    byte[] asc = com.macapk.loader.NativeMedia.nativeAudioEncCsd0(mEnc);
+                    if (asc != null && asc.length > 0) {
+                        outFmt.setByteBuffer("csd-0", ByteBuffer.wrap(asc.clone()));
+                        mOutQ.add(new OutEntry(asc.clone(), 0L, BUFFER_FLAG_CODEC_CONFIG));
+                    }
+                    mEncOutFormat = outFmt;
+                } else if (mIsVideo) {
+                    mVidEnc = com.macapk.loader.NativeMedia.nativeVidEncOpen(
+                            mVidMime, mVidWidth, mVidHeight, mEncBitrate, mEncFrameRate,
+                            mEncIFrameInterval, mEncProfile, mEncBitrateMode, this);
+                    if (mVidEnc == 0) {
+                        throw new CodecException(0, "VideoToolbox: failed to open encoder for " + mVidMime);
+                    }
+                    MediaFormat outFmt = MediaFormat.createVideoFormat(mVidMime, mVidWidth, mVidHeight);
+                    if (mEncBitrate > 0) outFmt.setInteger(MediaFormat.KEY_BIT_RATE, mEncBitrate);
+                    outFmt.setFloat(MediaFormat.KEY_FRAME_RATE, mEncFrameRate);
+                    mEncOutFormat = outFmt;
+                }
+                if (mInputSurface != null) {
+                    mIn = new ByteBuffer[0];
+                } else {
+                    mIn = new ByteBuffer[IN_BUFS];
+                }
+                mOut = new ByteBuffer[OUT_BUFS];
+                mOutPixbuf = null;
+                mOutPts = null;
+                mInFree.clear();
+                mOutFree.clear();
+                if (mInputSurface == null) {
+                    for (int i = 0; i < IN_BUFS; i++) {
+                        mIn[i] = ByteBuffer.allocateDirect(mInCap);
+                        mInFree.add(i);
+                    }
+                }
+                for (int i = 0; i < OUT_BUFS; i++) mOutFree.add(i);
+                mStarted = true;
+                com.macapk.loader.MediaStats.codecStart(mStat, mStatMime, mInputSurface != null);
+                if (mObs != null) mObs.onStart(mStatMime, mInputSurface != null);
+                mAsyncPaused = false;
+                mAsyncLock.notifyAll();
+                if (mInputSurface instanceof EncoderInputSurface) {
+                    ((EncoderInputSurface) mInputSurface).attachCodec(this);
+                }
+                if (mCallback != null && mAsyncThread == null) {
+                    mAsyncRunning = true;
+                    mAsyncThread = new Thread(new Runnable() {
+                        @Override public void run() { asyncDispatchLoop(); }
+                    }, "MediaCodec-async");
+                    mAsyncThread.setDaemon(true);
+                    mAsyncThread.start();
+                }
+                return;
+            }
             if (mFormatId != 0 && mSampleRate > 0 && mChannels > 0) {
                 mDec = com.macapk.loader.NativeMedia.nativeDecOpen(mFormatId, mSampleRate, mChannels, mCsd0);
                 if (mDec == 0) {
@@ -581,12 +790,13 @@ public final class MediaCodec {
                     throw new CodecException(0, "AudioToolbox: failed to open decoder for formatId " + mFormatId);
                 }
             } else if (mIsVideo) {
+                boolean wantSurface = mOutputTarget.hasSurface;
                 mVidDec = isVp8()
-                    ? safeVp8Open(mVidMime, mVidWidth, mVidHeight, mCsd0Vid, mCsd1Vid, mHasSurface)
+                    ? safeVp8Open(mVidMime, mVidWidth, mVidHeight, mCsd0Vid, mCsd1Vid, wantSurface)
                     : isVp9()
-                    ? safeVp9Open(mVidMime, mVidWidth, mVidHeight, mCsd0Vid, mCsd1Vid, mHasSurface)
+                    ? safeVp9Open(mVidMime, mVidWidth, mVidHeight, mCsd0Vid, mCsd1Vid, wantSurface)
                     : com.macapk.loader.NativeMedia.nativeVidOpen(
-                          mVidMime, mVidWidth, mVidHeight, mCsd0Vid, mCsd1Vid, mHasSurface);
+                          mVidMime, mVidWidth, mVidHeight, mCsd0Vid, mCsd1Vid, wantSurface);
                 if (mVidDec == 0) {
                     // Loud, not silent. AOSP throws from start() when a codec
                     // genuinely cannot be stood up, and this IS that case: at
@@ -603,20 +813,24 @@ public final class MediaCodec {
                     throw new CodecException(0, "VideoToolbox: failed to open decoder for " + mVidMime);
                 }
             }
+            final int outBufs = mIsVideo ? VIDEO_OUT_BUFS : OUT_BUFS;
             mIn  = new ByteBuffer[IN_BUFS];
-            mOut = new ByteBuffer[OUT_BUFS];
-            mOutPixbuf = mIsVideo ? new long[OUT_BUFS] : null;
-            mOutPts    = mIsVideo ? new long[OUT_BUFS] : null;
+            mOut = new ByteBuffer[outBufs];
+            mOutPixbuf = mIsVideo ? new long[outBufs] : null;
+            mOutPts    = mIsVideo ? new long[outBufs] : null;
             mInFree.clear(); mOutFree.clear(); mOutQ.clear();
-            for (int i = 0; i < IN_BUFS;  i++) { mIn[i] = ByteBuffer.allocateDirect(mInCap); mInFree.add(i); }
-            for (int i = 0; i < OUT_BUFS; i++) mOutFree.add(i);
+            for (int i = 0; i < IN_BUFS; i++) { mIn[i] = ByteBuffer.allocateDirect(mInCap); mInFree.add(i); }
+            for (int i = 0; i < outBufs; i++) mOutFree.add(i);
             mStarted = true; mFormatReported = false;
-            com.macapk.loader.MediaStats.codecStart(mStat, mStatMime, mHasSurface);
+            boolean hasSurfaceNow = mOutputTarget.hasSurface;
+            com.macapk.loader.MediaStats.codecStart(mStat, mStatMime, hasSurfaceNow);
+            if (mObs != null) mObs.onStart(mStatMime, hasSurfaceNow);
             // AOSP: "you must call start() after flush() ... to transition
             // the codec to the Running sub-state and start receiving input
             // buffers" in async mode -- start() always clears the pause, and
             // spawns the dispatch thread the first time a callback is armed.
             mAsyncPaused = false;
+            mAsyncLock.notifyAll();
             if (mCallback != null && mAsyncThread == null) {
                 mAsyncRunning = true;
                 mAsyncThread = new Thread(new Runnable() {
@@ -627,35 +841,68 @@ public final class MediaCodec {
             }
         }
     }
-    public void stop()    { com.macapk.loader.MediaStats.codecEnd(mStat, "stop");
-                            stopAsyncDispatch(); releaseDec(); mStarted = false; }
-    public void reset()   { com.macapk.loader.MediaStats.codecEnd(mStat, "reset");
-                            stopAsyncDispatch(); releaseDec(); mStarted = false; }
+    public void stop()    { bumpOutputGen();
+                            com.macapk.loader.MediaStats.codecEnd(mStat, "stop");
+                            if (mObs != null) mObs.emitOnce("stop");
+                            detachInputSurface();
+                            stopAsyncDispatch(); releaseDec(); mStarted = false; mConfigured = false; }
+    public void reset()   { bumpOutputGen();
+                            com.macapk.loader.MediaStats.codecEnd(mStat, "reset");
+                            if (mObs != null) mObs.emitOnce("reset");
+                            detachInputSurface(); releaseOwnedInputSurface();
+                            stopAsyncDispatch(); releaseDec(); mStarted = false; mConfigured = false;
+                            mEncOutFormat = null; mInputFormat = null; mEncEosQueued = false; }
     public void release() {
+        bumpOutputGen();
         com.macapk.loader.MediaStats.codecEnd(mStat, "release");
+        if (mObs != null) mObs.emitOnce("release");
+        detachInputSurface();
+        releaseOwnedInputSurface();
         stopAsyncDispatch(); releaseDec();
+        mConfigured = false;
+        mReleased = true;
         drainTimedFrames(true);
         // Drop the video-plane geometry binding IF it is still ours (a newer
         // codec's registration wins -- macapkUnregisterVideoSink compares the
         // Surface identity, so releasing an old codec after a new one bound
         // does not blank the new one's video).
-        android.view.SurfaceView.macapkUnregisterVideoSink(mSurface);
+        android.view.Surface s = mOutputTarget.surface;
+        if (s != null) {
+            s.macapkNoteVideoSinkActive(false);
+        }
     }
     public void flush() {
-        synchronized (mAsyncLock) {
-            mOutQ.clear();
-            releasePendingVideoFrames();
-            if (mVidDec != 0) {
-                if (isVp8()) com.macapk.loader.NativeMedia.nativeVp8Flush(mVidDec);
-                else if (isVp9()) com.macapk.loader.NativeMedia.nativeVp9Flush(mVidDec);
-                else com.macapk.loader.NativeMedia.nativeVidFlush(mVidDec);
+        long encToFlush = 0;
+        long vidEncToFlush = 0;
+        synchronized (mEncSubmitLock) {
+            synchronized (mAsyncLock) {
+                encToFlush = mEnc;
+                vidEncToFlush = mVidEnc;
             }
-            if (mIn  != null)  { mInFree.clear();  for (int i = 0; i < IN_BUFS;  i++) mInFree.add(i); }
-            if (mOut != null)  { mOutFree.clear(); for (int i = 0; i < OUT_BUFS; i++) mOutFree.add(i); }
-            // AOSP: in async mode flush() suspends buffer delivery until the
-            // next start() (see start() above); sync-mode callers (mCallback
-            // == null) are unaffected.
-            if (mCallback != null) mAsyncPaused = true;
+            if (encToFlush != 0) com.macapk.loader.NativeMedia.nativeAudioEncFlush(encToFlush);
+            if (vidEncToFlush != 0) com.macapk.loader.NativeMedia.nativeVidEncFlush(vidEncToFlush);
+            synchronized (mAsyncLock) {
+                mFlushSeq++;
+                bumpOutputGen();
+                mOutQ.clear();
+                mEncEosQueued = false;
+                releasePendingVideoFrames();
+                if (mVidDec != 0) {
+                    if (isVp8()) com.macapk.loader.NativeMedia.nativeVp8Flush(mVidDec);
+                    else if (isVp9()) com.macapk.loader.NativeMedia.nativeVp9Flush(mVidDec);
+                    else com.macapk.loader.NativeMedia.nativeVidFlush(mVidDec);
+                }
+                if (mIn != null && !(mIsEncoder && mInputSurface != null)) {
+                    mInFree.clear();
+                    for (int i = 0; i < Math.min(IN_BUFS, mIn.length); i++) mInFree.add(i);
+                }
+                if (mOut != null) { mOutFree.clear(); for (int i = 0; i < mOut.length; i++) mOutFree.add(i); }
+                // AOSP: in async mode flush() suspends buffer delivery until the
+                // next start() (see start() above); sync-mode callers (mCallback
+                // == null) are unaffected.
+                if (mCallback != null) mAsyncPaused = true;
+                mAsyncLock.notifyAll();
+            }
         }
     }
     // Signals the async dispatch thread to stop and forgets it, WITHOUT
@@ -669,6 +916,7 @@ public final class MediaCodec {
         synchronized (mAsyncLock) {
             mAsyncRunning = false;
             mAsyncThread = null;
+            mAsyncLock.notifyAll();
         }
     }
     // Releases any polled-but-not-yet-released video frames (native
@@ -694,9 +942,18 @@ public final class MediaCodec {
         com.macapk.loader.NativeMedia::nativeVidReleaseFrame;
 
     /** Called with mAsyncLock held, like tryDequeueOutputLocked0. */
+    private long[] nextVideoToolboxPolledLocked(long dec) {
+        if (mStashedVidFrame != null) {
+            long[] stashed = mStashedVidFrame;
+            mStashedVidFrame = null;
+            return stashed;
+        }
+        return com.macapk.loader.NativeMedia.nativeVidPoll(dec);
+    }
+
     private long[] reorderPoll() {
         final long dec = mVidDec;
-        return mReorder.poll(() -> com.macapk.loader.NativeMedia.nativeVidPoll(dec), RELEASE_FRAME);
+        return mReorder.poll(() -> nextVideoToolboxPolledLocked(dec), RELEASE_FRAME);
     }
     private void resetReorder() { mReorder.reset(RELEASE_FRAME); }
 
@@ -730,7 +987,7 @@ public final class MediaCodec {
                 held.add(f);
             }
             // Strict safety cap: never let held accumulate unbounded unrendered frames
-            while (held.size() > 8) {
+            while (held.size() > 20) {
                 long[] dropped = held.poll();
                 if (dropped != null && dropped[0] != 0) {
                     release.accept(dropped[0]);
@@ -761,6 +1018,12 @@ public final class MediaCodec {
     private void releasePendingVideoFrames() {
         resetReorder();
         drainTimedFrames(false);
+        if (mStashedVidFrame != null) {
+            if (mStashedVidFrame[0] != 0) {
+                com.macapk.loader.NativeMedia.nativeVidReleaseFrame(mStashedVidFrame[0]);
+            }
+            mStashedVidFrame = null;
+        }
         if (mOutPixbuf == null) return;
         for (int i = 0; i < mOutPixbuf.length; i++) {
             if (mOutPixbuf[i] != 0) {
@@ -770,9 +1033,19 @@ public final class MediaCodec {
         }
     }
     private void releaseDec() {
+        long encToClose = 0;
+        long vidEncToClose = 0;
         synchronized (mAsyncLock) {
             mStarted = false;
             mAsyncLock.notifyAll();
+            boolean interrupted = false;
+            while (mVidWaiters > 0) {
+                try { mAsyncLock.wait(); }
+                catch (InterruptedException ie) { interrupted = true; }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
+            if (mEnc != 0) { encToClose = mEnc; mEnc = 0; }
+            if (mVidEnc != 0) { vidEncToClose = mVidEnc; mVidEnc = 0; }
             if (mDec != 0) { com.macapk.loader.NativeMedia.nativeDecClose(mDec); mDec = 0; }
             if (mVidDec != 0) {
                 releasePendingVideoFrames();
@@ -782,10 +1055,15 @@ public final class MediaCodec {
                 else com.macapk.loader.NativeMedia.nativeVidClose(mVidDec);
                 mVidDec = 0;
             }
-            if (mSurface != null && mSurface.macapkGetSurfaceTexture() != null) {
-                android.graphics.SurfaceTexture.macapkUnregisterVideoTarget(mSurface.macapkGetSurfaceTexture());
+            android.view.Surface targetSurface = mOutputTarget.surface;
+            if (targetSurface != null && targetSurface.macapkGetSurfaceTexture() != null) {
+                android.graphics.SurfaceTexture.macapkUnregisterVideoTarget(targetSurface.macapkGetSurfaceTexture());
             }
             mOutQ.clear();
+        }
+        synchronized (mEncSubmitLock) {
+            if (encToClose != 0) com.macapk.loader.NativeMedia.nativeAudioEncClose(encToClose);
+            if (vidEncToClose != 0) com.macapk.loader.NativeMedia.nativeVidEncClose(vidEncToClose);
         }
     }
 
@@ -801,27 +1079,90 @@ public final class MediaCodec {
     // a second thread. That is what lets the existing synchronous
     // queueInputBuffer/releaseOutputBuffer bodies below be reused completely
     // unchanged for the async path, for BOTH audio and video.
+    private boolean hasExternalVideoFeed() {
+        return mVidDec != 0 && !isVp8() && !isVp9();
+    }
+
     private void asyncDispatchLoop() {
         while (true) {
             Callback cb = null;
             boolean formatChanged = false;
             int inIdx = -1, outIdx = -1;
             BufferInfo info = null;
+            long waitDec = 0;
+            long flushSeqBefore = 0;
             synchronized (mAsyncLock) {
                 if (!mAsyncRunning) return;
-                if (mCallback != null && !mAsyncPaused) {
-                    cb = mCallback;
-                    BufferInfo tmp = new BufferInfo();
-                    int r = tryDequeueOutputLocked(tmp);
-                    if (r == INFO_OUTPUT_FORMAT_CHANGED) {
-                        formatChanged = true;
-                    } else if (r >= 0) {
-                        outIdx = r;
-                        info = tmp;
-                    } else if (!mInFree.isEmpty()) {
-                        inIdx = mInFree.poll();
+                if (mCallback == null || mAsyncPaused) {
+                    try {
+                        mAsyncLock.wait();
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    continue;
+                }
+                cb = mCallback;
+                BufferInfo tmp = new BufferInfo();
+                int r = tryDequeueOutputLocked(tmp);
+                if (r == INFO_OUTPUT_FORMAT_CHANGED) {
+                    formatChanged = true;
+                } else if (r >= 0) {
+                    outIdx = r;
+                    info = tmp;
+                } else if (!mInFree.isEmpty()) {
+                    inIdx = mInFree.poll();
+                }
+                if (!formatChanged && outIdx < 0 && inIdx < 0) {
+                    if (mStarted && hasExternalVideoFeed() && !mOutFree.isEmpty()
+                            && com.macapk.loader.NativeMedia.nativeVidQueueDepth(mVidDec) > 0) {
+                        waitDec = mVidDec;
+                        flushSeqBefore = mFlushSeq;
+                        mVidWaiters++;
+                    } else {
+                        try {
+                            mAsyncLock.wait();
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        continue;
                     }
                 }
+            }
+            if (waitDec != 0) {
+                long[] waitedFrame = null;
+                boolean linkFallback = false;
+                try {
+                    try {
+                        waitedFrame = com.macapk.loader.NativeMedia.nativeVidWaitPoll(waitDec, 2000L);
+                    } catch (UnsatisfiedLinkError ule) {
+                        linkFallback = true;
+                        waitedFrame = com.macapk.loader.NativeMedia.nativeVidPoll(waitDec);
+                    }
+                } finally {
+                    synchronized (mAsyncLock) {
+                        mVidWaiters--;
+                        if (mVidWaiters == 0) mAsyncLock.notifyAll();
+                        if (waitedFrame != null) {
+                            if (mStarted && mVidDec == waitDec && mFlushSeq == flushSeqBefore) {
+                                if (mStashedVidFrame != null && mStashedVidFrame[0] != 0) {
+                                    RELEASE_FRAME.accept(mStashedVidFrame[0]);
+                                }
+                                mStashedVidFrame = waitedFrame;
+                                waitedFrame = null;
+                                mAsyncLock.notifyAll();
+                            }
+                        } else if (linkFallback && mAsyncRunning && mStarted && !mAsyncPaused) {
+                            try { mAsyncLock.wait(2); }
+                            catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+                        }
+                    }
+                    if (waitedFrame != null && waitedFrame[0] != 0) {
+                        RELEASE_FRAME.accept(waitedFrame[0]);
+                    }
+                }
+                continue;
             }
             if (cb != null) {
                 try {
@@ -829,14 +1170,6 @@ public final class MediaCodec {
                     else if (outIdx >= 0) cb.onOutputBufferAvailable(this, outIdx, info);
                     else if (inIdx >= 0)  cb.onInputBufferAvailable(this, inIdx);
                 } catch (Throwable ignore) {}
-            }
-            if (!formatChanged && outIdx < 0 && inIdx < 0) {
-                // Nothing to do this pass (buffers full / queue empty): a
-                // short poll interval rather than a real wait/notify, same
-                // trade-off ToneGenerator's render loop already makes
-                // elsewhere in this package for a non-hot-path thread.
-                try { Thread.sleep(5); }
-                catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
             }
         }
     }
@@ -889,23 +1222,136 @@ public final class MediaCodec {
 
     private static int ceilDiv(int num, int den) { return (num + den - 1) / den; }
 
+    private static int resolveEncoderInputCapacity(MediaFormat format, boolean isVideo,
+                                                   int colorFormat, int width, int height,
+                                                   int stride, int sliceHeight) {
+        final int CEILING = 32 << 20;
+        int declared = format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 0);
+        long rawMin = IN_CAP;
+        if (isVideo && width > 0 && height > 0) {
+            int effW = Math.max(width, stride);
+            int effH = Math.max(height, sliceHeight);
+            boolean is32BitRgb =
+                    colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_Format32bitBGRA8888
+                 || colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_Format32bitARGB8888
+                 || colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_Format32bitABGR8888
+                 || colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatRGBAFlexible;
+            if (is32BitRgb) {
+                int rowBytes = (stride >= width * 4) ? stride : effW * 4;
+                rawMin = (long) rowBytes * (long) effH;
+            } else {
+                rawMin = ((long) effW * (long) effH * 3L + 1L) / 2L;
+            }
+        }
+        long base = Math.max(IN_CAP, rawMin);
+        if (declared > 0) base = Math.max(base, (long) declared);
+        return (int) Math.min(CEILING, base);
+    }
+
     public ByteBuffer[] getInputBuffers()  { return mIn  != null ? mIn  : new ByteBuffer[0]; }
     public ByteBuffer[] getOutputBuffers() { return mOut != null ? mOut : new ByteBuffer[0]; }
     public ByteBuffer getInputBuffer(int index)  { return (mIn  != null && index >= 0 && index < mIn.length)  ? mIn[index]  : null; }
     // AOSP: "the ByteBuffer... will be null if configured with an output
-    // surface". Even without a surface our video output is an opaque native
-    // pixel buffer with no meaningful ByteBuffer view -- use getOutputImage.
+    // surface". For a video decoder output is an opaque native pixel buffer;
+    // for a video encoder output is a compressed bitstream ByteBuffer.
     public ByteBuffer getOutputBuffer(int index) {
-        if (mIsVideo) return null;
+        if (mIsVideo && !mIsEncoder) return null;
         return (mOut != null && index >= 0 && index < mOut.length) ? mOut[index] : null;
     }
-    public Image getInputImage(int index) { return null; }
+    public Image getInputImage(int index) {
+        if (!mIsEncoder || !mIsVideo || mInputSurface != null || mIn == null
+                || index < 0 || index >= mIn.length || mVidWidth <= 0 || mVidHeight <= 0) {
+            return null;
+        }
+        return new NativeInputYuvImage(mIn[index], mVidWidth, mVidHeight,
+                Math.max(mVidWidth, mEncStride), Math.max(mVidHeight, mEncSliceHeight),
+                mEncColorFormat);
+    }
     public Image getOutputImage(int index) {
-        if (!mIsVideo || mOutPixbuf == null || index < 0 || index >= mOutPixbuf.length) return null;
+        if (!mIsVideo || mIsEncoder || mOutPixbuf == null || index < 0 || index >= mOutPixbuf.length) return null;
         long pb = mOutPixbuf[index];
         if (pb == 0) return null;
         long ptsUs = (mOutPts != null) ? mOutPts[index] : 0;
         return new NativeVideoImage(pb, ptsUs, mVidWidth, mVidHeight);
+    }
+
+    private static final class NativeInputYuvImage extends Image {
+        private final ByteBuffer mBacking;
+        private final int mW, mH;
+        private final Plane[] mPlanes;
+        private long mTsUs = 0;
+        private boolean mClosed = false;
+
+        NativeInputYuvImage(ByteBuffer backing, int w, int h, int stride, int sliceHeight, int colorFormat) {
+            mBacking = backing;
+            mW = w;
+            mH = h;
+            boolean semi = (colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+                         || colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420PackedSemiPlanar);
+            int cw = (w + 1) / 2;
+            int ch = (h + 1) / 2;
+            int uvStride = (stride + 1) / 2;
+            int uvSlice = (sliceHeight + 1) / 2;
+            int yBytes = stride * sliceHeight;
+
+            ByteBuffer yBuf = backing.duplicate();
+            yBuf.position(0);
+            yBuf.limit(Math.min(backing.capacity(), yBytes));
+            ByteBuffer ySlice = yBuf.slice();
+
+            if (semi) {
+                int uvBytes = stride * uvSlice;
+                ByteBuffer uBuf = backing.duplicate();
+                int off = Math.min(backing.capacity(), yBytes);
+                uBuf.position(off);
+                uBuf.limit(Math.min(backing.capacity(), off + uvBytes));
+                ByteBuffer uvSliceBuf = uBuf.slice();
+                ByteBuffer vSliceBuf = uvSliceBuf.duplicate();
+                if (vSliceBuf.remaining() > 1) vSliceBuf.position(1);
+                mPlanes = new Plane[] {
+                    new InputPlane(ySlice, stride, 1),
+                    new InputPlane(uvSliceBuf, stride, 2),
+                    new InputPlane(vSliceBuf.slice(), stride, 2),
+                };
+            } else {
+                int uvBytes = uvStride * uvSlice;
+                int uOff = Math.min(backing.capacity(), yBytes);
+                ByteBuffer uBuf = backing.duplicate();
+                uBuf.position(uOff);
+                uBuf.limit(Math.min(backing.capacity(), uOff + uvBytes));
+                int vOff = Math.min(backing.capacity(), uOff + uvBytes);
+                ByteBuffer vBuf = backing.duplicate();
+                vBuf.position(vOff);
+                vBuf.limit(Math.min(backing.capacity(), vOff + cw + (ch - 1) * uvStride));
+                mPlanes = new Plane[] {
+                    new InputPlane(ySlice, stride, 1),
+                    new InputPlane(uBuf.slice(), uvStride, 1),
+                    new InputPlane(vBuf.slice(), uvStride, 1),
+                };
+            }
+        }
+
+        private void checkOpen() {
+            if (mClosed) throw new IllegalStateException("Image is closed");
+        }
+        @Override public int getFormat() { return 35; } // ImageFormat.YUV_420_888
+        @Override public int getWidth()  { return mW; }
+        @Override public int getHeight() { return mH; }
+        @Override public long getTimestamp() { return mTsUs; }
+        @Override public void setTimestamp(long ts) { mTsUs = ts; }
+        @Override public Plane[] getPlanes() { checkOpen(); return mPlanes; }
+        @Override public void close() { mClosed = true; }
+
+        private static final class InputPlane extends Plane {
+            private final ByteBuffer mBuf;
+            private final int mRowStride, mPixelStride;
+            InputPlane(ByteBuffer buf, int rowStride, int pixelStride) {
+                mBuf = buf; mRowStride = rowStride; mPixelStride = pixelStride;
+            }
+            @Override public ByteBuffer getBuffer() { return mBuf; }
+            @Override public int getPixelStride() { return mPixelStride; }
+            @Override public int getRowStride() { return mRowStride; }
+        }
     }
 
     // android.media.Image backed by a polled, not-yet-released decoded video
@@ -1035,6 +1481,7 @@ public final class MediaCodec {
         // per Image; a second call to getPlanes() is the normal AOSP
         // "you may call this more than once" case and must not recompute.
         private void materialize() {
+            final long obsT0 = mObs != null ? System.nanoTime() : 0L;
             byte[] bgra = null;
             int[] whs = new int[3];
             int rc = -1;
@@ -1056,6 +1503,7 @@ public final class MediaCodec {
             }
             if (rc != 0 || bgra == null || whs[0] <= 0 || whs[1] <= 0) {
                 mPlanes = new Plane[0];
+                if (mObs != null) mObs.recordOutputImage(System.nanoTime() - obsT0, 0, mTimestampUs);
                 return;
             }
             final int srcW = whs[0], srcH = whs[1], srcStride = whs[2];
@@ -1117,6 +1565,9 @@ public final class MediaCodec {
                 plane(cbView, cRowStride, 2),
                 plane(crView, cRowStride, 2),
             };
+            if (mObs != null) {
+                mObs.recordOutputImage(System.nanoTime() - obsT0, (srcStride * srcH) + yuv.length, mTimestampUs);
+            }
         }
 
         private ByteBuffer sliceAt(ByteBuffer base, int offset, int length) {
@@ -1174,7 +1625,11 @@ public final class MediaCodec {
 
     public int dequeueInputBuffer(long timeoutUs) {
         final long startedNs = System.nanoTime();
+        int r = INFO_TRY_AGAIN_LATER;
         synchronized (mAsyncLock) {
+          if (mIsEncoder && mInputSurface != null) {
+              throw new IllegalStateException("Cannot dequeueInputBuffer when input Surface is configured");
+          }
           while (mStarted) {
             // AOSP backpressure: if output buffer slots are exhausted or downstream
             // queues (native outQ/inFlight, reorder, timed) are backlogged, throttle input rather than free-running
@@ -1184,23 +1639,29 @@ public final class MediaCodec {
                 int timedCount = timedQueueSize();
                 int reorderCount = mReorder.size();
                 checkWatermarks(reorderCount, timedCount);
-                if (mOutFree.isEmpty() || nativeDepth >= 4 || reorderCount >= 6 || timedCount >= 6) {
+                int reorderCap = Math.max(12, mReorder.depth + 4);
+                if (mOutFree.isEmpty() || nativeDepth >= 16 || reorderCount >= reorderCap || timedCount >= 12) {
                     ready = false;
                 }
             }
-            if (ready) return mInFree.poll();
+            if (ready) { r = mInFree.poll(); break; }
             if (!waitForBufferLocked(timeoutUs, startedNs)) break;
           }
-          return INFO_TRY_AGAIN_LATER;
         }
+        if (mObs != null) mObs.recordDequeueIn(r, System.nanoTime() - startedNs);
+        return r;
     }
 
-    // Native decoder callbacks do not signal this Java monitor. Poll with a
-    // bounded sleep that releases the lock so output consumption can progress.
+    // Poll bounded at 2 ms while VideoToolbox has in-flight frames or timed queue
+    // pressure needs external drain; otherwise cap at 20 ms (or exact remaining
+    // timeout) so notifyAll() still wakes immediately without 500 Hz idle spin.
     // timeoutUs == 0 is non-blocking; negative means wait indefinitely.
     private boolean waitForBufferLocked(long timeoutUs, long startedNs) {
         if (timeoutUs == 0) return false;
-        long waitNs = 2_000_000L;
+        final boolean needShortPoll = timedQueueSize() >= 12
+            || (hasExternalVideoFeed() && !mOutFree.isEmpty()
+                && com.macapk.loader.NativeMedia.nativeVidQueueDepth(mVidDec) > 0);
+        long waitNs = needShortPoll ? 2_000_000L : 20_000_000L;
         if (timeoutUs > 0) {
             long remaining = java.util.concurrent.TimeUnit.MICROSECONDS.toNanos(timeoutUs)
                 - (System.nanoTime() - startedNs);
@@ -1217,38 +1678,131 @@ public final class MediaCodec {
     }
     public void queueInputBuffer(int index, int offset, int size, long presentationTimeUs, int flags) {
         if (PRESENT_TRACE && mIsVideo) traceIn();
+        final long obsT0 = mObs != null ? System.nanoTime() : 0L;
+        boolean eos = false;
+        boolean accepted = false;
+        long vidDecHandle = 0;
+        long vidDecFlushSeq = 0;
+        byte[] vidAu = null;
+        long vidEncHandle = 0;
+        long audioEncHandle = 0;
+        ByteBuffer vidInBuf = null;
+        byte[] audioPcm = null;
+        boolean codecConfig = false;
+
         synchronized (mAsyncLock) {
             if (!mStarted) return;
-            boolean eos = (flags & BUFFER_FLAG_END_OF_STREAM) != 0;
-            boolean codecConfig = (flags & BUFFER_FLAG_CODEC_CONFIG) != 0;
+            if (mIsEncoder && mInputSurface != null) {
+                throw new IllegalStateException("Cannot queueInputBuffer when input Surface is configured");
+            }
+            accepted = true;
+            eos = (flags & BUFFER_FLAG_END_OF_STREAM) != 0;
+            codecConfig = (flags & BUFFER_FLAG_CODEC_CONFIG) != 0;
             if (size > 0 && !codecConfig) com.macapk.loader.MediaStats.codecIn(mStat);
-            byte[] au = null;
-            if (size > 0 && !codecConfig && mIn != null && index >= 0 && index < mIn.length) {
-                ByteBuffer b = mIn[index].duplicate(); b.position(offset); b.limit(offset + size);
-                au = new byte[size]; b.get(au);
-            }
-            if (mVidDec != 0) {
-                // AOSP: codec-specific data "is automatically submitted to
-                // the codec upon start(); you MUST NOT submit this data
-                // explicitly" -- our video open() already built the format
-                // description from the configure()-time csd-0/csd-1, so a
-                // codec-config-flagged buffer here is a legitimate no-op for
-                // the payload (matching the audio branch below), though an
-                // EOS flag riding along with one must still be honored.
-                if (!codecConfig) {
-                    vidDecode(au, presentationTimeUs, eos);
-                } else if (eos) {
-                    vidDecode(null, presentationTimeUs, true);
+
+            if (mIsEncoder && mVidEnc != 0) {
+                vidEncHandle = mVidEnc;
+                vidInBuf = (!codecConfig && size > 0 && mIn != null && index >= 0 && index < mIn.length)
+                        ? mIn[index] : null;
+                if (eos) mEncEosQueued = true;
+            } else if (mIsEncoder && mEnc != 0) {
+                audioEncHandle = mEnc;
+                if (!codecConfig && size > 0 && mIn != null && index >= 0 && index < mIn.length) {
+                    ByteBuffer b = mIn[index].duplicate();
+                    b.position(offset);
+                    b.limit(offset + size);
+                    audioPcm = new byte[size];
+                    b.get(audioPcm);
                 }
-            } else if (mDec != 0 && !codecConfig) {
-                byte[] pcm = com.macapk.loader.NativeMedia.nativeDecDecode(mDec, au, eos);
-                if (pcm != null && (pcm.length > 0 || eos))
-                    mOutQ.add(new OutEntry(pcm, presentationTimeUs, eos ? BUFFER_FLAG_END_OF_STREAM : 0));
-            } else if (eos) {
-                mOutQ.add(new OutEntry(new byte[0], presentationTimeUs, BUFFER_FLAG_END_OF_STREAM));
+                if (eos) mEncEosQueued = true;
+            } else {
+                byte[] au = null;
+                if (size > 0 && !codecConfig && mIn != null && index >= 0 && index < mIn.length) {
+                    ByteBuffer b = mIn[index].duplicate(); b.position(offset); b.limit(offset + size);
+                    au = new byte[size]; b.get(au);
+                }
+                if (mVidDec != 0) {
+                    if (!codecConfig || eos) {
+                        vidDecHandle = mVidDec;
+                        vidDecFlushSeq = mFlushSeq;
+                        vidAu = codecConfig ? null : au;
+                        mVidWaiters++;
+                    } else {
+                        if (index >= 0 && index < IN_BUFS) mInFree.add(index);
+                        mAsyncLock.notifyAll();
+                    }
+                } else {
+                    if (mDec != 0 && !codecConfig) {
+                        byte[] pcm = com.macapk.loader.NativeMedia.nativeDecDecode(mDec, au, eos);
+                        if (pcm != null && (pcm.length > 0 || eos))
+                            mOutQ.add(new OutEntry(pcm, presentationTimeUs, eos ? BUFFER_FLAG_END_OF_STREAM : 0));
+                    } else if (eos) {
+                        mOutQ.add(new OutEntry(new byte[0], presentationTimeUs, BUFFER_FLAG_END_OF_STREAM));
+                    }
+                    if (index >= 0 && index < IN_BUFS) mInFree.add(index);
+                    mAsyncLock.notifyAll();
+                }
             }
-            if (index >= 0 && index < IN_BUFS) mInFree.add(index);
         }
+
+        if (vidDecHandle != 0) {
+            try {
+                synchronized (mEncSubmitLock) {
+                    if (mStarted && mVidDec == vidDecHandle && mFlushSeq == vidDecFlushSeq) {
+                        vidDecode(vidDecHandle, vidAu, presentationTimeUs, eos);
+                    }
+                }
+            } finally {
+                synchronized (mAsyncLock) {
+                    mVidWaiters--;
+                    if (mIn != null && index >= 0 && index < IN_BUFS && mFlushSeq == vidDecFlushSeq) {
+                        mInFree.add(index);
+                    }
+                    mAsyncLock.notifyAll();
+                }
+            }
+        } else if (vidEncHandle != 0) {
+            if (!codecConfig || eos) {
+                ByteBuffer directBuf = (vidInBuf != null && vidInBuf.isDirect()) ? vidInBuf : null;
+                byte[] heapArr = (vidInBuf != null && !vidInBuf.isDirect() && vidInBuf.hasArray())
+                        ? vidInBuf.array() : null;
+                int bufOff = (heapArr != null) ? (vidInBuf.arrayOffset() + offset) : offset;
+                int submitSize = (vidInBuf != null && !codecConfig) ? size : 0;
+                synchronized (mEncSubmitLock) {
+                    if (mVidEnc == vidEncHandle) {
+                        com.macapk.loader.NativeMedia.nativeVidEncEncodeBuffer(
+                                vidEncHandle, directBuf, heapArr, bufOff, submitSize,
+                                mEncColorFormat, mEncStride, mEncSliceHeight,
+                                presentationTimeUs, eos);
+                    }
+                }
+            }
+            synchronized (mAsyncLock) {
+                pollVideoEncoderLocked();
+                if (mIn != null && index >= 0 && index < mIn.length && mInputSurface == null) {
+                    mInFree.add(index);
+                }
+                mAsyncLock.notifyAll();
+            }
+        } else if (audioEncHandle != 0) {
+            synchronized (mEncSubmitLock) {
+                if (mEnc == audioEncHandle) {
+                    com.macapk.loader.NativeMedia.nativeAudioEncEncode(
+                            audioEncHandle, audioPcm, 0,
+                            audioPcm != null ? audioPcm.length : 0,
+                            presentationTimeUs, eos);
+                }
+            }
+            synchronized (mAsyncLock) {
+                pollAudioEncoderLocked();
+                if (mIn != null && index >= 0 && index < mIn.length) {
+                    mInFree.add(index);
+                }
+                mAsyncLock.notifyAll();
+            }
+        }
+
+        if (mObs != null && accepted) mObs.recordQueueIn(index, size, presentationTimeUs, eos, System.nanoTime() - obsT0);
     }
     public void queueSecureInputBuffer(int index, int offset, CryptoInfo info,
                                        long presentationTimeUs, int flags) {
@@ -1256,14 +1810,75 @@ public final class MediaCodec {
     }
     public int dequeueOutputBuffer(BufferInfo info, long timeoutUs) {
         final long startedNs = System.nanoTime();
-        synchronized (mAsyncLock) {
-            int result;
-            do {
+        int result = INFO_TRY_AGAIN_LATER;
+        while (true) {
+            long waitDec = 0;
+            long waitUs = 0;
+            long flushSeqBefore = 0;
+            synchronized (mAsyncLock) {
                 result = tryDequeueOutputLocked(info);
-                if (result != INFO_TRY_AGAIN_LATER || !mStarted) return result;
-            } while (waitForBufferLocked(timeoutUs, startedNs));
-            return INFO_TRY_AGAIN_LATER;
+                if (result != INFO_TRY_AGAIN_LATER || !mStarted || timeoutUs == 0) break;
+                if (timeoutUs > 0) {
+                    long remainingNs = java.util.concurrent.TimeUnit.MICROSECONDS.toNanos(timeoutUs)
+                        - (System.nanoTime() - startedNs);
+                    if (remainingNs <= 0) break;
+                }
+                if (hasExternalVideoFeed() && !mOutFree.isEmpty()
+                        && com.macapk.loader.NativeMedia.nativeVidQueueDepth(mVidDec) > 0) {
+                    waitDec = mVidDec;
+                    flushSeqBefore = mFlushSeq;
+                    if (timeoutUs < 0) {
+                        waitUs = 2000L;
+                    } else {
+                        long remNs = java.util.concurrent.TimeUnit.MICROSECONDS.toNanos(timeoutUs)
+                            - (System.nanoTime() - startedNs);
+                        waitUs = Math.min(2000L, Math.max(1L, (remNs + 999L) / 1000L));
+                    }
+                    mVidWaiters++;
+                } else {
+                    if (!waitForBufferLocked(timeoutUs, startedNs)) break;
+                    continue;
+                }
+            }
+            long[] waitedFrame = null;
+            boolean linkFallback = false;
+            boolean keepWaiting = true;
+            try {
+                try {
+                    waitedFrame = com.macapk.loader.NativeMedia.nativeVidWaitPoll(waitDec, waitUs);
+                } catch (UnsatisfiedLinkError ule) {
+                    linkFallback = true;
+                    waitedFrame = com.macapk.loader.NativeMedia.nativeVidPoll(waitDec);
+                }
+            } finally {
+                synchronized (mAsyncLock) {
+                    mVidWaiters--;
+                    if (mVidWaiters == 0) mAsyncLock.notifyAll();
+                    if (waitedFrame != null) {
+                        if (mStarted && mVidDec == waitDec && mFlushSeq == flushSeqBefore) {
+                            if (mStashedVidFrame != null && mStashedVidFrame[0] != 0) {
+                                RELEASE_FRAME.accept(mStashedVidFrame[0]);
+                            }
+                            mStashedVidFrame = waitedFrame;
+                            waitedFrame = null;
+                            mAsyncLock.notifyAll();
+                        }
+                    } else if (linkFallback && mStarted && mVidDec == waitDec && mFlushSeq == flushSeqBefore) {
+                        keepWaiting = waitForBufferLocked(timeoutUs, startedNs);
+                    }
+                }
+                if (waitedFrame != null && waitedFrame[0] != 0) {
+                    RELEASE_FRAME.accept(waitedFrame[0]);
+                }
+            }
+            if (!keepWaiting) break;
         }
+        if (mObs != null) {
+            int outSz = (result >= 0 && info != null) ? Math.max(0, info.size) : 0;
+            long outPts = (result >= 0 && info != null) ? info.presentationTimeUs : -1L;
+            mObs.recordDequeueOut(result, outSz, outPts, System.nanoTime() - startedNs);
+        }
+        return result;
     }
     // Shared output-selection logic for the synchronous dequeueOutputBuffer()
     // and the async dispatch loop (asyncDispatchLoop mirrors this rather than
@@ -1278,6 +1893,33 @@ public final class MediaCodec {
     }
     private int tryDequeueOutputLocked0(BufferInfo info) {
         if (!mStarted) return INFO_TRY_AGAIN_LATER;
+        if (mIsEncoder && mIsVideo) {
+            pollVideoEncoderLocked();
+            if (!mFormatReported) {
+                if (mOutQ.isEmpty()) return INFO_TRY_AGAIN_LATER;
+                if (mEncOutFormat != null && mVidEnc != 0) {
+                    byte[] c0 = com.macapk.loader.NativeMedia.nativeVidEncCsd0(mVidEnc);
+                    if (c0 != null && c0.length > 0) {
+                        mEncOutFormat.setByteBuffer("csd-0", ByteBuffer.wrap(c0));
+                    }
+                    byte[] c1 = com.macapk.loader.NativeMedia.nativeVidEncCsd1(mVidEnc);
+                    if (c1 != null && c1.length > 0) {
+                        mEncOutFormat.setByteBuffer("csd-1", ByteBuffer.wrap(c1));
+                    }
+                }
+                mFormatReported = true;
+                return INFO_OUTPUT_FORMAT_CHANGED;
+            }
+            if (mOutQ.isEmpty() || mOutFree.isEmpty()) return INFO_TRY_AGAIN_LATER;
+            OutEntry e = mOutQ.poll();
+            int oi = mOutFree.poll();
+            mOut[oi] = ByteBuffer.wrap(e.pcm);
+            info.set(0, e.pcm.length, e.pts, e.flags);
+            return oi;
+        }
+        if (mIsEncoder) {
+            pollAudioEncoderLocked();
+        }
         // AOSP reports the output format once before the first buffer.
         if (!mFormatReported) { mFormatReported = true; return INFO_OUTPUT_FORMAT_CHANGED; }
         if (mVidDec != 0) {
@@ -1287,10 +1929,14 @@ public final class MediaCodec {
                 : isVp9()
                 ? com.macapk.loader.NativeMedia.nativeVp9Poll(mVidDec)
                 : VIDEO_REORDER ? reorderPoll()
-                : com.macapk.loader.NativeMedia.nativeVidPoll(mVidDec);
+                : nextVideoToolboxPolledLocked(mVidDec);
             if (polled == null) return INFO_TRY_AGAIN_LATER;
             int oi = mOutFree.poll();
             if (PRESENT_TRACE) traceOut();
+            if (polled[0] != 0) {
+                android.view.Surface.macapkRecordProducerStat(
+                    mOutputTarget.surface, android.view.Surface.STAT_DEQUEUED_OUT);
+            }
             mOutPixbuf[oi] = polled[0];
             mOutPts[oi] = polled[1];
             // No real "compressed size" applies to an opaque decoded pixel
@@ -1326,31 +1972,54 @@ public final class MediaCodec {
         return oi;
     }
     public void releaseOutputBuffer(int index, boolean render) {
+        long pb = 0;
+        long ptsUs = 0L;
+        OutputTarget target = null;
+        boolean videoSlot = false;
         synchronized (mAsyncLock) {
-            if (mIsVideo && mOutPixbuf != null && index >= 0 && index < mOutPixbuf.length) {
-                long pb = mOutPixbuf[index];
-                mOutPixbuf[index] = 0;
-                if (pb != 0) {
+            try {
+                if (mIsVideo && !mIsEncoder && mOutPixbuf != null && index >= 0 && index < mOutPixbuf.length) {
+                    videoSlot = true;
+                    pb = mOutPixbuf[index];
+                    ptsUs = (mOutPts != null && index < mOutPts.length) ? mOutPts[index] : 0L;
+                    mOutPixbuf[index] = 0;
+                    target = mOutputTarget;
+                    if (mOut != null && index < mOut.length) mOut[index] = null;
+                    mOutFree.add(index);
+                } else {
+                    if (mOut != null && index >= 0 && index < mOut.length) { mOut[index] = null; mOutFree.add(index); }
+                }
+            } finally {
+                mAsyncLock.notifyAll();
+            }
+        }
+        if (videoSlot) {
+            if (pb != 0) {
+                try {
+                    android.view.Surface.macapkRecordProducerStat(
+                        target.surface, render ? android.view.Surface.STAT_RELEASE_TRUE
+                                               : android.view.Surface.STAT_RELEASE_FALSE);
                     // render=true is the whole point of this project's video
                     // work: composite the decoded frame onto the configured
                     // Surface for real (video_toolbox.mm's
                     // macapk_vtb_render_frame -> cocoa_bridge.mm's
                     // CocoaPresentVideoFrame), not merely decode it.
                     if (PRESENT_TRACE && !render) mTraceAppDrops++;
-                    if (render && mHasSurface) {
+                    if (render && target.hasSurface && target.gen == mCodecSurfaceGen.get()) {
                         if (PRESENT_TRACE) tracePresent();
-                        com.macapk.loader.NativeMedia.nativeVidRenderToSurface(pb, mVidWidth, mVidHeight,
-                            mSurface != null ? mSurface.macapkGetSurfaceTexture() : null);
-                        com.macapk.loader.MediaStats.codecRendered(mStat);
+                        // Android API 23+ contract: releaseOutputBuffer(i, true)
+                        // attaches presentationTimeUs * 1000 as the SurfaceTexture
+                        // nanosecond presentation timestamp.
+                        renderDecodedFrameToTarget(target, pb, ptsUs * 1000L);
                     }
+                } finally {
                     com.macapk.loader.NativeMedia.nativeVidReleaseFrame(pb);
                 }
-                if (mOut != null && index < mOut.length) mOut[index] = null;
-                mOutFree.add(index);
-                return;
             }
-            if (mOut != null && index >= 0 && index < mOut.length) { mOut[index] = null; mOutFree.add(index); }
+            if (mObs != null) mObs.recordReleaseOut(index, render);
+            return;
         }
+        if (mObs != null) mObs.recordReleaseOut(index, render);
     }
     /** AOSP releaseOutputBuffer(index, renderTimestampNs): the frame is shown
      *  AT that System.nanoTime() timestamp (SurfaceFlinger latches, per vsync,
@@ -1362,32 +2031,60 @@ public final class MediaCodec {
      *  judder (ytdlnis's preview player, owner report 2026-10-19).
      *  MACAPK_VIDEO_TIMED_RELEASE=0 restores present-on-release. */
     public void releaseOutputBuffer(int index, long renderTimestampNs) {
-        if (!VIDEO_TIMED_RELEASE || !mIsVideo || !mHasSurface) { releaseOutputBuffer(index, true); return; }
+        OutputTarget checkTarget = mOutputTarget;
+        if (!mIsVideo || mIsEncoder || !checkTarget.hasSurface) { releaseOutputBuffer(index, true); return; }
         long pb = 0;
+        OutputTarget target;
         synchronized (mAsyncLock) {
-            if (mOutPixbuf != null && index >= 0 && index < mOutPixbuf.length) {
-                pb = mOutPixbuf[index];
-                mOutPixbuf[index] = 0;
-                if (mOut != null && index < mOut.length) mOut[index] = null;
-                mOutFree.add(index);
-            } else {
-                if (mOut != null && index >= 0 && index < mOut.length) { mOut[index] = null; mOutFree.add(index); }
-                return;
+            try {
+                target = mOutputTarget;
+                if (mOutPixbuf != null && index >= 0 && index < mOutPixbuf.length) {
+                    pb = mOutPixbuf[index];
+                    mOutPixbuf[index] = 0;
+                    if (mOut != null && index < mOut.length) mOut[index] = null;
+                    mOutFree.add(index);
+                } else {
+                    if (mOut != null && index >= 0 && index < mOut.length) { mOut[index] = null; mOutFree.add(index); }
+                    if (mObs != null) mObs.recordReleaseOut(index, false);
+                    return;
+                }
+            } finally {
+                mAsyncLock.notifyAll();
             }
         }
+        if (mObs != null) mObs.recordReleaseOut(index, pb != 0);
         if (pb == 0) return;
+        android.view.Surface.macapkRecordProducerStat(
+            target.surface, android.view.Surface.STAT_RELEASE_TIMED);
+        if (!VIDEO_TIMED_RELEASE) {
+            try {
+                if (target.gen == mCodecSurfaceGen.get()) {
+                    if (PRESENT_TRACE) tracePresent();
+                    renderDecodedFrameToTarget(target, pb, renderTimestampNs);
+                }
+            } finally {
+                com.macapk.loader.NativeMedia.nativeVidReleaseFrame(pb);
+            }
+            return;
+        }
         long now = System.nanoTime();
         if (PRESENT_TRACE) { traceEarly(renderTimestampNs - now); traceDue(renderTimestampNs); }
         long due = renderTimestampNs;
         if (due < now || due - now > 1_000_000_000L) due = now;   // late, or "not within a second": now
         synchronized (mTimedLock) {
+            if (target.gen != mCodecSurfaceGen.get()) {
+                com.macapk.loader.NativeMedia.nativeVidReleaseFrame(pb);
+                return;
+            }
             while (mTimed.size() >= 8) {
                 long[] old = mTimed.pollFirst();
                 if (old != null && old[0] != 0) {
                     com.macapk.loader.NativeMedia.nativeVidReleaseFrame(old[0]);
+                    android.view.Surface.macapkRecordProducerStat(
+                        target.surface, android.view.Surface.STAT_TIMED_OVERFLOW);
                 }
             }
-            mTimed.addLast(new long[]{ pb, due });
+            mTimed.addLast(new long[]{ pb, due, renderTimestampNs, target.gen });
             if (mTimedThread == null || !mTimedThread.isAlive()) {
                 mTimedQuit = false;
                 mTimedThread = new Thread(this::timedPresentLoop, "MediaCodec:VideoPresent");
@@ -1463,6 +2160,12 @@ public final class MediaCodec {
     private void timedPresentLoop() {
         synchronized (mTimedLock) {
             while (!mTimedQuit) {
+                while (!mTimed.isEmpty() && mTimed.peekFirst()[3] != mCodecSurfaceGen.get()) {
+                    long[] stale = mTimed.pollFirst();
+                    if (stale != null && stale[0] != 0) {
+                        com.macapk.loader.NativeMedia.nativeVidReleaseFrame(stale[0]);
+                    }
+                }
                 long[] head = mTimed.peekFirst();
                 if (head == null) {
                     try { mTimedLock.wait(); } catch (InterruptedException e) { return; }
@@ -1474,25 +2177,53 @@ public final class MediaCodec {
                     catch (InterruptedException e) { return; }
                     continue;
                 }
-                long now = System.nanoTime();
+                long curGen = mCodecSurfaceGen.get();
                 long[] show = mTimed.pollFirst();
+                if (show == null) continue;
+                if (show[3] != curGen) {
+                    if (show[0] != 0) com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);
+                    continue;
+                }
+                long now = System.nanoTime();
                 while (!mTimed.isEmpty() && mTimed.peekFirst()[1] <= now) {
+                    long[] next = mTimed.pollFirst();
+                    if (next == null) break;
+                    if (next[3] != curGen) {
+                        if (next[0] != 0) com.macapk.loader.NativeMedia.nativeVidReleaseFrame(next[0]);
+                        continue;
+                    }
                     com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);   // superseded
-                    show = mTimed.pollFirst();
+                    android.view.Surface.macapkRecordProducerStat(
+                        mOutputTarget.surface, android.view.Surface.STAT_TIMED_SUPERSEDED);
+                    show = next;
                     if (PRESENT_TRACE) mTraceDrops++;
+                }
+                OutputTarget renderTarget = mOutputTarget;
+                if (show[3] != renderTarget.gen || show[3] != mCodecSurfaceGen.get()) {
+                    com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);
+                    continue;
                 }
                 if (PRESENT_TRACE) tracePresent();
                 // Rendering under mTimedLock: drainTimedFrames (flush / stop /
                 // release) waits for an in-flight present instead of freeing
                 // the buffer underneath it.
                 try {
-                    com.macapk.loader.NativeMedia.nativeVidRenderToSurface(show[0], mVidWidth, mVidHeight,
-                        mSurface != null ? mSurface.macapkGetSurfaceTexture() : null);
-                    com.macapk.loader.MediaStats.codecRendered(mStat);
+                    renderDecodedFrameToTarget(renderTarget, show[0], show[2]);
                 } catch (Throwable ignored) {}
                 com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);
             }
         }
+    }
+
+    private void renderDecodedFrameToTarget(OutputTarget target, long pb, long presentationTimeNs) {
+        android.view.Surface s = target != null ? target.surface : null;
+        if (s != null && s.macapkIsRemote()) {
+            s.macapkPresentRemotePixelBuffer(pb, mVidWidth, mVidHeight, presentationTimeNs);
+        } else {
+            com.macapk.loader.NativeMedia.nativeVidRenderToSurface(pb, mVidWidth, mVidHeight,
+                s != null ? s.macapkGetSurfaceTexture() : null, presentationTimeNs);
+        }
+        com.macapk.loader.MediaStats.codecRendered(mStat);
     }
 
     /** Release every queued, not-yet-shown frame (flush / stop / release). */
@@ -1506,17 +2237,25 @@ public final class MediaCodec {
     }
 
     public MediaFormat getOutputFormat() {
+        if (mIsEncoder) {
+            synchronized (mAsyncLock) {
+                if (mEncOutFormat != null) return new MediaFormat(mEncOutFormat);
+            }
+            if (mIsVideo) return MediaFormat.createVideoFormat(mVidMime, mVidWidth, mVidHeight);
+            return MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, mSampleRate, mChannels);
+        }
         if (mIsVideo) {
+            boolean hasSurfaceNow = mOutputTarget.hasSurface;
             MediaFormat f = MediaFormat.createVideoFormat(mVidMime, mVidWidth, mVidHeight);
             f.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                mHasSurface ? MediaFormat.COLOR_FormatSurface : MediaFormat.COLOR_FormatYUV420Flexible);
+                hasSurfaceNow ? MediaFormat.COLOR_FormatSurface : MediaFormat.COLOR_FormatYUV420Flexible);
             f.setInteger(MediaFormat.KEY_STRIDE, mVidWidth);
             f.setInteger(MediaFormat.KEY_SLICE_HEIGHT, mVidHeight);
             f.setInteger(MediaFormat.KEY_CROP_LEFT, 0);
             f.setInteger(MediaFormat.KEY_CROP_TOP, 0);
             f.setInteger(MediaFormat.KEY_CROP_RIGHT, mVidWidth > 0 ? mVidWidth - 1 : 0);
             f.setInteger(MediaFormat.KEY_CROP_BOTTOM, mVidHeight > 0 ? mVidHeight - 1 : 0);
-            if (!mHasSurface) {
+            if (!hasSurfaceNow) {
                 // Describes NativeVideoImage's OWN derived conversion, not
                 // VideoToolbox's internal decode colourimetry -- meaningless
                 // for the Surface path, which composites VideoToolbox's raw
@@ -1534,12 +2273,22 @@ public final class MediaCodec {
         f.setInteger(MediaFormat.KEY_PCM_ENCODING, 2);  // ENCODING_PCM_16BIT
         return f;
     }
-    public MediaFormat getInputFormat() { return new MediaFormat(); }
+    public MediaFormat getInputFormat() {
+        return mInputFormat != null ? new MediaFormat(mInputFormat) : new MediaFormat();
+    }
     public MediaFormat getOutputFormat(int index) { return getOutputFormat(); }
 
     public MediaCodecInfo getCodecInfo() { return MediaCodecInfo.forName(mName); }
 
-    public void setParameters(android.os.Bundle params) {}
+    public void setParameters(android.os.Bundle params) {
+        if (params == null) return;
+        long vidEnc = 0;
+        synchronized (mAsyncLock) { vidEnc = mVidEnc; }
+        if (vidEnc != 0 && params.containsKey(PARAMETER_KEY_REQUEST_SYNC_FRAME)) {
+            int v = params.getInt(PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+            if (v != 0) com.macapk.loader.NativeMedia.nativeVidEncRequestKeyFrame(vidEnc);
+        }
+    }
 
     /** The metrics-bundle keys AOSP publishes for getMetrics(). */
     public static final class MetricsConstants {
@@ -1573,49 +2322,351 @@ public final class MediaCodec {
     public void subscribeToVendorParameters(java.util.List<String> names) { }
     public void unsubscribeFromVendorParameters(java.util.List<String> names) { }
 
-    public android.view.Surface createInputSurface() { return null; }
-    public void signalEndOfInputStream() { }
-    public void detachOutputSurface() { }
-
-    // =====================================================================
-    // API-gap close-out. Signatures from /tmp/aosp_api/android16.txt; behaviour
-    // from frameworks/base/media/java/android/media/MediaCodec.java
-    // (android16-release).
-    //
-    // Two families land here, both of which this backend genuinely lacks, and
-    // both of which report that the AOSP way rather than by pretending:
-    //   * ENCODE (createPersistentInputSurface / setInputSurface). The native
-    //     bridge is decode-only -- com.macapk.loader.NativeMedia has
-    //     nativeDecOpen/nativeVidDecode and no encoder counterpart -- so there
-    //     is no producer to hand a surface to. createInputSurface() above
-    //     already returns null for the same reason.
-    //   * The BLOCK MODEL (getQueueRequest / getOutputFrame / LinearBlock).
-    //     AOSP itself throws IllegalStateException from these unless the codec
-    //     was configured with CONFIGURE_FLAG_USE_BLOCK_MODEL, and this backend
-    //     cannot be, so that documented exception is the terminal answer.
-    // =====================================================================
-
-    /**
-     * API 23. A surface that can be reused across several encoder sessions.
-     * AOSP returns a real surface from the codec service; there is no encoder
-     * here, so this returns the same empty, no-producer Surface the rest of this
-     * tree hands out for a sink that consumes nothing -- non-null, because
-     * AOSP's contract is @NonNull and an app that gets null here NPEs at its
-     * own setInputSurface call instead of learning anything.
-     */
-    public static android.view.Surface createPersistentInputSurface() {
-        return new android.view.Surface();
+    public android.view.Surface createInputSurface() {
+        synchronized (mAsyncLock) {
+            if (mReleased || !mConfigured || !mIsEncoder || !mIsVideo || mStarted) {
+                throw new IllegalStateException(
+                        "createInputSurface requires configured, non-started video encoder");
+            }
+            if (mInputSurface != null) {
+                throw new IllegalStateException("Input surface already created or set");
+            }
+            EncoderInputSurface sur = new EncoderInputSurface(mVidWidth, mVidHeight);
+            mInputSurface = sur;
+            mOwnsInputSurface = true;
+            return sur;
+        }
     }
 
-    /**
-     * API 23. Feeds an encoder from a persistent input surface. AOSP throws
-     * IllegalStateException when the codec is not a configured encoder -- which
-     * it never is here (no encoder backend) -- so that is the answer, rather
-     * than accepting a surface whose frames go nowhere.
-     */
+    public void signalEndOfInputStream() {
+        android.view.Surface inSur;
+        long vidEnc;
+        synchronized (mAsyncLock) {
+            if (mReleased || !mConfigured || !mIsEncoder || !mIsVideo || !mStarted || mInputSurface == null) {
+                throw new IllegalStateException(
+                        "signalEndOfInputStream requires running video encoder with input surface");
+            }
+            inSur = mInputSurface;
+            vidEnc = mVidEnc;
+            if (mEncEosQueued) return;
+        }
+        if (inSur instanceof EncoderInputSurface) {
+            ((EncoderInputSurface) inSur).flushBarrier();
+        }
+        if (vidEnc != 0) {
+            synchronized (mEncSubmitLock) {
+                if (mVidEnc == vidEnc) {
+                    com.macapk.loader.NativeMedia.nativeVidEncEndOfStream(vidEnc);
+                }
+            }
+        }
+        synchronized (mAsyncLock) {
+            mEncEosQueued = true;
+            if (mVidEnc != 0) {
+                pollVideoEncoderLocked();
+            } else {
+                mOutQ.add(new OutEntry(new byte[0], 0L, BUFFER_FLAG_END_OF_STREAM));
+            }
+            mAsyncLock.notifyAll();
+        }
+    }
+
+    public void detachOutputSurface() { }
+
+    public static android.view.Surface createPersistentInputSurface() {
+        return new EncoderInputSurface(0, 0);
+    }
+
     public void setInputSurface(android.view.Surface surface) {
         java.util.Objects.requireNonNull(surface, "surface must not be null");
-        throw new IllegalStateException("MediaCodec is not a configured encoder");
+        synchronized (mAsyncLock) {
+            if (mReleased || !mConfigured || !mIsEncoder || !mIsVideo || mStarted) {
+                throw new IllegalStateException("MediaCodec is not a configured video encoder");
+            }
+            if (!(surface instanceof EncoderInputSurface)) {
+                throw new IllegalArgumentException("surface must be a persistent input surface");
+            }
+            if (mInputSurface != null) {
+                throw new IllegalStateException("Input surface already created or set");
+            }
+            ((EncoderInputSurface) surface).configureSize(mVidWidth, mVidHeight);
+            mInputSurface = surface;
+            mOwnsInputSurface = false;
+        }
+    }
+
+    // Must be called with mAsyncLock held.
+    private void pollAudioEncoderLocked() {
+        if (mEnc == 0) return;
+        long[] meta = new long[2];
+        while (true) {
+            byte[] pkt = com.macapk.loader.NativeMedia.nativeAudioEncPoll(mEnc, meta);
+            if (pkt == null) break;
+            mOutQ.add(new OutEntry(pkt, meta[0], (int) meta[1]));
+        }
+    }
+
+    // Must be called with mAsyncLock held.
+    private void pollVideoEncoderLocked() {
+        if (mVidEnc == 0) return;
+        long[] meta = new long[2];
+        while (true) {
+            byte[] pkt = com.macapk.loader.NativeMedia.nativeVidEncPoll(mVidEnc, meta);
+            if (pkt == null) break;
+            mOutQ.add(new OutEntry(pkt, meta[0], (int) meta[1]));
+        }
+    }
+
+    // Invoked by native VideoToolbox EncOutputCallback (outside VtEncoder::mu).
+    void macapkOnNativeOutput() {
+        synchronized (mAsyncLock) {
+            mAsyncLock.notifyAll();
+        }
+    }
+
+    private void detachInputSurface() {
+        if (mInputSurface instanceof EncoderInputSurface) {
+            ((EncoderInputSurface) mInputSurface).attachCodec(null);
+        }
+    }
+
+    private void releaseOwnedInputSurface() {
+        if (mInputSurface != null) {
+            if (mOwnsInputSurface) {
+                try { mInputSurface.release(); } catch (Throwable ignored) {}
+            } else if (mInputSurface instanceof EncoderInputSurface) {
+                ((EncoderInputSurface) mInputSurface).attachCodec(null);
+            }
+            mInputSurface = null;
+            mOwnsInputSurface = false;
+        }
+    }
+
+    boolean isEncoderStartedAndOpen() {
+        synchronized (mAsyncLock) {
+            return mStarted && !mReleased && mVidEnc != 0 && !mEncEosQueued;
+        }
+    }
+
+    void submitInputSurfacePixels(int[] argb, int width, int height, long ptsUs) {
+        if (argb == null || width <= 0 || height <= 0) return;
+        long vidEnc;
+        synchronized (mAsyncLock) {
+            if (!mStarted || mReleased || mVidEnc == 0 || mEncEosQueued) return;
+            vidEnc = mVidEnc;
+        }
+        synchronized (mEncSubmitLock) {
+            if (mVidEnc == vidEnc) {
+                com.macapk.loader.NativeMedia.nativeVidEncEncodeArgb(vidEnc, argb, width, height, ptsUs);
+            }
+        }
+        synchronized (mAsyncLock) {
+            pollVideoEncoderLocked();
+            mAsyncLock.notifyAll();
+        }
+    }
+
+    private static final class EncoderInputSurface extends android.view.Surface {
+        private final android.graphics.SurfaceTexture mSt;
+        private final android.os.HandlerThread mThread;
+        private final android.os.Handler mHandler;
+        private final Object mLock = new Object();
+        private MediaCodec mCodec;
+        private int mWidth;
+        private int mHeight;
+        private boolean mReleased = false;
+        private long mFirstTsNs = Long.MIN_VALUE;
+        private long mLastPtsUs = -1L;
+
+        private android.graphics.Bitmap mDrawBitmap;
+        private android.graphics.Canvas mDrawCanvas;
+        private boolean mCanvasLocked = false;
+
+        EncoderInputSurface(int width, int height) {
+            super(createBackingSurfaceTexture(width, height));
+            mSt = super.macapkGetSurfaceTexture();
+            mWidth = width;
+            mHeight = height;
+            mThread = new android.os.HandlerThread("MediaCodec-InputSurface");
+            mThread.setDaemon(true);
+            mThread.start();
+            mHandler = new android.os.Handler(mThread.getLooper());
+            mSt.setOnFrameAvailableListener(new android.graphics.SurfaceTexture.OnFrameAvailableListener() {
+                @Override public void onFrameAvailable(android.graphics.SurfaceTexture surfaceTexture) {
+                    drainLatestFrame();
+                }
+            }, mHandler);
+        }
+
+        private static android.graphics.SurfaceTexture createBackingSurfaceTexture(int w, int h) {
+            android.graphics.SurfaceTexture st = new android.graphics.SurfaceTexture(false);
+            if (w > 0 && h > 0) st.setDefaultBufferSize(w, h);
+            return st;
+        }
+
+        void configureSize(int w, int h) {
+            synchronized (mLock) {
+                mWidth = w;
+                mHeight = h;
+                if (w > 0 && h > 0) mSt.setDefaultBufferSize(w, h);
+            }
+        }
+
+        void attachCodec(MediaCodec codec) {
+            boolean shouldDrain;
+            synchronized (mLock) {
+                mCodec = codec;
+                shouldDrain = (codec != null && !mReleased);
+            }
+            if (shouldDrain) postDrain();
+        }
+
+        void postDrain() {
+            android.os.Handler h;
+            synchronized (mLock) {
+                if (mReleased || mHandler == null || !mThread.isAlive()) return;
+                h = mHandler;
+            }
+            h.post(new Runnable() {
+                @Override public void run() { drainLatestFrame(); }
+            });
+        }
+
+        private long nextPtsUs(long tsNs) {
+            long ptsUs;
+            if (mFirstTsNs == Long.MIN_VALUE) {
+                mFirstTsNs = tsNs;
+                ptsUs = 0L;
+            } else {
+                ptsUs = Math.max(0L, (tsNs - mFirstTsNs) / 1000L);
+            }
+            if (ptsUs <= mLastPtsUs) ptsUs = mLastPtsUs + 1L;
+            mLastPtsUs = ptsUs;
+            return ptsUs;
+        }
+
+        void drainLatestFrame() {
+            MediaCodec codec;
+            int[] px;
+            int w;
+            int h;
+            long ptsUs;
+            synchronized (mLock) {
+                if (mReleased || mCodec == null || !mCodec.isEncoderStartedAndOpen()) return;
+                int prevGen = mSt.macapkLatchGeneration();
+                android.graphics.Bitmap bm = mSt.macapkLatchBitmap();
+                int newGen = mSt.macapkLatchGeneration();
+                if (bm == null || newGen == prevGen) return;
+                px = bm.macapkLiveArgbOrNull();
+                if (px == null) px = bm.macapkArgbBuffer();
+                if (px == null || px.length == 0) return;
+                w = bm.getWidth();
+                h = bm.getHeight();
+                long tsNs = mSt.getTimestamp();
+                ptsUs = nextPtsUs(tsNs > 0 ? tsNs : System.nanoTime());
+                codec = mCodec;
+            }
+            codec.submitInputSurfacePixels(px, w, h, ptsUs);
+        }
+
+        void flushBarrier() {
+            android.os.Handler h;
+            synchronized (mLock) {
+                if (mReleased || mHandler == null || !mThread.isAlive()) return;
+                h = mHandler;
+            }
+            if (Thread.currentThread() == mThread) {
+                drainLatestFrame();
+                return;
+            }
+            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            if (h.post(new Runnable() {
+                @Override public void run() {
+                    try {
+                        drainLatestFrame();
+                    } finally {
+                        latch.countDown();
+                    }
+                }
+            })) {
+                try {
+                    latch.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        @Override public android.graphics.Canvas lockCanvas(android.graphics.Rect dirty) {
+            synchronized (mLock) {
+                if (!isValid() || mReleased) {
+                    throw new IllegalStateException("Surface has already been released.");
+                }
+                if (mCanvasLocked) {
+                    throw new IllegalArgumentException("Surface was already locked");
+                }
+                int w = mWidth > 0 ? mWidth : 640;
+                int h = mHeight > 0 ? mHeight : 480;
+                if (mDrawBitmap == null || mDrawBitmap.getWidth() != w || mDrawBitmap.getHeight() != h) {
+                    mDrawBitmap = android.graphics.Bitmap.createBitmapWithCanvasBacking(w, h);
+                    mDrawCanvas = new android.graphics.Canvas(mDrawBitmap);
+                }
+                mCanvasLocked = true;
+                return mDrawCanvas;
+            }
+        }
+
+        @Override public android.graphics.Canvas lockHardwareCanvas() {
+            return lockCanvas(null);
+        }
+
+        @Override public void unlockCanvasAndPost(android.graphics.Canvas canvas) {
+            MediaCodec codec;
+            android.graphics.Bitmap bm;
+            long ptsUs = 0L;
+            long tsNs = System.nanoTime();
+            synchronized (mLock) {
+                if (!isValid() || mReleased) {
+                    throw new IllegalStateException("Surface has already been released.");
+                }
+                if (canvas != mDrawCanvas) {
+                    throw new IllegalArgumentException("canvas object must be the same instance "
+                            + "that was previously returned by lockCanvas");
+                }
+                if (!mCanvasLocked) {
+                    throw new IllegalStateException("Surface was not locked");
+                }
+                mCanvasLocked = false;
+                bm = mDrawBitmap;
+                codec = mCodec;
+                if (codec != null && codec.isEncoderStartedAndOpen()) {
+                    ptsUs = nextPtsUs(tsNs);
+                }
+            }
+            if (bm == null) return;
+            int w = bm.getWidth();
+            int h = bm.getHeight();
+            int[] pixels = bm.macapkLiveArgbOrNull();
+            if (pixels == null) pixels = bm.macapkArgbBuffer();
+            if (pixels == null || w <= 0 || h <= 0) return;
+            if (codec != null && codec.isEncoderStartedAndOpen()) {
+                codec.submitInputSurfacePixels(pixels, w, h, ptsUs);
+            } else {
+                mSt.macapkQueueProducerFrame(null, pixels.clone(), w, h, w, null, null, false);
+            }
+        }
+
+        @Override public void release() {
+            synchronized (mLock) {
+                if (mReleased) return;
+                mReleased = true;
+                mCodec = null;
+            }
+            super.release();
+            try { mSt.setOnFrameAvailableListener(null, null); } catch (Throwable ignored) {}
+            try { mSt.release(); } catch (Throwable ignored) {}
+            try { mThread.quitSafely(); } catch (Throwable ignored) {}
+        }
     }
 
     /** API 31, tunneled playback only. Mac.apk has no tunneled path
@@ -1795,6 +2846,140 @@ public final class MediaCodec {
 
         @Override protected void finalize() throws Throwable {
             try { recycle(); } finally { super.finalize(); }
+        }
+    }
+
+    /** Returns bounded observability summary when MACAPK_CODEC_OBS=1, or null when disabled. */
+    public String macapkCodecObsSnapshot() {
+        return mObs != null ? mObs.snapshot("snapshot") : null;
+    }
+
+    /**
+     * MACAPK_CODEC_OBS=1: bounded, default-OFF observability recorder for
+     * MediaCodec queue/wait/output-poll/image-readback boundaries (OBS-001).
+     * Uses System.nanoTime() (monotonic ns), fixed 64-slot ring + dropped counter,
+     * and System.err emission so both macapk-runtime and bare JVM work identically.
+     */
+    private static final class ObsRecorder {
+        static final int MAX_OBS_EVENTS = 64;
+        private static final int OP_DEQ_IN = 1, OP_QUE_IN = 2, OP_DEQ_OUT = 3, OP_GET_IMG = 4, OP_REL_OUT = 5;
+        private static final java.util.concurrent.atomic.AtomicInteger NEXT_ID =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+        private final int codecId = NEXT_ID.incrementAndGet();
+        private final long[] evDurNs = new long[MAX_OBS_EVENTS];
+        private final long[] evPtsUs = new long[MAX_OBS_EVENTS];
+        private final int[] evOp = new int[MAX_OBS_EVENTS];
+        private final int[] evArg = new int[MAX_OBS_EVENTS];
+        private final int[] evBytes = new int[MAX_OBS_EVENTS];
+
+        private String mime = "";
+        private boolean surface;
+        private boolean emitted;
+        private long lastThreadId = -1L;
+        private int threadSwitches;
+        private int evWriteIdx, evBuffered;
+        private long totalEvents, droppedEvents;
+        private long inDeq, inTryAgain, inWaitNs, inQueued, inBytes, eosQueued;
+        private long outFmt, outDeq, outTryAgain, outWaitNs, outMaxWaitNs, outBytes;
+        private long imgCalls, imgBytes, imgNs;
+        private long relCount, relRender;
+
+        synchronized void onStart(String m, boolean surf) {
+            mime = m != null ? m : "";
+            surface = surf;
+            emitted = false;
+            touchThread();
+        }
+
+        private void touchThread() {
+            long tid = Thread.currentThread().getId();
+            if (lastThreadId != -1L && lastThreadId != tid) threadSwitches++;
+            lastThreadId = tid;
+        }
+
+        private void pushEvent(int op, int arg, int bytes, long ptsUs, long durNs) {
+            totalEvents++;
+            if (evBuffered < MAX_OBS_EVENTS) {
+                evBuffered++;
+            } else {
+                droppedEvents++;
+            }
+            evOp[evWriteIdx] = op;
+            evArg[evWriteIdx] = arg;
+            evBytes[evWriteIdx] = bytes;
+            evPtsUs[evWriteIdx] = ptsUs;
+            evDurNs[evWriteIdx] = durNs;
+            evWriteIdx = (evWriteIdx + 1) % MAX_OBS_EVENTS;
+        }
+
+        synchronized void recordDequeueIn(int ret, long durNs) {
+            touchThread();
+            if (ret >= 0) inDeq++; else inTryAgain++;
+            inWaitNs += durNs;
+            pushEvent(OP_DEQ_IN, ret, 0, -1L, durNs);
+        }
+
+        synchronized void recordQueueIn(int index, int size, long ptsUs, boolean eos, long durNs) {
+            touchThread();
+            inQueued++;
+            inBytes += Math.max(0, size);
+            if (eos) eosQueued++;
+            pushEvent(OP_QUE_IN, index, Math.max(0, size), ptsUs, durNs);
+        }
+
+        synchronized void recordDequeueOut(int ret, int size, long ptsUs, long durNs) {
+            touchThread();
+            if (ret >= 0) {
+                outDeq++;
+                outBytes += Math.max(0, size);
+            } else if (ret == INFO_OUTPUT_FORMAT_CHANGED) {
+                outFmt++;
+            } else {
+                outTryAgain++;
+            }
+            outWaitNs += durNs;
+            if (durNs > outMaxWaitNs) outMaxWaitNs = durNs;
+            pushEvent(OP_DEQ_OUT, ret, Math.max(0, size), ptsUs, durNs);
+        }
+
+        synchronized void recordOutputImage(long durNs, int bytes, long ptsUs) {
+            touchThread();
+            imgCalls++;
+            imgBytes += Math.max(0, bytes);
+            imgNs += durNs;
+            pushEvent(OP_GET_IMG, 0, Math.max(0, bytes), ptsUs, durNs);
+        }
+
+        synchronized void recordReleaseOut(int index, boolean render) {
+            touchThread();
+            relCount++;
+            if (render) relRender++;
+            pushEvent(OP_REL_OUT, index, render ? 1 : 0, -1L, 0L);
+        }
+
+        synchronized String snapshot(String how) {
+            return String.format(java.util.Locale.ROOT,
+                "[codec-obs] codec#%d end=%s mime=%s surface=%d clock=System.nanoTime unit=ns "
+                + "thr_switches=%d cap=%d retained=%d dropped=%d total_ev=%d "
+                + "in_deq=%d in_try_again=%d in_wait_ns=%d in_q=%d in_bytes=%d eos_q=%d "
+                + "out_fmt=%d out_deq=%d out_try_again=%d out_wait_ns=%d out_max_wait_ns=%d out_bytes=%d "
+                + "img_calls=%d img_bytes=%d img_ns=%d rel=%d rel_render=%d",
+                codecId, how, mime.isEmpty() ? "-" : mime, surface ? 1 : 0,
+                threadSwitches, MAX_OBS_EVENTS, evBuffered, droppedEvents, totalEvents,
+                inDeq, inTryAgain, inWaitNs, inQueued, inBytes, eosQueued,
+                outFmt, outDeq, outTryAgain, outWaitNs, outMaxWaitNs, outBytes,
+                imgCalls, imgBytes, imgNs, relCount, relRender);
+        }
+
+        void emitOnce(String how) {
+            final String line;
+            synchronized (this) {
+                if (emitted) return;
+                emitted = true;
+                line = snapshot(how);
+            }
+            System.err.println(line);
         }
     }
 

@@ -1,0 +1,542 @@
+{
+  "anchors": {
+    "capabilities_sha256": "b6908a469a9b2dc2d27e908297dcd0a295ec098ba05ac7c9ba93678231d27922",
+    "host_jdk_home": "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home",
+    "inventory_sha256": "aeac3a08f01813669b340e899e4f035cbe04acfc394c3122205dd41be417511a",
+    "scenarios_sha256": "80e65affd3462aa9f21b33eaf31231adafeb8b568d9faeeebd0211befcecebce"
+  },
+  "apps": [
+    {
+      "app_id": "comp-service-ipc-abi",
+      "blind_spots": [
+        {
+          "detail": "Exports JNI_OnLoad or references RegisterNatives; dynamically bound JNI methods are unknown statically",
+          "hints": [],
+          "kind": "native_dynamic_jni_registration",
+          "source": "comp-service-ipc-abi.apk!/lib/arm64-v8a/libcompprobe.so"
+        }
+      ],
+      "capabilities_touched": [
+        {
+          "capability_id": "IPC-001",
+          "static_ref_count": 8,
+          "support_status": "partial",
+          "surface": "public_sdk",
+          "verification_status": "contract-tested"
+        },
+        {
+          "capability_id": "IPC-002",
+          "static_ref_count": 2,
+          "support_status": "implemented",
+          "surface": "public_sdk",
+          "verification_status": "contract-tested"
+        },
+        {
+          "capability_id": "IPC-003",
+          "static_ref_count": 1,
+          "support_status": "partial",
+          "surface": "jni_registration",
+          "verification_status": "contract-tested"
+        },
+        {
+          "capability_id": "LIFE-001",
+          "static_ref_count": 2,
+          "support_status": "partial",
+          "surface": "public_sdk",
+          "verification_status": "unverified"
+        }
+      ],
+      "gaps": {
+        "java": [],
+        "manifest_clues": [
+          {
+            "capability_id": "IPC-003",
+            "component_type": "services",
+            "kind": "multiprocess_component",
+            "name": "org.macapk.comp.ipcabi.WorkerService",
+            "note": "Remote process runs via ProcessBroker/Mach-port IPC without Android OS sandbox isolation",
+            "process": ":worker"
+          }
+        ],
+        "native": []
+      },
+      "inputs": [
+        {
+          "dex_files": [
+            "classes.dex"
+          ],
+          "filename": "comp-service-ipc-abi.apk",
+          "native_libs": [
+            "lib/arm64-v8a/libcompprobe.so"
+          ],
+          "sha256": "51cf3c426e3c215efca467926eb8e5038fa491b212bbd0a987ed0d9e55297de3",
+          "size_bytes": 7932,
+          "zip_entries": 5
+        }
+      ],
+      "java_summary": {
+        "app_defined_classes": 4,
+        "app_native_methods": [
+          {
+            "class": "org/macapk/comp/ipcabi/MainActivity",
+            "descriptor": "(II)I",
+            "expected_symbols": [
+              "Java_org_macapk_comp_ipcabi_MainActivity_nativeProbe",
+              "Java_org_macapk_comp_ipcabi_MainActivity_nativeProbe__II"
+            ],
+            "name": "nativeProbe",
+            "status": "bound_static_jni_export"
+          }
+        ],
+        "fields": {
+          "missing": 0,
+          "present_in_host_jdk": 0,
+          "present_in_platform": 0,
+          "satisfied_by_app": 1,
+          "unknown": 0
+        },
+        "methods": {
+          "missing": 0,
+          "present_in_host_jdk": 2,
+          "present_in_platform": 14,
+          "satisfied_by_app": 12,
+          "unknown": 0
+        },
+        "native_lib_load_hints": [
+          "libcompprobe.so"
+        ],
+        "referenced_types_by_origin": {
+          "app_owned": 4,
+          "host_jdk": 4,
+          "public_sdk": 10
+        },
+        "service_hints": [],
+        "system_property_hints": []
+      },
+      "manifest": {
+        "application": {
+          "extract_native_libs": null,
+          "name": null
+        },
+        "components": {
+          "activities": [
+            {
+              "exported": true,
+              "name": "org.macapk.comp.ipcabi.MainActivity",
+              "process": null
+            }
+          ],
+          "activity_aliases": [],
+          "providers": [],
+          "receivers": [],
+          "services": [
+            {
+              "exported": false,
+              "name": "org.macapk.comp.ipcabi.WorkerService",
+              "process": ":worker"
+            }
+          ]
+        },
+        "max_sdk": null,
+        "min_sdk": 24,
+        "package": "org.macapk.comp.ipcabi",
+        "presented_sdk": 36,
+        "split": null,
+        "target_sdk": 36,
+        "uses_features": [
+          {
+            "gl_es_version": null,
+            "name": "android.hardware.faketouch",
+            "required": false
+          }
+        ],
+        "uses_libraries": [],
+        "uses_permissions": [],
+        "version_code": 100,
+        "version_name": "1.0.0"
+      },
+      "native_summary": {
+        "abis": {
+          "arm64-v8a": {
+            "libraries": [
+              {
+                "abi_machine_match": true,
+                "app_closure_libs": [],
+                "archive_path": "comp-service-ipc-abi.apk!/lib/arm64-v8a/libcompprobe.so",
+                "dt_needed": [],
+                "e_machine": "EM_AARCH64",
+                "elf_class": "ELF64",
+                "exports_count": 3,
+                "has_initializers": false,
+                "imports_count": 0,
+                "initializers_executed": false,
+                "missing_dt_needed": [],
+                "missing_symbols": [],
+                "platform_dt_needed": [],
+                "resolved_by_app": [],
+                "resolved_by_app_count": 0,
+                "resolved_by_platform_count": 0,
+                "section_headers_present": true,
+                "soname": "libcompprobe.so",
+                "unknown_symbols": [],
+                "weak_unresolved": []
+              }
+            ],
+            "libraries_count": 1
+          }
+        }
+      },
+      "reflection_string_hints_count": 0,
+      "reflection_string_hints_sample": [],
+      "scenario_id": "comp-service-ipc-abi",
+      "split_manifests": [],
+      "unknowns": []
+    },
+    {
+      "app_id": "comp-surface-media",
+      "blind_spots": [],
+      "capabilities_touched": [
+        {
+          "capability_id": "LIFE-001",
+          "static_ref_count": 3,
+          "support_status": "partial",
+          "surface": "public_sdk",
+          "verification_status": "unverified"
+        },
+        {
+          "capability_id": "SURF-002",
+          "static_ref_count": 2,
+          "support_status": "partial",
+          "surface": "public_sdk",
+          "verification_status": "contract-tested"
+        },
+        {
+          "capability_id": "SURF-003",
+          "static_ref_count": 2,
+          "support_status": "partial",
+          "surface": "public_sdk",
+          "verification_status": "contract-tested"
+        }
+      ],
+      "gaps": {
+        "java": [],
+        "manifest_clues": [],
+        "native": []
+      },
+      "inputs": [
+        {
+          "dex_files": [
+            "classes.dex"
+          ],
+          "filename": "comp-surface-media.apk",
+          "native_libs": [],
+          "sha256": "b1096a22ae784ddc6b7d1bbe4061c34d6ecb8f38bc9e7e9d252a8edaf41ae106",
+          "size_bytes": 10737,
+          "zip_entries": 8
+        }
+      ],
+      "java_summary": {
+        "app_defined_classes": 1,
+        "app_native_methods": [],
+        "fields": {
+          "missing": 0,
+          "present_in_host_jdk": 0,
+          "present_in_platform": 0,
+          "satisfied_by_app": 0,
+          "unknown": 0
+        },
+        "methods": {
+          "missing": 0,
+          "present_in_host_jdk": 0,
+          "present_in_platform": 16,
+          "satisfied_by_app": 9,
+          "unknown": 0
+        },
+        "native_lib_load_hints": [],
+        "referenced_types_by_origin": {
+          "app_owned": 1,
+          "public_sdk": 13
+        },
+        "service_hints": [],
+        "system_property_hints": []
+      },
+      "manifest": {
+        "application": {
+          "extract_native_libs": null,
+          "name": null
+        },
+        "components": {
+          "activities": [
+            {
+              "exported": true,
+              "name": "org.macapk.comp.surfmedia.MainActivity",
+              "process": null
+            }
+          ],
+          "activity_aliases": [],
+          "providers": [],
+          "receivers": [],
+          "services": []
+        },
+        "max_sdk": null,
+        "min_sdk": 24,
+        "package": "org.macapk.comp.surfmedia",
+        "presented_sdk": 36,
+        "split": null,
+        "target_sdk": 36,
+        "uses_features": [
+          {
+            "gl_es_version": "0x00030000",
+            "name": null,
+            "required": false
+          },
+          {
+            "gl_es_version": null,
+            "name": "android.hardware.audio.output",
+            "required": false
+          }
+        ],
+        "uses_libraries": [],
+        "uses_permissions": [],
+        "version_code": 100,
+        "version_name": "1.0.0"
+      },
+      "native_summary": {
+        "abis": {}
+      },
+      "reflection_string_hints_count": 0,
+      "reflection_string_hints_sample": [],
+      "scenario_id": "comp-surface-media",
+      "split_manifests": [],
+      "unknowns": []
+    },
+    {
+      "app_id": "comp-ui-resources",
+      "blind_spots": [],
+      "capabilities_touched": [
+        {
+          "capability_id": "LIFE-001",
+          "static_ref_count": 5,
+          "support_status": "partial",
+          "surface": "public_sdk",
+          "verification_status": "unverified"
+        },
+        {
+          "capability_id": "RES-001",
+          "static_ref_count": 1,
+          "support_status": "partial",
+          "surface": "public_sdk",
+          "verification_status": "contract-tested"
+        }
+      ],
+      "gaps": {
+        "java": [],
+        "manifest_clues": [],
+        "native": []
+      },
+      "inputs": [
+        {
+          "dex_files": [
+            "classes.dex"
+          ],
+          "filename": "comp-ui-resources.apk",
+          "native_libs": [],
+          "sha256": "693b2e4227ab5a0c9496ac9d50d51bbd89498e63ee9aca3da7fcb4e0772ac92c",
+          "size_bytes": 3937,
+          "zip_entries": 7
+        }
+      ],
+      "java_summary": {
+        "app_defined_classes": 1,
+        "app_native_methods": [],
+        "fields": {
+          "missing": 0,
+          "present_in_host_jdk": 0,
+          "present_in_platform": 0,
+          "satisfied_by_app": 0,
+          "unknown": 0
+        },
+        "methods": {
+          "missing": 0,
+          "present_in_host_jdk": 0,
+          "present_in_platform": 6,
+          "satisfied_by_app": 2,
+          "unknown": 0
+        },
+        "native_lib_load_hints": [],
+        "referenced_types_by_origin": {
+          "app_owned": 1,
+          "host_jdk": 1,
+          "public_sdk": 3
+        },
+        "service_hints": [],
+        "system_property_hints": []
+      },
+      "manifest": {
+        "application": {
+          "extract_native_libs": null,
+          "name": null
+        },
+        "components": {
+          "activities": [
+            {
+              "exported": true,
+              "name": "org.macapk.comp.uires.MainActivity",
+              "process": null
+            }
+          ],
+          "activity_aliases": [],
+          "providers": [],
+          "receivers": [],
+          "services": []
+        },
+        "max_sdk": null,
+        "min_sdk": 24,
+        "package": "org.macapk.comp.uires",
+        "presented_sdk": 36,
+        "split": null,
+        "target_sdk": 36,
+        "uses_features": [
+          {
+            "gl_es_version": null,
+            "name": "android.hardware.touchscreen",
+            "required": false
+          },
+          {
+            "gl_es_version": null,
+            "name": "android.software.leanback",
+            "required": false
+          }
+        ],
+        "uses_libraries": [],
+        "uses_permissions": [],
+        "version_code": 100,
+        "version_name": "1.0.0"
+      },
+      "native_summary": {
+        "abis": {}
+      },
+      "reflection_string_hints_count": 0,
+      "reflection_string_hints_sample": [],
+      "scenario_id": "comp-ui-resources",
+      "split_manifests": [],
+      "unknowns": []
+    }
+  ],
+  "apps_scanned": 3,
+  "gaplog_priority_clues": [
+    {
+      "affected_apks_count": 1,
+      "affected_apps": [
+        "comp-service-ipc-abi"
+      ],
+      "affected_scenarios": [
+        "comp-service-ipc-abi"
+      ],
+      "api_or_symbol": "org.macapk.comp.ipcabi.WorkerService",
+      "capability_id": "IPC-003",
+      "kind": "multiprocess_component",
+      "runtime_call_frequency": null,
+      "static_ref_count": 1,
+      "surface": "manifest"
+    }
+  ],
+  "partial_capability_clues": [
+    {
+      "affected_apks_count": 3,
+      "affected_apps": [
+        "comp-service-ipc-abi",
+        "comp-surface-media",
+        "comp-ui-resources"
+      ],
+      "affected_scenarios": [
+        "comp-service-ipc-abi",
+        "comp-surface-media",
+        "comp-ui-resources"
+      ],
+      "capability_id": "LIFE-001",
+      "runtime_call_frequency": null,
+      "static_ref_count": 10,
+      "support_status": "partial",
+      "surface": "public_sdk",
+      "verification_status": "unverified"
+    },
+    {
+      "affected_apks_count": 1,
+      "affected_apps": [
+        "comp-service-ipc-abi"
+      ],
+      "affected_scenarios": [
+        "comp-service-ipc-abi"
+      ],
+      "capability_id": "IPC-001",
+      "runtime_call_frequency": null,
+      "static_ref_count": 8,
+      "support_status": "partial",
+      "surface": "public_sdk",
+      "verification_status": "contract-tested"
+    },
+    {
+      "affected_apks_count": 1,
+      "affected_apps": [
+        "comp-surface-media"
+      ],
+      "affected_scenarios": [
+        "comp-surface-media"
+      ],
+      "capability_id": "SURF-002",
+      "runtime_call_frequency": null,
+      "static_ref_count": 2,
+      "support_status": "partial",
+      "surface": "public_sdk",
+      "verification_status": "contract-tested"
+    },
+    {
+      "affected_apks_count": 1,
+      "affected_apps": [
+        "comp-surface-media"
+      ],
+      "affected_scenarios": [
+        "comp-surface-media"
+      ],
+      "capability_id": "SURF-003",
+      "runtime_call_frequency": null,
+      "static_ref_count": 2,
+      "support_status": "partial",
+      "surface": "public_sdk",
+      "verification_status": "contract-tested"
+    },
+    {
+      "affected_apks_count": 1,
+      "affected_apps": [
+        "comp-service-ipc-abi"
+      ],
+      "affected_scenarios": [
+        "comp-service-ipc-abi"
+      ],
+      "capability_id": "IPC-003",
+      "runtime_call_frequency": null,
+      "static_ref_count": 1,
+      "support_status": "partial",
+      "surface": "jni_registration",
+      "verification_status": "contract-tested"
+    },
+    {
+      "affected_apks_count": 1,
+      "affected_apps": [
+        "comp-ui-resources"
+      ],
+      "affected_scenarios": [
+        "comp-ui-resources"
+      ],
+      "capability_id": "RES-001",
+      "runtime_call_frequency": null,
+      "static_ref_count": 1,
+      "support_status": "partial",
+      "surface": "public_sdk",
+      "verification_status": "contract-tested"
+    }
+  ],
+  "scanner_version": "1.0.0",
+  "schema_version": "1.0.0"
+}

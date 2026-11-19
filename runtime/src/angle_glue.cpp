@@ -1070,6 +1070,7 @@ extern "C" void macapk_angle_install_blob_cache(void* egl_display) {
 // >>> GLSURVIVOR-GATE-BEGIN
 extern "C" void* CocoaEnsureNativeEglLayer(int* outW, int* outH);
 extern "C" void  CocoaNoteNativeEglSurfaceLive(void);
+extern "C" void* CocoaEnsureNativeEglLayerForSurfaceKey(int key, int* outW, int* outH);
 
 namespace macapk {
 namespace glsurvivor {
@@ -1088,20 +1089,12 @@ static void* HandleOf(JNIEnv* env, jobject o) {
     return reinterpret_cast<void*>(static_cast<intptr_t>(h));
 }
 
-static jobject JNICALL CreateSurfaceViewWindow(JNIEnv* env, jclass,
-                                               jobject dpy, jobject cfg, jintArray attribs) {
-    if (!dpy || !cfg) return nullptr;
-    EGLDisplay d = static_cast<EGLDisplay>(HandleOf(env, dpy));
-    EGLConfig c = static_cast<EGLConfig>(HandleOf(env, cfg));
-    if (!d || !c) return nullptr;
-    int lw = 0, lh = 0;
-    void* layer = CocoaEnsureNativeEglLayer(&lw, &lh);
-    if (!layer) {
-        std::fprintf(stderr, "[E] angle: SurfaceView window: no native-EGL layer "
-                             "(no render view yet) -> EGL_NO_SURFACE\n");
-        std::fflush(stderr);
-        return nullptr;
-    }
+// Create a boxed ANGLE EGLSurface targeting a CAMetalLayer and verify the
+// JNI boxing round-trip cleanly.
+static jobject CreateWindowOnMetalLayer(JNIEnv* env, EGLDisplay d, EGLConfig c,
+                                       void* layer, int lw, int lh,
+                                       jintArray attribs, const char* label) {
+    if (!layer) return nullptr;
     // The Java side has already applied jni_eglCreateWindowSurface's
     // validAttribList (null, or ending in EGL_NONE); copy, do not pin, since
     // EGL runs arbitrary work before it reads the list.
@@ -1114,15 +1107,11 @@ static jobject JNICALL CreateSurfaceViewWindow(JNIEnv* env, jclass,
     EGLSurface s = eglCreateWindowSurface(d, c, reinterpret_cast<EGLNativeWindowType>(layer),
                                           attribs ? al.data() : nullptr);
     if (s == EGL_NO_SURFACE) {
-        std::fprintf(stderr, "[E] angle: SurfaceView window: eglCreateWindowSurface on "
-                             "layer %p (%dx%d) failed: 0x%x\n", layer, lw, lh, eglGetError());
+        std::fprintf(stderr, "[E] angle: %s: eglCreateWindowSurface on "
+                             "layer %p (%dx%d) failed: 0x%x\n", label, layer, lw, lh, eglGetError());
         std::fflush(stderr);
         return nullptr;
     }
-    CocoaNoteNativeEglSurfaceLive();
-    std::fprintf(stderr, "[I] angle: SurfaceView window: EGLSurface %p on native-EGL "
-                         "layer %p (%dx%d), thread-owned (javax EGL10)\n", s, layer, lw, lh);
-    std::fflush(stderr);
     jclass sc = env->FindClass("android/opengl/EGLSurface");
     jmethodID ctor = sc ? env->GetMethodID(sc, "<init>", "(J)V") : nullptr;
     jobject boxed = ctor ? env->NewObject(sc, ctor,
@@ -1138,11 +1127,67 @@ static jobject JNICALL CreateSurfaceViewWindow(JNIEnv* env, jclass,
     return boxed;
 }
 
+static jobject JNICALL CreateSurfaceViewWindow(JNIEnv* env, jclass,
+                                               jobject dpy, jobject cfg, jintArray attribs) {
+    if (!dpy || !cfg) return nullptr;
+    EGLDisplay d = static_cast<EGLDisplay>(HandleOf(env, dpy));
+    EGLConfig c = static_cast<EGLConfig>(HandleOf(env, cfg));
+    if (!d || !c) return nullptr;
+    int lw = 0, lh = 0;
+    void* layer = CocoaEnsureNativeEglLayer(&lw, &lh);
+    if (!layer) {
+        std::fprintf(stderr, "[E] angle: SurfaceView window: no native-EGL layer "
+                             "(no render view yet) -> EGL_NO_SURFACE\n");
+        std::fflush(stderr);
+        return nullptr;
+    }
+    jobject boxed = CreateWindowOnMetalLayer(env, d, c, layer, lw, lh, attribs,
+                                             "SurfaceView window");
+    if (!boxed) return nullptr;
+    CocoaNoteNativeEglSurfaceLive();
+    std::fprintf(stderr, "[I] angle: SurfaceView window: EGLSurface on native-EGL "
+                         "layer %p (%dx%d), thread-owned (javax EGL10)\n", layer, lw, lh);
+    std::fflush(stderr);
+    return boxed;
+}
+
+static jobject JNICALL CreateKeyedSurfaceViewWindow(JNIEnv* env, jclass,
+                                                    jobject dpy, jobject cfg,
+                                                    jint surfaceKey, jintArray attribs) {
+    if (!dpy || !cfg || surfaceKey <= 0) return nullptr;
+    EGLDisplay d = static_cast<EGLDisplay>(HandleOf(env, dpy));
+    EGLConfig c = static_cast<EGLConfig>(HandleOf(env, cfg));
+    if (!d || !c) return nullptr;
+    int lw = 0, lh = 0;
+    void* layer = CocoaEnsureNativeEglLayerForSurfaceKey(surfaceKey, &lw, &lh);
+    if (!layer) {
+        std::fprintf(stderr, "[W] angle: keyed SurfaceView window (key=%d): no layer "
+                             "(no render view yet) -> fallback\n", static_cast<int>(surfaceKey));
+        std::fflush(stderr);
+        return nullptr;
+    }
+    jobject boxed = CreateWindowOnMetalLayer(env, d, c, layer, lw, lh, attribs,
+                                             "keyed SurfaceView window");
+    if (!boxed) return nullptr;
+    std::fprintf(stderr, "[I] angle: keyed SurfaceView window (key=%d): EGLSurface on "
+                         "native-EGL layer %p (%dx%d), zero-readback (javax EGL10)\n",
+                 static_cast<int>(surfaceKey), layer, lw, lh);
+    std::fflush(stderr);
+    return boxed;
+}
+
 static const JNINativeMethod kMethods[] = {
     {const_cast<char*>("nativeCreateSurfaceViewWindow"),
      const_cast<char*>("(Landroid/opengl/EGLDisplay;Landroid/opengl/EGLConfig;[I)"
                        "Landroid/opengl/EGLSurface;"),
      reinterpret_cast<void*>(CreateSurfaceViewWindow)},
+};
+
+static const JNINativeMethod kKeyedMethods[] = {
+    {const_cast<char*>("nativeCreateKeyedSurfaceViewWindow"),
+     const_cast<char*>("(Landroid/opengl/EGLDisplay;Landroid/opengl/EGLConfig;I[I)"
+                       "Landroid/opengl/EGLSurface;"),
+     reinterpret_cast<void*>(CreateKeyedSurfaceViewWindow)},
 };
 
 }  // namespace glsurvivor
@@ -1164,6 +1209,12 @@ void RegisterAngleGlueNatives(JNIEnv* env) {
         env->ExceptionClear();
         std::fprintf(stderr, "[E] angle: RegisterNatives(MacApkEGL10) failed; SurfaceView "
                              "window bridge unbound\n");
+    }
+    if (env->RegisterNatives(c, glsurvivor::kKeyedMethods,
+                             sizeof(glsurvivor::kKeyedMethods) / sizeof(glsurvivor::kKeyedMethods[0]))
+            != JNI_OK) {
+        env->ExceptionClear();
+        std::fprintf(stderr, "[W] angle: keyed SurfaceView window bridge unbound\n");
     }
     env->DeleteLocalRef(c);
 }

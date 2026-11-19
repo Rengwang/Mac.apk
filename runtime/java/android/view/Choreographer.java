@@ -197,9 +197,6 @@ public final class Choreographer {
         // FRAME_CALLBACK_TOKEN / VSYNC_CALLBACK_TOKEN). Matched by the
         // vsync-thread removeCallbacks, as AOSP's removeCallbacksLocked does.
         final Object token;
-        FrameAction(int t, FrameCallback f, VsyncCallback v, Runnable r, long d) {
-            this(t, f, v, r, null, d);
-        }
         FrameAction(int t, FrameCallback f, VsyncCallback v, Runnable r, Object tok, long d) {
             type = t; frameCb = f; vsyncCb = v; runnable = r; token = tok; dueNanos = d;
         }
@@ -434,20 +431,18 @@ public final class Choreographer {
     }
     public void postCallbackDelayed(int callbackType, Runnable action,
                                     Object token, long delayMillis) {
-        if (action == null) return;
+        if (callbackType < CALLBACK_INPUT || callbackType > CALLBACK_LAST) {
+            throw new IllegalArgumentException("callbackType is invalid");
+        }
+        if (action == null) throw new IllegalArgumentException("action must not be null");
         if (isMainVsyncDriven()) {
             synchronized (sMainQueue) {
-                sMainQueue.add(new FrameAction(callbackType, null, null, action,
+                sMainQueue.add(new FrameAction(callbackType, null, null, action, token,
                     frameClockNanos() + Math.max(0L, delayMillis) * 1_000_000L));
             }
             return;
         }
         if (mVsyncThread) {
-            // AOSP postCallbackDelayed validates the type before queueing; an
-            // out-of-range type would otherwise sit in a phase doFrame never runs.
-            if (callbackType < 0 || callbackType > CALLBACK_LAST) {
-                throw new IllegalArgumentException("callbackType is invalid");
-            }
             postVsyncThreadAction(new FrameAction(callbackType, null, null, action, token,
                 vsyncDueMillis(delayMillis)));
             return;
@@ -455,6 +450,17 @@ public final class Choreographer {
         mHandler.postDelayed(action, Math.max(0L, delayMillis) + 16L);
     }
     public void removeCallbacks(int callbackType, Runnable action, Object token) {
+        if (callbackType < CALLBACK_INPUT || callbackType > CALLBACK_LAST) {
+            throw new IllegalArgumentException("callbackType is invalid");
+        }
+        if (isMainVsyncDriven()) {
+            synchronized (sMainQueue) {
+                sMainQueue.removeIf(a -> a.type == callbackType
+                    && (action == null || actionOf(a) == action)
+                    && (token == null || a.token == token));
+            }
+            return;
+        }
         if (mVsyncThread) {
             // AOSP CallbackQueue.removeCallbacksLocked: a null action or a null
             // token is a wildcard; both null clears the phase.
@@ -464,11 +470,6 @@ public final class Choreographer {
                     && (token == null || a.token == token));
             }
             return;
-        }
-        if (action != null && isMainVsyncDriven()) {
-            synchronized (sMainQueue) {
-                sMainQueue.removeIf(a -> a.runnable == action && a.type == callbackType);
-            }
         }
     }
 
@@ -493,7 +494,7 @@ public final class Choreographer {
         // case) becomes due immediately and runs on the very next frame.
         if (isMainVsyncDriven()) {
             synchronized (sMainQueue) {
-                sMainQueue.add(new FrameAction(CALLBACK_ANIMATION, callback, null, null,
+                sMainQueue.add(new FrameAction(CALLBACK_ANIMATION, callback, null, null, FRAME_CALLBACK_TOKEN,
                     frameClockNanos() + Math.max(0L, delayMillis) * 1_000_000L));
             }
             return;
@@ -550,7 +551,7 @@ public final class Choreographer {
         }
         if (isMainVsyncDriven()) {
             synchronized (sMainQueue) {
-                sMainQueue.add(new FrameAction(CALLBACK_ANIMATION, null, callback, null,
+                sMainQueue.add(new FrameAction(CALLBACK_ANIMATION, null, callback, null, VSYNC_CALLBACK_TOKEN,
                     frameClockNanos()));
             }
             return;
@@ -687,7 +688,10 @@ public final class Choreographer {
         if (due.isEmpty()) return;
         // AOSP doFrame order: INPUT(0) -> ANIMATION(1) -> INSETS_ANIMATION(2)
         // -> [TRAVERSAL(3) = canvas] -> COMMIT(4).
-        due.sort((a, b) -> Integer.compare(a.type, b.type));
+        due.sort((a, b) -> {
+            int phaseOrder = Integer.compare(a.type, b.type);
+            return phaseOrder != 0 ? phaseOrder : Long.compare(a.dueNanos, b.dueNanos);
+        });
         if (TIMEDIAG) android.util.Log.i("Mac.apk.Choreo",
             "doMainFrame fire #" + sChoreoFire.incrementAndGet() + " ran=" + due.size()
             + " nanos=" + nanos);

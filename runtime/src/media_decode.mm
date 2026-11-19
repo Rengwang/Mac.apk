@@ -38,6 +38,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
+#include <mutex>
 #include <vector>
 #include <deque>
 
@@ -327,6 +329,216 @@ static bool parse_vorbis_combined_csd(const uint8_t* blob, int blobLen,
     return true;
 }
 
+// ===================== AudioEncoder helpers =====================
+
+static void append_mp4_desc_len(std::vector<uint8_t>& out, size_t len) {
+    uint8_t b[4];
+    int n = 0;
+    do {
+        b[n++] = (uint8_t)(len & 0x7F);
+        len >>= 7;
+    } while (len > 0 && n < 4);
+    for (int i = n - 1; i >= 0; i--) {
+        out.push_back((uint8_t)(b[i] | (i > 0 ? 0x80 : 0x00)));
+    }
+}
+
+// Wrap a bare MPEG-4 AudioSpecificConfig (typically 2 bytes for AAC-LC) inside
+// an ISO/IEC 14496-1 ES_Descriptor so AudioConverterSetProperty(
+// kAudioConverterDecompressionMagicCookie) accepts AOSP csd-0 directly.
+static std::vector<uint8_t> wrap_asc_to_esds(const uint8_t* asc, size_t ascLen) {
+    std::vector<uint8_t> desc05;
+    desc05.push_back(0x05);
+    append_mp4_desc_len(desc05, ascLen);
+    desc05.insert(desc05.end(), asc, asc + ascLen);
+
+    std::vector<uint8_t> desc04Body = {
+        0x40,                   // MPEG-4 Audio
+        0x15,                   // AudioStream (5 << 2 | 1)
+        0x00, 0x00, 0x00,       // bufferSizeDB
+        0x00, 0x00, 0x00, 0x00, // maxBitrate
+        0x00, 0x00, 0x00, 0x00, // avgBitrate
+    };
+    desc04Body.insert(desc04Body.end(), desc05.begin(), desc05.end());
+
+    std::vector<uint8_t> desc04;
+    desc04.push_back(0x04);
+    append_mp4_desc_len(desc04, desc04Body.size());
+    desc04.insert(desc04.end(), desc04Body.begin(), desc04Body.end());
+
+    std::vector<uint8_t> desc06 = { 0x06, 0x01, 0x02 };
+
+    std::vector<uint8_t> desc03Body = { 0x00, 0x00, 0x00 }; // ES_ID=0, flags=0
+    desc03Body.insert(desc03Body.end(), desc04.begin(), desc04.end());
+    desc03Body.insert(desc03Body.end(), desc06.begin(), desc06.end());
+
+    std::vector<uint8_t> desc03;
+    desc03.push_back(0x03);
+    append_mp4_desc_len(desc03, desc03Body.size());
+    desc03.insert(desc03.end(), desc03Body.begin(), desc03Body.end());
+    return desc03;
+}
+
+static bool read_mp4_desc_len(const uint8_t* d, size_t n, size_t& ioOff, size_t& outLen) {
+    size_t val = 0;
+    for (int i = 0; i < 4; i++) {
+        if (ioOff >= n) return false;
+        uint8_t b = d[ioOff++];
+        val = (val << 7) | (size_t)(b & 0x7F);
+        if ((b & 0x80) == 0) {
+            outLen = val;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Extract the raw AudioSpecificConfig bytes (tag 0x05 payload) from an
+// AudioToolbox ES_Descriptor magic cookie. Returns synthetic 2-byte AAC-LC ASC
+// if parsing fails.
+static std::vector<uint8_t> extract_asc_from_magic_cookie(const uint8_t* cookie, size_t len,
+                                                          int sampleRate, int channels) {
+    if (cookie && len >= 2 && cookie[0] != 0x03 && len <= 16) {
+        return std::vector<uint8_t>(cookie, cookie + len);
+    }
+    if (cookie && len >= 8 && cookie[0] == 0x03) {
+        size_t off = 1;
+        size_t esLen = 0;
+        if (read_mp4_desc_len(cookie, len, off, esLen)) {
+            size_t esEnd = std::min(len, off + esLen);
+            if (off + 3 <= esEnd) {
+                uint8_t flags = cookie[off + 2];
+                off += 3;
+                if ((flags & 0x80) && off + 2 <= esEnd) off += 2; // dependsOn_ES_ID
+                if ((flags & 0x40) && off < esEnd) {             // URLstring
+                    uint8_t ulen = cookie[off++];
+                    off += std::min<size_t>(ulen, esEnd - off);
+                }
+                if ((flags & 0x20) && off + 2 <= esEnd) off += 2; // OCR_ES_ID
+                while (off < esEnd) {
+                    uint8_t tag = cookie[off++];
+                    size_t dlen = 0;
+                    if (!read_mp4_desc_len(cookie, esEnd, off, dlen)) break;
+                    size_t dend = std::min(esEnd, off + dlen);
+                    if (tag == 0x05 && dend > off) {
+                        return std::vector<uint8_t>(cookie + off, cookie + dend);
+                    }
+                    if (tag == 0x04 && off + 13 <= dend) {
+                        size_t sub = off + 13;
+                        while (sub < dend) {
+                            uint8_t stag = cookie[sub++];
+                            size_t slen = 0;
+                            if (!read_mp4_desc_len(cookie, dend, sub, slen)) break;
+                            size_t send = std::min(dend, sub + slen);
+                            if (stag == 0x05 && send > sub) {
+                                return std::vector<uint8_t>(cookie + sub, cookie + send);
+                            }
+                            sub = send;
+                        }
+                    }
+                    off = dend;
+                }
+            }
+        }
+    }
+    static const int kRates[13] = {
+        96000, 88200, 64000, 48000, 44100, 32000,
+        24000, 22050, 16000, 12000, 11025, 8000, 7350
+    };
+    int srIdx = 4;
+    for (int i = 0; i < 13; i++) {
+        if (kRates[i] == sampleRate) { srIdx = i; break; }
+    }
+    int aot = 2; // AAC-LC
+    uint8_t b0 = (uint8_t)((aot << 3) | (srIdx >> 1));
+    uint8_t b1 = (uint8_t)(((srIdx & 1) << 7) | ((channels & 0x0F) << 3));
+    return { b0, b1 };
+}
+
+constexpr int kAudioEncFlagEndOfStream = 4; // MediaCodec.BUFFER_FLAG_END_OF_STREAM
+
+struct AudioEncoder {
+    std::mutex mu;
+    AudioConverterRef conv = nullptr;
+    int formatId = 1;
+    int sampleRate = 0;
+    int channels = 0;
+    int frameBytes = 0;
+    UInt32 maxPacketBytes = 4096;
+    std::vector<uint8_t> csd0;
+
+    std::vector<uint8_t> pcmBuf;
+    size_t pcmReadOff = 0;
+    std::vector<uint8_t> partialBytes;
+    std::vector<uint8_t> inflight;
+
+    struct PtsLandmark {
+        int64_t sampleIndex;
+        int64_t ptsUs;
+    };
+    std::vector<PtsLandmark> landmarks;
+    int64_t pushedSamples = 0;
+    int64_t encodedSamples = 0;
+
+    bool eosSeen = false;
+    bool eosEmitted = false;
+
+    struct OutPacket {
+        std::vector<uint8_t> data;
+        int64_t ptsUs;
+        int flags;
+    };
+    std::deque<OutPacket> outQ;
+
+    int64_t lookupPtsUs(int64_t sampleIdx) const {
+        if (landmarks.empty() || sampleRate <= 0) return 0;
+        const PtsLandmark* lm = &landmarks.front();
+        for (size_t i = 1; i < landmarks.size(); i++) {
+            if (landmarks[i].sampleIndex <= sampleIdx) lm = &landmarks[i];
+            else break;
+        }
+        int64_t delta = sampleIdx - lm->sampleIndex;
+        return lm->ptsUs + (int64_t)llround((double)delta * 1.0e6 / (double)sampleRate);
+    }
+};
+
+static OSStatus enc_input_proc(AudioConverterRef, UInt32* ioNumberDataPackets,
+                               AudioBufferList* ioData,
+                               AudioStreamPacketDescription* __nullable* __nullable outPktDesc,
+                               void* inUserData) {
+    AudioEncoder* enc = (AudioEncoder*)inUserData;
+    if (outPktDesc) *outPktDesc = nullptr;
+    size_t availBytes = enc->pcmBuf.size() - enc->pcmReadOff;
+    size_t availFrames = enc->frameBytes > 0 ? (availBytes / (size_t)enc->frameBytes) : 0;
+    if (availFrames == 0) {
+        *ioNumberDataPackets = 0;
+        ioData->mNumberBuffers = 1;
+        ioData->mBuffers[0].mNumberChannels = (UInt32)enc->channels;
+        ioData->mBuffers[0].mDataByteSize = 0;
+        ioData->mBuffers[0].mData = nullptr;
+        return enc->eosSeen ? noErr : kMacApkNoDataNow;
+    }
+    UInt32 want = *ioNumberDataPackets;
+    UInt32 takeFrames = (want > 0 && availFrames > want) ? want : (UInt32)availFrames;
+    size_t takeBytes = (size_t)takeFrames * (size_t)enc->frameBytes;
+    enc->inflight.assign(enc->pcmBuf.begin() + enc->pcmReadOff,
+                         enc->pcmBuf.begin() + enc->pcmReadOff + takeBytes);
+    enc->pcmReadOff += takeBytes;
+    if (enc->pcmReadOff == enc->pcmBuf.size()) {
+        enc->pcmBuf.clear();
+        enc->pcmReadOff = 0;
+    } else if (enc->pcmReadOff > 65536) {
+        enc->pcmBuf.erase(enc->pcmBuf.begin(), enc->pcmBuf.begin() + enc->pcmReadOff);
+        enc->pcmReadOff = 0;
+    }
+    ioData->mNumberBuffers = 1;
+    ioData->mBuffers[0].mNumberChannels = (UInt32)enc->channels;
+    ioData->mBuffers[0].mDataByteSize = (UInt32)enc->inflight.size();
+    ioData->mBuffers[0].mData = enc->inflight.data();
+    *ioNumberDataPackets = takeFrames;
+    return noErr;
+}
+
 }  // namespace
 
 // audio_vorbis_decode.mm (same executable target, see runtime/CMakeLists.txt;
@@ -509,7 +721,12 @@ void* macapk_md_dec_open(int formatId, int sampleRate, int channels,
     std::vector<uint8_t> flacCookie;
     const void* cookiePtr = csd0;
     int cookieLen = csd0Len;
-    if (formatId == 4 && csd0 && csd0Len > 4) {
+    if (formatId == 1 && csd0 && csd0Len >= 2 && csd0Len < 16 &&
+            ((const uint8_t*)csd0)[0] != 0x03) {
+        flacCookie = wrap_asc_to_esds((const uint8_t*)csd0, (size_t)csd0Len);
+        cookiePtr = flacCookie.data();
+        cookieLen = (int)flacCookie.size();
+    } else if (formatId == 4 && csd0 && csd0Len > 4) {
         const uint8_t* c = (const uint8_t*)csd0;
         uint32_t rest = (uint32_t)(csd0Len - 4);      // everything after "fLaC"
         uint32_t total = 4 + 4 + 4 + rest;
@@ -620,6 +837,238 @@ void macapk_md_dec_close(void* h) {
     delete d;
 }
 
+// ===================== AudioEncoder (AudioToolbox AAC-LC) =====================
+
+void* macapk_md_enc_open(int formatId, int sampleRate, int channels, int bitrate) {
+    if (formatId != 1 || sampleRate <= 0 || channels < 1 || channels > 8) {
+        std::fprintf(stderr, "[media] enc_open: invalid args formatId=%d sr=%d ch=%d\n",
+                     formatId, sampleRate, channels);
+        return nullptr;
+    }
+
+    AudioStreamBasicDescription in = {};
+    in.mSampleRate = (Float64)sampleRate;
+    in.mFormatID = kAudioFormatLinearPCM;
+    in.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
+    in.mBitsPerChannel = 16;
+    in.mChannelsPerFrame = (UInt32)channels;
+    in.mFramesPerPacket = 1;
+    in.mBytesPerFrame = (UInt32)(2 * channels);
+    in.mBytesPerPacket = in.mBytesPerFrame;
+
+    AudioStreamBasicDescription out = {};
+    out.mSampleRate = (Float64)sampleRate;
+    out.mFormatID = kAudioFormatMPEG4AAC;
+    out.mFormatFlags = 0; // AAC-LC
+    out.mChannelsPerFrame = (UInt32)channels;
+    out.mFramesPerPacket = 1024;
+
+    AudioConverterRef conv = nullptr;
+    OSStatus s = AudioConverterNew(&in, &out, &conv);
+    if (s != noErr || !conv) {
+        std::fprintf(stderr, "[media] enc_open: AudioConverterNew AAC failed (%d) sr=%d ch=%d\n",
+                     (int)s, sampleRate, channels);
+        return nullptr;
+    }
+
+    UInt32 reqBitrate = (bitrate > 0) ? (UInt32)bitrate : (UInt32)(channels >= 2 ? 128000 : 64000);
+    s = AudioConverterSetProperty(conv, kAudioConverterEncodeBitRate, sizeof(reqBitrate), &reqBitrate);
+    if (s != noErr) {
+        UInt32 propSz = 0;
+        if (AudioConverterGetPropertyInfo(conv, kAudioConverterApplicableEncodeBitRates, &propSz, nullptr) == noErr
+                && propSz >= sizeof(AudioValueRange)) {
+            std::vector<AudioValueRange> ranges(propSz / sizeof(AudioValueRange));
+            if (AudioConverterGetProperty(conv, kAudioConverterApplicableEncodeBitRates, &propSz, ranges.data()) == noErr
+                    && !ranges.empty()) {
+                UInt32 best = reqBitrate;
+                double bestDiff = 1.0e18;
+                for (const auto& r : ranges) {
+                    double cand = std::max(r.mMinimum, std::min(r.mMaximum, (double)reqBitrate));
+                    double diff = std::abs(cand - (double)reqBitrate);
+                    if (diff < bestDiff) {
+                        bestDiff = diff;
+                        best = (UInt32)llround(cand);
+                    }
+                }
+                AudioConverterSetProperty(conv, kAudioConverterEncodeBitRate, sizeof(best), &best);
+            }
+        }
+    }
+
+    UInt32 maxPkt = 4096;
+    UInt32 maxPktSz = sizeof(maxPkt);
+    if (AudioConverterGetProperty(conv, kAudioConverterPropertyMaximumOutputPacketSize, &maxPktSz, &maxPkt) != noErr
+            || maxPkt < 1024) {
+        maxPkt = 4096;
+    }
+
+    std::vector<uint8_t> cookie;
+    UInt32 cookieSz = 0;
+    Boolean writable = false;
+    if (AudioConverterGetPropertyInfo(conv, kAudioConverterCompressionMagicCookie, &cookieSz, &writable) == noErr
+            && cookieSz > 0) {
+        cookie.resize(cookieSz);
+        if (AudioConverterGetProperty(conv, kAudioConverterCompressionMagicCookie, &cookieSz, cookie.data()) == noErr) {
+            cookie.resize(cookieSz);
+        } else {
+            cookie.clear();
+        }
+    }
+
+    AudioEncoder* enc = new AudioEncoder();
+    enc->conv = conv;
+    enc->formatId = formatId;
+    enc->sampleRate = sampleRate;
+    enc->channels = channels;
+    enc->frameBytes = 2 * channels;
+    enc->maxPacketBytes = maxPkt;
+    enc->csd0 = extract_asc_from_magic_cookie(
+        cookie.empty() ? nullptr : cookie.data(), cookie.size(), sampleRate, channels);
+    return enc;
+}
+
+int macapk_md_enc_csd0_size(void* h) {
+    AudioEncoder* enc = (AudioEncoder*)h;
+    if (!enc) return 0;
+    std::lock_guard<std::mutex> lk(enc->mu);
+    return (int)enc->csd0.size();
+}
+
+int macapk_md_enc_csd0(void* h, void* out, int cap) {
+    AudioEncoder* enc = (AudioEncoder*)h;
+    if (!enc || !out || cap <= 0) return 0;
+    std::lock_guard<std::mutex> lk(enc->mu);
+    int n = (int)enc->csd0.size() < cap ? (int)enc->csd0.size() : cap;
+    if (n > 0) std::memcpy(out, enc->csd0.data(), (size_t)n);
+    return n;
+}
+
+int macapk_md_enc_encode(void* h, const uint8_t* pcm, int offset, int length, int64_t ptsUs, int eos) {
+    AudioEncoder* enc = (AudioEncoder*)h;
+    if (!enc || !enc->conv) return -1;
+    std::lock_guard<std::mutex> lk(enc->mu);
+
+    if (pcm && length > 0 && offset >= 0) {
+        if (enc->eosSeen) {
+            // Post-EOS feed ignored until flush().
+            return 0;
+        }
+        int64_t startSampleIdx = enc->pushedSamples;
+        if (enc->landmarks.empty()) {
+            enc->landmarks.push_back({ startSampleIdx, ptsUs });
+        } else {
+            int64_t expectedPts = enc->lookupPtsUs(startSampleIdx);
+            if (std::abs(ptsUs - expectedPts) > 50000) {
+                enc->landmarks.push_back({ startSampleIdx, ptsUs });
+            }
+        }
+        enc->partialBytes.insert(enc->partialBytes.end(),
+                                 pcm + offset, pcm + offset + length);
+        size_t fullFrames = enc->partialBytes.size() / (size_t)enc->frameBytes;
+        size_t fullBytes = fullFrames * (size_t)enc->frameBytes;
+        if (fullBytes > 0) {
+            enc->pcmBuf.insert(enc->pcmBuf.end(),
+                               enc->partialBytes.begin(),
+                               enc->partialBytes.begin() + fullBytes);
+            enc->partialBytes.erase(enc->partialBytes.begin(),
+                                    enc->partialBytes.begin() + fullBytes);
+            enc->pushedSamples += (int64_t)fullFrames;
+        }
+    }
+
+    if (eos) {
+        if (!enc->partialBytes.empty()) {
+            enc->pcmBuf.insert(enc->pcmBuf.end(),
+                               enc->partialBytes.begin(), enc->partialBytes.end());
+            size_t rem = enc->frameBytes - enc->partialBytes.size();
+            enc->pcmBuf.insert(enc->pcmBuf.end(), rem, 0);
+            enc->partialBytes.clear();
+            enc->pushedSamples += 1;
+        }
+        enc->eosSeen = true;
+    }
+
+    while (true) {
+        std::vector<uint8_t> pktBuf(enc->maxPacketBytes);
+        AudioBufferList abl;
+        abl.mNumberBuffers = 1;
+        abl.mBuffers[0].mNumberChannels = (UInt32)enc->channels;
+        abl.mBuffers[0].mDataByteSize = (UInt32)pktBuf.size();
+        abl.mBuffers[0].mData = pktBuf.data();
+        UInt32 ioPackets = 1;
+        AudioStreamPacketDescription outDesc = {};
+        OSStatus s = AudioConverterFillComplexBuffer(
+            enc->conv, enc_input_proc, enc, &ioPackets, &abl, &outDesc);
+
+        if (ioPackets > 0 && abl.mBuffers[0].mDataByteSize > 0) {
+            uint32_t offBytes = outDesc.mStartOffset;
+            uint32_t szBytes = outDesc.mDataByteSize > 0
+                ? outDesc.mDataByteSize : abl.mBuffers[0].mDataByteSize;
+            if ((size_t)offBytes + (size_t)szBytes <= pktBuf.size() && szBytes > 0) {
+                std::vector<uint8_t> au(pktBuf.begin() + offBytes,
+                                        pktBuf.begin() + offBytes + szBytes);
+                int64_t pktPts = enc->lookupPtsUs(enc->encodedSamples);
+                UInt32 frames = outDesc.mVariableFramesInPacket > 0
+                    ? outDesc.mVariableFramesInPacket : 1024;
+                enc->encodedSamples += (int64_t)frames;
+                enc->outQ.push_back({ std::move(au), pktPts, 0 });
+            }
+        }
+        if (s == kMacApkNoDataNow) break;
+        if (s != noErr || ioPackets == 0) break;
+    }
+
+    if (eos && !enc->eosEmitted) {
+        enc->eosEmitted = true;
+        int64_t eosPts = enc->lookupPtsUs(enc->encodedSamples);
+        enc->outQ.push_back({ {}, eosPts, kAudioEncFlagEndOfStream });
+    }
+    return 0;
+}
+
+int macapk_md_enc_poll(void* h, std::vector<uint8_t>* outData, int64_t* outPtsUs, int* outFlags) {
+    AudioEncoder* enc = (AudioEncoder*)h;
+    if (!enc) return -1;
+    std::lock_guard<std::mutex> lk(enc->mu);
+    if (enc->outQ.empty()) return 0;
+    AudioEncoder::OutPacket pkt = std::move(enc->outQ.front());
+    enc->outQ.pop_front();
+    if (outData) *outData = std::move(pkt.data);
+    if (outPtsUs) *outPtsUs = pkt.ptsUs;
+    if (outFlags) *outFlags = pkt.flags;
+    return 1;
+}
+
+void macapk_md_enc_flush(void* h) {
+    AudioEncoder* enc = (AudioEncoder*)h;
+    if (!enc) return;
+    std::lock_guard<std::mutex> lk(enc->mu);
+    enc->pcmBuf.clear();
+    enc->pcmReadOff = 0;
+    enc->partialBytes.clear();
+    enc->inflight.clear();
+    enc->landmarks.clear();
+    enc->pushedSamples = 0;
+    enc->encodedSamples = 0;
+    enc->eosSeen = false;
+    enc->eosEmitted = false;
+    enc->outQ.clear();
+    if (enc->conv) AudioConverterReset(enc->conv);
+}
+
+void macapk_md_enc_close(void* h) {
+    AudioEncoder* enc = (AudioEncoder*)h;
+    if (!enc) return;
+    {
+        std::lock_guard<std::mutex> lk(enc->mu);
+        if (enc->conv) {
+            AudioConverterDispose(enc->conv);
+            enc->conv = nullptr;
+        }
+    }
+    delete enc;
+}
+
 }  // extern "C"
 
 // ===================== NativeMedia JNI surface =====================
@@ -694,6 +1143,61 @@ jint  Java_com_macapk_loader_NativeMedia_nativeDecOutSampleRate(JNIEnv*, jclass,
 jint  Java_com_macapk_loader_NativeMedia_nativeDecOutChannels(JNIEnv*, jclass, jlong h)   { return macapk_md_dec_out_channels((void*)(uintptr_t)h); }
 void  Java_com_macapk_loader_NativeMedia_nativeDecClose(JNIEnv*, jclass, jlong h)         { macapk_md_dec_close((void*)(uintptr_t)h); }
 
+jlong Java_com_macapk_loader_NativeMedia_nativeAudioEncOpen(JNIEnv*, jclass, jint fmt, jint sr, jint ch, jint bitrate) {
+    void* h = macapk_md_enc_open(fmt, sr, ch, bitrate);
+    return (jlong)(uintptr_t)h;
+}
+
+jbyteArray Java_com_macapk_loader_NativeMedia_nativeAudioEncCsd0(JNIEnv* env, jclass, jlong h) {
+    int n = macapk_md_enc_csd0_size((void*)(uintptr_t)h);
+    if (n <= 0) return nullptr;
+    std::vector<uint8_t> tmp(n);
+    macapk_md_enc_csd0((void*)(uintptr_t)h, tmp.data(), n);
+    jbyteArray arr = env->NewByteArray(n);
+    if (arr) env->SetByteArrayRegion(arr, 0, n, (const jbyte*)tmp.data());
+    return arr;
+}
+
+jint Java_com_macapk_loader_NativeMedia_nativeAudioEncEncode(JNIEnv* env, jclass, jlong h,
+                                                              jbyteArray jpcm, jint offset, jint length,
+                                                              jlong ptsUs, jboolean eos) {
+    std::vector<uint8_t> in;
+    if (jpcm && length > 0 && offset >= 0) {
+        jsize arrLen = env->GetArrayLength(jpcm);
+        if (offset + length > arrLen) return -1;
+        in.resize((size_t)length);
+        env->GetByteArrayRegion(jpcm, offset, length, (jbyte*)in.data());
+    }
+    return macapk_md_enc_encode((void*)(uintptr_t)h,
+                                in.empty() ? nullptr : in.data(),
+                                0, (int)in.size(), (int64_t)ptsUs, eos ? 1 : 0);
+}
+
+jbyteArray Java_com_macapk_loader_NativeMedia_nativeAudioEncPoll(JNIEnv* env, jclass, jlong h, jlongArray jmeta) {
+    std::vector<uint8_t> data;
+    int64_t ptsUs = 0;
+    int flags = 0;
+    int got = macapk_md_enc_poll((void*)(uintptr_t)h, &data, &ptsUs, &flags);
+    if (got <= 0) return nullptr;
+    if (jmeta && env->GetArrayLength(jmeta) >= 2) {
+        jlong meta[2] = { (jlong)ptsUs, (jlong)flags };
+        env->SetLongArrayRegion(jmeta, 0, 2, meta);
+    }
+    jbyteArray arr = env->NewByteArray((jsize)data.size());
+    if (arr && !data.empty()) {
+        env->SetByteArrayRegion(arr, 0, (jsize)data.size(), (const jbyte*)data.data());
+    }
+    return arr;
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeAudioEncFlush(JNIEnv*, jclass, jlong h) {
+    macapk_md_enc_flush((void*)(uintptr_t)h);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeAudioEncClose(JNIEnv*, jclass, jlong h) {
+    macapk_md_enc_close((void*)(uintptr_t)h);
+}
+
 }  // extern "C"
 
 static const JNINativeMethod kNativeMediaMethods[] = {
@@ -714,6 +1218,12 @@ static const JNINativeMethod kNativeMediaMethods[] = {
     {(char*)"nativeDecOutSampleRate",(char*)"(J)I",  (void*)Java_com_macapk_loader_NativeMedia_nativeDecOutSampleRate},
     {(char*)"nativeDecOutChannels",  (char*)"(J)I",  (void*)Java_com_macapk_loader_NativeMedia_nativeDecOutChannels},
     {(char*)"nativeDecClose",        (char*)"(J)V",  (void*)Java_com_macapk_loader_NativeMedia_nativeDecClose},
+    {(char*)"nativeAudioEncOpen",    (char*)"(IIII)J", (void*)Java_com_macapk_loader_NativeMedia_nativeAudioEncOpen},
+    {(char*)"nativeAudioEncCsd0",    (char*)"(J)[B",   (void*)Java_com_macapk_loader_NativeMedia_nativeAudioEncCsd0},
+    {(char*)"nativeAudioEncEncode",  (char*)"(J[BIIJZ)I", (void*)Java_com_macapk_loader_NativeMedia_nativeAudioEncEncode},
+    {(char*)"nativeAudioEncPoll",    (char*)"(J[J)[B", (void*)Java_com_macapk_loader_NativeMedia_nativeAudioEncPoll},
+    {(char*)"nativeAudioEncFlush",   (char*)"(J)V",    (void*)Java_com_macapk_loader_NativeMedia_nativeAudioEncFlush},
+    {(char*)"nativeAudioEncClose",   (char*)"(J)V",    (void*)Java_com_macapk_loader_NativeMedia_nativeAudioEncClose},
 };
 
 // Called from native_methods.cpp::RegisterAllNativeMethods at boot.

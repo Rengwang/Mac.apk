@@ -69,17 +69,20 @@ scripts/rebuild_and_run.sh
 
 In the recorded primary checkout, `rebuild_and_run.sh` builds the runtime, the Java
 framework and the launcher, installs the result as `/Applications/Mac.apk.app`
-(override with `MACAPK_CANONICAL_APP`), and opens it. A checkout recognized as a clone
-builds without touching the installed app unless `--promote` is passed. Use
-`--no-promote` to force a build-only run in either kind of checkout.
+(override with `MACAPK_CANONICAL_APP`), and opens it. In a clone, the script opens
+the local build by default. `--no-promote` opens the local build in either kind of
+checkout and skips installation and shared runtime staging. The script can stop
+running Mac.apk processes in the primary checkout.
 
-Step by step instead:
+For a local build without opening the GUI, run these commands in an independent
+worktree. See [TESTING.md](TESTING.md) for the bundle checks.
 
 ```bash
-runtime/scripts/build.sh                # runtime, framework jars, translator -> runtime/build/
-scripts/build_launcher.sh               # the app bundle -> build/Mac.apk.app
-debug/build_java_only.sh                # fast check that the Java side compiles
+MACAPK_NO_BUNDLE_SYNC=1 runtime/scripts/build.sh
+MACAPK_NO_BUNDLE_SYNC=1 scripts/build_launcher.sh
 ```
+
+For a quick Java-only build, use `debug/build_java_only.sh`.
 
 Run an APK straight from the build, without installing it:
 

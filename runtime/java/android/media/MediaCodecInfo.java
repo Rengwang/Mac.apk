@@ -52,6 +52,31 @@ public final class MediaCodecInfo {
         return new MediaCodecInfo(name, name, flags, new CodecCapabilities[] { caps });
     }
 
+    static MediaCodecInfo createAudioEncoder(
+            String name, String mime, boolean hardwareAccelerated,
+            int[] sampleRates, int maxChannels, Range<Integer> bitrateRange,
+            CodecProfileLevel[] profileLevels, int supportedBitrateModes) {
+        int flags = FLAG_IS_ENCODER
+                | (hardwareAccelerated ? FLAG_IS_HARDWARE_ACCELERATED : FLAG_IS_SOFTWARE_ONLY);
+        CodecCapabilities caps = CodecCapabilities.createAudioEncoderCaps(
+                mime, sampleRates, maxChannels, bitrateRange, profileLevels, supportedBitrateModes);
+        return new MediaCodecInfo(name, name, flags, new CodecCapabilities[] { caps });
+    }
+
+    static MediaCodecInfo createVideoEncoder(
+            String name, String mime, boolean hardwareAccelerated,
+            Range<Integer> widthRange, Range<Integer> heightRange,
+            Range<Integer> frameRateRange, int maxMacroblocks,
+            Range<Integer> bitrateRange, CodecProfileLevel[] profileLevels,
+            int[] colorFormats, int supportedBitrateModes) {
+        int flags = FLAG_IS_ENCODER
+                | (hardwareAccelerated ? FLAG_IS_HARDWARE_ACCELERATED : FLAG_IS_SOFTWARE_ONLY);
+        CodecCapabilities caps = CodecCapabilities.createVideoEncoderCaps(
+                mime, widthRange, heightRange, frameRateRange, maxMacroblocks,
+                bitrateRange, profileLevels, colorFormats, supportedBitrateModes);
+        return new MediaCodecInfo(name, name, flags, new CodecCapabilities[] { caps });
+    }
+
     /** Used by MediaCodec.getCodecInfo() (MediaCodec.java, not owned by this
      *  lane) to resolve a MediaCodecInfo purely from a codec name string.
      *  Looks the name up in the real registry first -- so a codec created via
@@ -139,16 +164,23 @@ public final class MediaCodecInfo {
         private static final Range<Integer> DEFAULT_BITRATE_RANGE = new Range<Integer>(0, Integer.MAX_VALUE);
         private static final int DEFAULT_MAX_SUPPORTED_INSTANCES = 32;   // AOSP's own default hint
 
+        public static final int COLOR_Format32bitBGRA8888          = 15;
+        public static final int COLOR_Format32bitARGB8888          = 16;
+        public static final int COLOR_FormatYUV420Planar           = 19;
+        public static final int COLOR_FormatYUV420PackedPlanar     = 20;
+        public static final int COLOR_FormatYUV420SemiPlanar       = 21;
+        public static final int COLOR_FormatYUV420PackedSemiPlanar = 39;
+        public static final int COLOR_FormatSurface                = 0x7f000789;
+        public static final int COLOR_Format32bitABGR8888          = 0x7f00a000;
+        public static final int COLOR_FormatRGBAFlexible           = 0x7f36a888;
+        public static final int COLOR_FormatYUV420Flexible         = 0x7f420888;
+
         String mMime;
         public CodecProfileLevel[] profileLevels = new CodecProfileLevel[0];   // modifiable by caller, per AOSP
         public int[] colorFormats = new int[0];
         private AudioCapabilities mAudioCaps;
         private VideoCapabilities mVideoCaps;
-        // Encoding is out of scope end to end (MediaCodec's native backing is
-        // decode-only -- see MediaCodec.java's own header comment), so this
-        // stays permanently null: AOSP's own contract for
-        // getEncoderCapabilities() is "null if this is not an encoder".
-        private final EncoderCapabilities mEncoderCaps = null;
+        private EncoderCapabilities mEncoderCaps = null;
 
         public CodecCapabilities() {}
 
@@ -185,6 +217,32 @@ public final class MediaCodecInfo {
             return c;
         }
 
+        static CodecCapabilities createAudioEncoderCaps(
+                String mime, int[] sampleRates, int maxChannels, Range<Integer> bitrateRange,
+                CodecProfileLevel[] profileLevels, int supportedBitrateModes) {
+            CodecCapabilities c = new CodecCapabilities();
+            c.mMime = mime;
+            c.profileLevels = profileLevels != null ? profileLevels.clone() : new CodecProfileLevel[0];
+            c.mAudioCaps = AudioCapabilities.forEncoder(sampleRates, maxChannels, bitrateRange);
+            c.mEncoderCaps = new EncoderCapabilities(supportedBitrateModes);
+            return c;
+        }
+
+        static CodecCapabilities createVideoEncoderCaps(
+                String mime, Range<Integer> widthRange, Range<Integer> heightRange,
+                Range<Integer> frameRateRange, int maxMacroblocks,
+                Range<Integer> bitrateRange, CodecProfileLevel[] profileLevels,
+                int[] colorFormats, int supportedBitrateModes) {
+            CodecCapabilities c = new CodecCapabilities();
+            c.mMime = mime;
+            c.profileLevels = profileLevels != null ? profileLevels.clone() : new CodecProfileLevel[0];
+            c.colorFormats = colorFormats != null ? colorFormats.clone() : new int[0];
+            c.mVideoCaps = VideoCapabilities.forEncoder(
+                    widthRange, heightRange, frameRateRange, maxMacroblocks, bitrateRange);
+            c.mEncoderCaps = new EncoderCapabilities(supportedBitrateModes);
+            return c;
+        }
+
         /** Defensive copy returned by getCapabilitiesForType: profileLevels
          *  is documented (AOSP included) as modifiable by the caller, so a
          *  caller mutating its copy must not corrupt the shared registry
@@ -196,6 +254,7 @@ public final class MediaCodecInfo {
             c.colorFormats = colorFormats.clone();
             c.mAudioCaps = mAudioCaps;   // immutable after construction: safe to share
             c.mVideoCaps = mVideoCaps;
+            c.mEncoderCaps = mEncoderCaps;
             return c;
         }
 
@@ -246,6 +305,20 @@ public final class MediaCodecInfo {
             Integer profile = (Integer) map.get(MediaFormat.KEY_PROFILE);
             Integer level = (Integer) map.get(MediaFormat.KEY_LEVEL);
             if (profile != null && !supportsProfileLevel(profile.intValue(), level)) return false;
+
+            Integer colorFormat = (Integer) map.get(MediaFormat.KEY_COLOR_FORMAT);
+            if (colorFormat != null && colorFormats.length > 0) {
+                boolean colorOk = false;
+                int cf = colorFormat.intValue();
+                for (int supported : colorFormats) {
+                    if (supported == cf) { colorOk = true; break; }
+                }
+                if (!colorOk) return false;
+            }
+            if (mEncoderCaps != null) {
+                Integer bm = (Integer) map.get(MediaFormat.KEY_BIT_RATE_MODE);
+                if (bm != null && !mEncoderCaps.isBitrateModeSupported(bm.intValue())) return false;
+            }
 
             if (mAudioCaps != null && !mAudioCaps.supportsFormat(format)) return false;
             if (mVideoCaps != null && !mVideoCaps.supportsFormat(format)) return false;
@@ -569,6 +642,24 @@ public final class MediaCodecInfo {
             return ac;
         }
 
+        @SuppressWarnings("unchecked")
+        static AudioCapabilities forEncoder(int[] sampleRates, int maxChannels, Range<Integer> bitrateRange) {
+            AudioCapabilities ac = new AudioCapabilities();
+            if (sampleRates != null) {
+                int[] rates = sampleRates.clone();
+                Arrays.sort(rates);
+                ac.mSampleRates = rates;
+                Range<Integer>[] ranges = new Range[rates.length];
+                for (int i = 0; i < rates.length; i++) ranges[i] = new Range<Integer>(rates[i], rates[i]);
+                ac.mSampleRateRanges = ranges;
+            } else {
+                ac.mSampleRateRanges = new Range[0];
+            }
+            ac.mMaxChannels = Math.max(1, maxChannels);
+            if (bitrateRange != null) ac.mBitrateRange = bitrateRange;
+            return ac;
+        }
+
         private boolean supports(Integer sampleRate, Integer channels) {
             if (channels != null && (channels < 1 || channels > mMaxChannels)) return false;
             if (sampleRate != null) {
@@ -642,6 +733,19 @@ public final class MediaCodecInfo {
             if (cap.heightAlignment > 0) vc.mHeightAlignment = cap.heightAlignment;
             vc.mMaxMacroblocks = cap.maxMacroblocks;
             if (cap.bitrateRange != null) vc.mBitrateRange = cap.bitrateRange;
+            return vc;
+        }
+
+        static VideoCapabilities forEncoder(
+                Range<Integer> widthRange, Range<Integer> heightRange,
+                Range<Integer> frameRateRange, int maxMacroblocks,
+                Range<Integer> bitrateRange) {
+            VideoCapabilities vc = new VideoCapabilities();
+            vc.mWidthRange = widthRange;
+            vc.mHeightRange = heightRange;
+            vc.mFrameRateRange = frameRateRange;
+            vc.mMaxMacroblocks = maxMacroblocks;
+            if (bitrateRange != null) vc.mBitrateRange = bitrateRange;
             return vc;
         }
 
@@ -835,12 +939,28 @@ public final class MediaCodecInfo {
         }
     }
 
-    /** Encoding is entirely out of scope (see CodecCapabilities.mEncoderCaps
-     *  above) -- this class exists only so a signature that references it
-     *  resolves. AOSP-shaped for when/if an encoder ever exists. */
+    /** Encoder capability descriptor for host hardware/software encoders. */
     public static final class EncoderCapabilities {
-        public Range<Integer> getQualityRange() { return null; }
-        public Range<Integer> getComplexityRange() { return null; }
-        public boolean isBitrateModeSupported(int mode) { return false; }
+        public static final int BITRATE_MODE_CQ     = 0;
+        public static final int BITRATE_MODE_VBR    = 1;
+        public static final int BITRATE_MODE_CBR    = 2;
+        public static final int BITRATE_MODE_CBR_FD = 3;
+
+        private final int mBitControl;
+        private final Range<Integer> mQualityRange;
+        private final Range<Integer> mComplexityRange;
+
+        EncoderCapabilities(int bitControl) {
+            mBitControl = bitControl;
+            mQualityRange = new Range<Integer>(0, 0);
+            mComplexityRange = new Range<Integer>(0, 0);
+        }
+
+        public Range<Integer> getQualityRange() { return mQualityRange; }
+        public Range<Integer> getComplexityRange() { return mComplexityRange; }
+        public boolean isBitrateModeSupported(int mode) {
+            if (mode < 0 || mode >= 31) return false;
+            return (mBitControl & (1 << mode)) != 0;
+        }
     }
 }

@@ -28,6 +28,7 @@
 import AppKit
 import CryptoKit
 import Darwin
+import LocalAuthentication
 
 // MARK: - Small helpers
 
@@ -44,6 +45,91 @@ private func stubLog(_ msg: String) {
     let line = "[MacApkAppStub] " + msg + "\n"
     stubLogBuffer.append(line)
     FileHandle.standardError.write(Data(line.utf8))
+}
+
+// MARK: - Touch ID prompts on the runtime's behalf
+
+/// Shows one Touch ID or Mac password prompt for the runtime, then exits with
+/// the result. The runtime starts this executable with `flag` as its first
+/// argument (runtime/src/user_verification_bridge.mm, `RunHelper`); nothing
+/// else in this file runs in that mode.
+///
+/// WHY THE STUB SHOWS IT. macOS names a LocalAuthentication prompt after the
+/// program that asks: the CFBundleName embedded in that program, else its
+/// file name. Only a bundle's own executable gets the bundle's name (and
+/// icon). Every app runs the one shared macapk-runtime, whose embedded name is
+/// "Mac.apk", so every app's prompt read "Mac.apk is trying to ...", and the
+/// user could not tell which app wanted their fingerprint. This stub IS the
+/// app's bundle executable, so its prompt names the app that is asking, as
+/// Android's does. Measured 2026-11-13 with five probe bundles: a program run
+/// through a bundle's symlink showed its embedded name, or with none its file
+/// name, never the bundle's; a bundle's own executable showed the bundle's
+/// name. A helper rather than a renamed copy of the runtime: tools that find
+/// running apps by the runtime's file name keep working, and it costs no disk.
+///
+/// Arguments after the flag: policy ("biometric" or "password"), reason,
+/// fallback-button title ("" hides it), cancel-button title ("" keeps the
+/// system's). The result is one line on stdout, and the exit status: 0
+/// allowed; 100 + n for LAError code -n; 98 for any other failure; 99 for
+/// unusable arguments. Nothing is ever written to stdin: when it reaches end
+/// of file (the runtime cancelled, timed out, quit or crashed) this process
+/// exits, and its prompt closes with it.
+enum UserVerificationHelper {
+    static let flag = "--macapk-verify-user=1"
+
+    static func run(_ args: [String]) -> Never {
+        guard args.count == 4 else { finish(99) }
+        let lifeline = DispatchSource.makeReadSource(fileDescriptor: 0, queue: .global())
+        lifeline.setEventHandler {
+            var byte: UInt8 = 0
+            if read(0, &byte, 1) <= 0 { finish(98) }
+        }
+        lifeline.resume()
+        let (policy, reason, fallback, cancel) = (args[0], args[1], args[2], args[3])
+        let context = LAContext()
+        context.touchIDAuthenticationAllowableReuseDuration = 0
+        context.localizedFallbackTitle = fallback
+        if !cancel.isEmpty { context.localizedCancelTitle = cancel }
+        let done = DispatchSemaphore(value: 0)
+        var status: Int32 = 98
+        let reply: (Bool, Error?) -> Void = { ok, error in
+            status = ok ? 0 : exitStatus(error)
+            done.signal()
+        }
+        switch policy {
+        case "biometric":
+            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
+                                   localizedReason: reason, reply: reply)
+        case "password":
+            // Password only, as the runtime's own path does: the broader owner
+            // policy can be satisfied by Touch ID, which is not a password result.
+            guard let control = SecAccessControlCreateWithFlags(
+                nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .devicePasscode, nil)
+            else { finish(98) }
+            context.evaluateAccessControl(control, operation: .useItem,
+                                          localizedReason: reason, reply: reply)
+        default:
+            finish(99)
+        }
+        done.wait()
+        finish(status)
+    }
+
+    /// Held by the first caller and never released: the reply and the stdin
+    /// handler can both get here, and only one line and one exit may happen.
+    private static let finishing = NSLock()
+
+    private static func finish(_ status: Int32) -> Never {
+        finishing.lock()
+        FileHandle.standardOutput.write(Data("\(status)\n".utf8))
+        exit(status)
+    }
+
+    private static func exitStatus(_ error: Error?) -> Int32 {
+        guard let e = error as NSError?, e.domain == LAErrorDomain,
+              e.code < 0, e.code > -98 else { return 98 }
+        return Int32(100 - e.code)
+    }
 }
 
 // MARK: - The run log
@@ -208,9 +294,36 @@ private func rotateRunLog(dir: URL, identity: String) {
 /// What is left -- /dev/null, a pipe to the log daemon, a closed descriptor --
 /// is the launchd/Dock case, where nobody is capturing and the output is
 /// discarded today. That is the case this exists for.
+private func isAutomationMode() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["MACAPK_AUTOMATION"] == "1" && !(env["MACAPK_AUTOMATION_DIR"] ?? "").isEmpty
+}
+
 private func beginRunLog(runtime: URL, identity: String,
-                         header: [String]) -> String? {
+                         header: [String],
+                         allowAutomationLog: Bool = true) -> String? {
     if ProcessInfo.processInfo.environment["MACAPK_STUB_LOG"] == "0" { return nil }
+    let autoLogPath = (allowAutomationLog && isAutomationMode())
+        ? (ProcessInfo.processInfo.environment["MACAPK_AUTOMATION_LOG"] ?? "")
+        : ""
+    if !autoLogPath.isEmpty {
+        let expanded = (autoLogPath as NSString).expandingTildeInPath
+        let logURL = URL(fileURLWithPath: expanded)
+        try? FileManager.default.createDirectory(
+            at: logURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        let fd = open(logURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        if fd >= 0 {
+            var preamble = header.map { "[MacApkAppStub] " + $0 + "\n" }
+            preamble.append(contentsOf: stubLogBuffer)
+            _ = preamble.joined().withCString { write(fd, $0, strlen($0)) }
+            dup2(fd, 1)
+            dup2(fd, 2)
+            if fd > 2 { close(fd) }
+            return logURL.path
+        }
+        stubLog("WARN: cannot open automation log \(logURL.path) (errno \(errno)); falling back")
+    }
     if isatty(2) == 1 { return nil }
     var st = stat()
     if fstat(2, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG { return nil }
@@ -255,7 +368,7 @@ private func fatalAlert(_ title: String, _ body: String,
     // debug/installtest/run.sh asserts on this exit code. It suppresses only an
     // error REPORT: the process still exits non-zero with the same code, and
     // there is no confirmation and nothing destructive anywhere on this path.
-    if ProcessInfo.processInfo.environment["MACAPK_STUB_NO_UI"] == "1" {
+    if ProcessInfo.processInfo.environment["MACAPK_STUB_NO_UI"] == "1" || isAutomationMode() {
         exit(exitCode)
     }
     let app = NSApplication.shared
@@ -536,6 +649,12 @@ struct AppStubMain {
     }
 
     static func main() {
+        // Not a launch: a Touch ID prompt the runtime asked for. Before anything
+        // else, so it touches no log, registry or staged runtime.
+        let args = CommandLine.arguments
+        if args.count >= 2, args[1] == UserVerificationHelper.flag {
+            UserVerificationHelper.run(Array(args.dropFirst(2)))
+        }
         let fm = FileManager.default
 
         // 1. Resolve our own bundle from the executable location:
@@ -821,8 +940,10 @@ struct AppStubMain {
                         // Opening the app again must bring it back, as tapping its
                         // icon does on a device; unhide is what fires the runtime's
                         // NSApplicationDidUnhideNotification -> the task resumes.
-                        if running.isHidden { _ = running.unhide() }
-                        running.activate(options: [])
+                        if !isAutomationMode() {
+                            if running.isHidden { _ = running.unhide() }
+                            running.activate(options: [])
+                        }
                     }
                     exit(0)
                 }
@@ -989,6 +1110,33 @@ struct AppStubMain {
             stubLog("registry: skipped bundle reconcile (\(error.localizedDescription))")
         }
 
+        let launchEnv = ProcessInfo.processInfo.environment
+        let isAutomation = launchEnv["MACAPK_AUTOMATION"] == "1"
+            && !(launchEnv["MACAPK_AUTOMATION_DIR"] ?? "").isEmpty
+
+        if !isAutomation {
+            // Scrub testing/harness environment variables so dirty shell environments
+            // do not leak into app stub runs (matches MacApkLauncherApp.swift:153-161).
+            for name in ["MACAPK_NO_ACTIVATE", "MACAPK_PAUSE_WHEN_HIDDEN",
+                         "MACAPK_INSTALL_LOCK_HELD", "MACAPK_INJECT_FILE",
+                         "MACAPK_DEBUG_HOSTKEY_FILE", "MACAPK_RECORD_INPUT",
+                         "MACAPK_EXTERNAL_URLS",
+                         "MACAPK_SYSTEM_APPS_DIR", "MACAPK_USER_APPS_DIR"] {
+                unsetenv(name)
+            }
+        } else {
+            // Headless Sidecar automation: still scrub non-automation test harness leakage,
+            // but keep focus non-stealing and offscreen/Sidecar rendering unpaused.
+            for name in ["MACAPK_INSTALL_LOCK_HELD", "MACAPK_INJECT_FILE",
+                         "MACAPK_DEBUG_HOSTKEY_FILE", "MACAPK_RECORD_INPUT",
+                         "MACAPK_EXTERNAL_URLS",
+                         "MACAPK_SYSTEM_APPS_DIR", "MACAPK_USER_APPS_DIR"] {
+                unsetenv(name)
+            }
+            setenv("MACAPK_NO_ACTIVATE", "1", 1)
+            setenv("MACAPK_PAUSE_WHEN_HIDDEN", "0", 1)
+        }
+
         // 8. Environment, matching the launcher's launch() contract so the
         //    runtime presents this process as the app: cocoa_bridge.mm
         //    adopts Dock icon + window title from MACAPK_APP_ICON /
@@ -1036,6 +1184,26 @@ struct AppStubMain {
            let row = reg.apps.first(where: { $0.dirName == dirName }) {
             for (k, v) in row.env {
                 setenv(k, v, 1)
+            }
+        }
+        if isAutomation {
+            // Re-assert automation controls after per-app RegistryStore row.env so saved
+            // user toggles cannot silently re-enable activation, pause-when-hidden, or
+            // drop trace/display/automation directory overrides.
+            setenv("MACAPK_NO_ACTIVATE", "1", 1)
+            setenv("MACAPK_PAUSE_WHEN_HIDDEN", "0", 1)
+            for key in ["MACAPK_HOST_DISPLAY",
+                        "MACAPK_AUTOMATION",
+                        "MACAPK_AUTOMATION_DIR",
+                        "MACAPK_AUTOMATION_LOG",
+                        "MACAPK_VIDEO_PRESENT_TRACE",
+                        "MACAPK_FRAME_TRACE",
+                        "MACAPK_TRACE_VIDEO_GEOMETRY",
+                        "MACAPK_GL_WINDOW_READBACK_TRACE",
+                        "MACAPK_MAIN_STALL_MS"] {
+                if let val = launchEnv[key], !val.isEmpty {
+                    setenv(key, val, 1)
+                }
             }
         }
         //
@@ -1122,7 +1290,8 @@ struct AppStubMain {
             header: ["---- run log \(ISO8601DateFormatter().string(from: Date())) ----",
                      "app: \(label) \(versionName) (\(package)), dirName=\(logIdentity)",
                      "bundle: \(bundleRoot.path)",
-                     "stub pid: \(getpid())"])
+                     "stub pid: \(getpid())"],
+            allowAutomationLog: !secondaryProcess)
         if let runLogPath {
             stubLog("run log: \(runLogPath)")
         }
@@ -1231,19 +1400,26 @@ struct AppStubMain {
         // assessment then fails with "a sealed resource is missing or
         // invalid" -- an app that launches once and is refused afterwards.
         // BundleGenerator pre-creates it, so the common path is a no-op.
-        let have = try? FileManager.default
-            .destinationOfSymbolicLink(atPath: execLink.path)
-        if have == runtime.path {
-            execPath = execLink.path
-        } else {
-            unlink(execLink.path)
-            if symlink(runtime.path, execLink.path) == 0 {
+        // A headless secondary process must not register as this launchable
+        // app. If it executes the same bundle-relative link, LaunchServices
+        // can keep treating the background worker as the running app after
+        // the UI process exits; Finder then activates that worker instead of
+        // starting a new window. Only the primary needs the bundle identity.
+        if !secondaryProcess {
+            let have = try? FileManager.default
+                .destinationOfSymbolicLink(atPath: execLink.path)
+            if have == runtime.path {
                 execPath = execLink.path
-                stubLog("exec link repointed -> \(runtime.path) (was \(have ?? "absent")); "
-                        + "the bundle seal is now stale until the next install")
             } else {
-                stubLog("WARN: could not create \(execLink.path) (errno \(errno)); "
-                        + "exec'ing the runtime directly (Dock will show its own name)")
+                unlink(execLink.path)
+                if symlink(runtime.path, execLink.path) == 0 {
+                    execPath = execLink.path
+                    stubLog("exec link repointed -> \(runtime.path) (was \(have ?? "absent")); "
+                            + "the bundle seal is now stale until the next install")
+                } else {
+                    stubLog("WARN: could not create \(execLink.path) (errno \(errno)); "
+                            + "exec'ing the runtime directly (Dock will show its own name)")
+                }
             }
         }
         // Last line of defence before handing control to the runtime. The

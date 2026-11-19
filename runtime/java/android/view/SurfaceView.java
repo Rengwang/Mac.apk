@@ -184,6 +184,21 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             return false;
         }
     }
+    static boolean macapkIsViewStoppedUnderTop(View view) {
+        if (view == null) return false;
+        try {
+            android.content.Context c = view.getContext();
+            while (c instanceof android.content.ContextWrapper && !(c instanceof android.app.Activity)) {
+                android.content.Context b = ((android.content.ContextWrapper) c).getBaseContext();
+                if (b == c) break;
+                c = b;
+            }
+            return (c instanceof android.app.Activity)
+                && com.macapk.loader.ActivityHost.macapkIsStoppedUnderTop((android.app.Activity) c);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
     protected final void macapkDetectDrawBehindTop(Object renderer) {
         if (macapkBehindTopSaid) return;
         if (macapkOwnerStoppedUnderTop()) {
@@ -1512,20 +1527,8 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         holder.fireChanged(0, s[0], s[1]);
     }
 
-    /** This view's top-left in DISPLAY-surface pixels -- the space the
-     *  ViewCanvasDriver canvas, and so the canvas overlay, lives in. ONE
-     *  formula for the video plane (macapkActiveVideoRectPacked) and the
-     *  placement of a lockCanvas surface, so a hole and its plane cannot drift
-     *  apart; the v1.0.997 correction it carries is documented there. */
-    private void macapkWindowOrigin(int[] out) {
-        int[] loc = new int[2];
-        getLocationInWindow(loc);
-        View root = getRootView();
-        int rootLeft = root != null ? root.getLeft() : 0;
-        int rootTop  = root != null ? root.getTop()  : 0;
-        out[0] = loc[0] - rootLeft;
-        out[1] = loc[1] - rootTop + com.macapk.loader.StatusBarDriver.heightPx(root);
-    }
+    /** Window-origin helper lives on View.macapkWindowOrigin(int[]) so
+     *  SurfaceView and direct-layer TextureView share one coordinate formula. */
 
     // ---- where a lockCanvas frame is shown -----------------------------------
     //
@@ -1553,6 +1556,48 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
     private static final java.util.concurrent.ConcurrentHashMap<Integer,
             java.lang.ref.WeakReference<SurfaceView>> sSurfaceByKey =
         new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static final class ExternalKeyedSurface {
+        volatile int vx, vy, vw, vh;
+        volatile int ownW, ownH;
+        volatile boolean visible;
+        volatile java.lang.ref.WeakReference<TextureView> hostView;
+    }
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, ExternalKeyedSurface>
+        sExternalSurfaceByKey = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Allocate a unique keyed native-EGL surface id for non-SurfaceView hosts (TextureView). */
+    public static int macapkAllocateExternalSurfaceKey() {
+        return sSurfaceKeySeq.incrementAndGet();
+    }
+
+    /** Publish or update the window rect and producer buffer geometry for an external keyed surface. */
+    public static void macapkPublishExternalKeyedSurfaceRect(
+            int key, int vx, int vy, int vw, int vh, int ownW, int ownH, boolean visible) {
+        if (key <= 0) return;
+        ExternalKeyedSurface ext = sExternalSurfaceByKey.computeIfAbsent(
+                key, k -> new ExternalKeyedSurface());
+        ext.vx = vx;
+        ext.vy = vy;
+        ext.vw = vw;
+        ext.vh = vh;
+        ext.ownW = ownW;
+        ext.ownH = ownH;
+        ext.visible = visible;
+    }
+
+    static void macapkBindExternalKeyedTextureView(int key, TextureView host) {
+        if (key <= 0) return;
+        ExternalKeyedSurface ext = sExternalSurfaceByKey.computeIfAbsent(
+                key, k -> new ExternalKeyedSurface());
+        ext.hostView = host != null ? new java.lang.ref.WeakReference<>(host) : null;
+    }
+
+    /** Remove an external keyed surface so the native compositor tears down its CAMetalLayer. */
+    public static void macapkUnpublishExternalKeyedSurface(int key) {
+        if (key <= 0) return;
+        sExternalSurfaceByKey.remove(key);
+    }
     private volatile int macapkSurfaceKey;
     /** AOSP mDrawFinished: a frame of this surface has been shown, so draw()
      *  now punches its hole (and a first frame asked the tree to redraw).
@@ -1597,16 +1642,32 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
     public static boolean macapkSurfaceFormatHasAlpha(int key) {
         java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
         SurfaceView v = ref != null ? ref.get() : null;
-        return v != null && android.graphics.PixelFormat.formatHasAlpha(v.holder.macapkRequestedFormat);
+        if (v != null) {
+            return android.graphics.PixelFormat.formatHasAlpha(v.holder.macapkRequestedFormat);
+        }
+        ExternalKeyedSurface ext = sExternalSurfaceByKey.get(key);
+        if (ext != null && ext.hostView != null) {
+            TextureView tv = ext.hostView.get();
+            return tv != null && !tv.isOpaque();
+        }
+        return false;
     }
 
     /** Effective view alpha for a native surface, including parent fades. */
     public static float macapkSurfaceLayerAlpha(int key) {
         java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
         SurfaceView v = ref != null ? ref.get() : null;
-        if (v == null) return 0f;
-        float alpha = v.getAlpha();
-        ViewParent parent = v.getParent();
+        View target = v;
+        if (target == null) {
+            ExternalKeyedSurface ext = sExternalSurfaceByKey.get(key);
+            if (ext == null) return 0f;
+            java.lang.ref.WeakReference<TextureView> hostRef = ext.hostView;
+            if (hostRef == null) return ext.visible ? 1f : 0f;
+            target = hostRef.get();
+            if (target == null) return 0f;
+        }
+        float alpha = target.getAlpha();
+        ViewParent parent = target.getParent();
         while (parent instanceof View) {
             View ancestor = (View) parent;
             alpha *= ancestor.getAlpha();
@@ -1769,12 +1830,37 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
      *  the layer); -1 = not visible right now (hide it). A display-sized or
      *  fixed-size buffer keeps the legacy whole-window placement, which is
      *  where its pixels have always been shown. */
+    private static long macapkExternalSurfaceRectPacked(int key) {
+        ExternalKeyedSurface ext = sExternalSurfaceByKey.get(key);
+        if (ext == null) return 0L;
+        try {
+            java.lang.ref.WeakReference<TextureView> hostRef = ext.hostView;
+            if (hostRef != null) {
+                TextureView tv = hostRef.get();
+                if (tv == null) {
+                    sExternalSurfaceByKey.remove(key);
+                    return 0L;
+                }
+                if (!tv.macapkSyncDirectGlExternalSurface(key)) {
+                    return 0L;
+                }
+            }
+            if (!ext.visible || ext.vw <= 0 || ext.vh <= 0) return -1L;
+            return ((ext.vx & 0xffffL) << 48)
+                 | ((ext.vy & 0xffffL) << 32)
+                 | ((ext.vw & 0xffffL) << 16)
+                 |  (ext.vh & 0xffffL);
+        } catch (Throwable t) {
+            return -1L;
+        }
+    }
+
     public static long macapkSurfaceRectPacked(int key) {
         java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
         SurfaceView v = ref != null ? ref.get() : null;
         if (v == null) {
             if (ref != null) sSurfaceByKey.remove(key);
-            return 0L;
+            return macapkExternalSurfaceRectPacked(key);
         }
         try {
             // A stopped Activity still owns attached, "shown" View objects in
@@ -1927,7 +2013,13 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
     public static long macapkSurfaceOwnSizePacked(int key) {
         java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
         SurfaceView v = ref != null ? ref.get() : null;
-        if (v == null) return 0L;
+        if (v == null) {
+            ExternalKeyedSurface ext = sExternalSurfaceByKey.get(key);
+            if (ext == null) return 0L;
+            int w = ext.ownW > 0 ? ext.ownW : ext.vw;
+            int h = ext.ownH > 0 ? ext.ownH : ext.vh;
+            return w > 0 && h > 0 ? ((long) w << 32) | (h & 0xffffffffL) : 0L;
+        }
         int w = v.getWidth(), h = v.getHeight();
         if (w <= 0 || h <= 0) return 0L;
         return ((long) w << 32) | (h & 0xffffffffL);
@@ -1936,7 +2028,19 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
     public static long macapkSurfaceBufferSizePacked(int key) {
         java.lang.ref.WeakReference<SurfaceView> ref = sSurfaceByKey.get(key);
         SurfaceView v = ref != null ? ref.get() : null;
-        if (v == null || !v.macapkHasIsolatedNativeSurface) return 0L;
+        if (v == null) {
+            ExternalKeyedSurface ext = sExternalSurfaceByKey.get(key);
+            if (ext == null) return 0L;
+            java.lang.ref.WeakReference<TextureView> hostRef = ext.hostView;
+            if (hostRef != null) {
+                TextureView tv = hostRef.get();
+                if (tv != null) tv.macapkSyncDirectGlExternalSurface(key);
+            }
+            int w = ext.ownW > 0 ? ext.ownW : ext.vw;
+            int h = ext.ownH > 0 ? ext.ownH : ext.vh;
+            return w > 0 && h > 0 ? ((long) w << 32) | (h & 0xffffffffL) : 0L;
+        }
+        if (!v.macapkHasIsolatedNativeSurface) return 0L;
         android.graphics.Rect f = v.holder.getSurfaceFrame();
         // Without an explicit fixed size, the producer follows the view. The
         // holder's cached frame can still contain the previous window size
@@ -4034,7 +4138,16 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
 
     public static long macapkActiveVideoRectPacked() {
         java.lang.ref.WeakReference<SurfaceView> ref = sVideoSinkView;
-        if (ref == null) { macapkNoteSinkState(0, null); return 0L; }
+        if (ref == null) {
+            long tvRect = android.graphics.SurfaceTexture.macapkActiveVideoRectPacked();
+            if (tvRect != 0L) {
+                macapkNoteSinkState(tvRect < 0L ? 1 : 2,
+                    tvRect < 0L ? "texture-hidden" : "texture-direct");
+                return tvRect;
+            }
+            macapkNoteSinkState(0, null);
+            return 0L;
+        }
         SurfaceView v = ref.get();
         if (v == null) { macapkNoteSinkState(1, "collected"); return -1L; }
         int w, h;
@@ -4074,10 +4187,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             int y = origin[1];
             macapkNoteSinkState(2, x + "," + y + " " + w + "x" + h);
             macapkTraceSinkTree(v);
-            return ((long) (x & 0xffffL) << 48)
-                 | ((long) (y & 0xffffL) << 32)
-                 | ((long) (w & 0xffffL) << 16)
-                 |  (long) (h & 0xffffL);
+            return View.macapkPackVideoRect(x, y, w, h);
         } catch (Throwable t) {
             // A half-torn-down tree mid-pull must degrade to "hidden", never
             // throw across JNI into the compositor.

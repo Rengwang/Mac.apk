@@ -465,12 +465,15 @@ public final class MessageQueue {
                 msg.next = p;
                 mMessages = msg;
                 needWake = mBlocked;
+                wake = true;
             } else {
                 // Insert at tail or middle. Only need to wake when a barrier
                 // sits at the head and this is the earliest work eligible to
                 // cross it on the owner loop.
-                needWake = mBlocked && p.target == null && p.callback == null
+                boolean barrierHead = p.target == null && p.callback == null;
+                needWake = mBlocked && barrierHead
                            && macapkEligibleAfterBarrier(msg, true);
+                wake = barrierHead && macapkEligibleAfterBarrier(msg, true);
                 Message prev;
                 for (;;) {
                     prev = p;
@@ -483,7 +486,6 @@ public final class MessageQueue {
                 prev.next = msg;
             }
             if (needWake) notifyAll();
-            wake = true;
         }
         // Outside the monitor: the waker may be a NATIVE call (see setWaker),
         // and holding this queue's lock across it would block every other

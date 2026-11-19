@@ -56,6 +56,16 @@ public class StorageManager {
     public StorageVolume getPrimaryStorageVolume() {
         return PRIMARY_VOLUME;
     }
+
+    /** AOSP @UnsupportedAppUsage: legacy volume-list array accessor. */
+    public StorageVolume[] getVolumeList() {
+        return new StorageVolume[] { PRIMARY_VOLUME };
+    }
+
+    /** AOSP @UnsupportedAppUsage: static (userId, flags) volume-list accessor. */
+    public static StorageVolume[] getVolumeList(int userId, int flags) {
+        return new StorageVolume[] { PRIMARY_VOLUME };
+    }
     /** AOSP: "Return the UUID that uniquely identifies the storage volume that
      *  hosts the given path" -- it returns a real UUID or throws IOException,
      *  and NEVER returns null. Callers written against that contract do not

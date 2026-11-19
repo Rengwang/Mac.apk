@@ -1,4 +1,5 @@
 #include "shared_gl_frames.h"
+#include "video_pixels.h"
 #include <EGL/eglext.h>
 #include <EGL/eglext_angle.h>
 #include <GLES2/gl2.h>
@@ -121,19 +122,7 @@ static bool copyArgb(SharedGlFrames* p,uint64_t token,uint32_t* out,size_t count
     if(IOSurfaceLock(io,kIOSurfaceLockReadOnly,nullptr)!=kIOReturnSuccess) return false;
     const auto* base=static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(io));
     if(!base) {IOSurfaceUnlock(io,kIOSurfaceLockReadOnly,nullptr);return false;}
-    for(size_t y=0;y<height;++y) {
-        const auto* row=reinterpret_cast<const uint32_t*>(base+(height-1-y)*stride);
-        uint32_t* dst=out+y*width;
-        for(size_t x=0;x<width;++x) {
-            uint32_t pixel=row[x],a=pixel>>24;
-            uint32_t r=(pixel>>16)&255,g=(pixel>>8)&255,b=pixel&255;
-            if(a!=255) {
-                if(a==0) {r=0;g=0;b=0;}
-                else {r=(r*255+(a>>1))/a;g=(g*255+(a>>1))/a;b=(b*255+(a>>1))/a;}
-            }
-            dst[x]=(a<<24)|(r<<16)|((g&255)<<8)|b;
-        }
-    }
+    pixels::FlipBgraPremulToArgb(base, stride, out, static_cast<int>(width), static_cast<int>(height));
     IOSurfaceUnlock(io,kIOSurfaceLockReadOnly,nullptr);return true;
 }
 bool SharedGlFramesCopyArgb(SharedGlFrames* p,uint64_t token,uint32_t* out,size_t count) {

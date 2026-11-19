@@ -94,6 +94,7 @@ public final class NativeMedia {
      *  nativeVidReleaseFrame (never both, never neither) or native memory
      *  leaks/dangles. */
     public static native long[] nativeVidPoll(long h);
+    public static native long[] nativeVidWaitPoll(long dec, long timeoutUs);
     /** Current depth of unconsumed frames in the decoder queue (ready + in-flight). */
     public static native int nativeVidQueueDepth(long h);
     /** MediaCodec.releaseOutputBuffer(index, render=true): composites the
@@ -103,6 +104,19 @@ public final class NativeMedia {
     /** Explicit codec destination; unrelated Surface construction cannot redirect it. */
     public static native void nativeVidRenderToSurface(long pixbufHandle, int width, int height,
                                                       android.graphics.SurfaceTexture target);
+    public static native void nativeVidRenderToSurface(long pixbufHandle, int width, int height,
+                                                      android.graphics.SurfaceTexture target,
+                                                      long presentationTimeNs);
+    /** Exports the decoded frame's backing IOSurface as a Mach send right for
+     *  cross-process Surface presentation; returns 0 if unavailable. */
+    public static native int nativeVidExportIOSurfacePort(long pixbufHandle);
+    /** Imports a Mach send right produced by nativeVidExportIOSurfacePort, wraps
+     *  it zero-copy in a CVPixelBufferRef, and presents onto target / window. */
+    public static native void nativeVidPresentIOSurfacePort(int machPort, int width, int height,
+                                                            android.graphics.SurfaceTexture target);
+    public static native void nativeVidPresentIOSurfacePort(int machPort, int width, int height,
+                                                            android.graphics.SurfaceTexture target,
+                                                            long presentationTimeNs);
     /** Frees a polled frame's native memory. Required exactly once per
      *  nativeVidPoll result, whether or not it was rendered. */
     public static native void nativeVidReleaseFrame(long pixbufHandle);
@@ -181,4 +195,46 @@ public final class NativeMedia {
     public static native long[] nativeVp9Poll(long h);
     public static native void nativeVp9Flush(long h);
     public static native void nativeVp9Close(long h);
+
+    // ---- Audio encoder (backs MediaCodec audio/mp4a-latm encoder): AudioToolbox ----
+    /** Opens an audio encoder (formatId 1 = AAC-LC); handle or 0. */
+    public static native long nativeAudioEncOpen(int formatId, int sampleRate, int channels, int bitrate);
+    /** Returns the MPEG-4 AudioSpecificConfig (2-byte csd-0), or null. */
+    public static native byte[] nativeAudioEncCsd0(long h);
+    /** Feeds interleaved S16LE PCM bytes; encodes complete frames and flushes on eos. */
+    public static native int nativeAudioEncEncode(long h, byte[] pcm, int offset, int size,
+                                                  long ptsUs, boolean eos);
+    /** Pops one encoded audio packet: fills outMeta[0]=ptsUs, outMeta[1]=flags; null if empty. */
+    public static native byte[] nativeAudioEncPoll(long h, long[] outMeta);
+    public static native void nativeAudioEncFlush(long h);
+    public static native void nativeAudioEncClose(long h);
+
+    // ---- Video encoder (backs MediaCodec video/avc, video/hevc): VideoToolbox ----
+    /** Video MIME strings this host can encode via VideoToolbox. */
+    public static native String[] nativeVideoEncodeSupportedMimes();
+    /** True if the encoder for `mime` uses hardware acceleration on this host. */
+    public static native boolean nativeVideoEncodeIsHardware(String mime);
+    /** Opens a VTCompressionSession encoder; returns opaque handle or 0. */
+    public static native long nativeVidEncOpen(String mime, int width, int height,
+                                               int bitrate, float frameRate, float iFrameIntervalSec,
+                                               int profile, int bitrateMode, Object callbackTarget);
+    /** Encodes one raw video frame from direct ByteBuffer (or fallback byte[]) in Android colorFormat. */
+    public static native int nativeVidEncEncodeBuffer(long h, java.nio.ByteBuffer directBuf,
+                                                      byte[] fallbackBytes, int offset, int size,
+                                                      int colorFormat, int stride, int sliceHeight,
+                                                      long ptsUs, boolean eos);
+    /** Encodes one raw ARGB_8888 (0xAARRGGBB) top-down frame from an input Surface. */
+    public static native int nativeVidEncEncodeArgb(long h, int[] argb, int width, int height, long ptsUs);
+    /** Flushes pending frames (VTCompressionSessionCompleteFrames) and queues trailing EOS. */
+    public static native int nativeVidEncEndOfStream(long h);
+    /** Pops one encoded packet (Annex-B); fills outMeta[0]=ptsUs, outMeta[1]=flags; null if empty. */
+    public static native byte[] nativeVidEncPoll(long h, long[] outMeta);
+    /** Returns Annex-B csd-0 (H.264 SPS / HEVC VPS+SPS+PPS), or null if not yet emitted. */
+    public static native byte[] nativeVidEncCsd0(long h);
+    /** Returns Annex-B csd-1 (H.264 PPS), or null. */
+    public static native byte[] nativeVidEncCsd1(long h);
+    /** Requests a keyframe on the next encoded frame. */
+    public static native void nativeVidEncRequestKeyFrame(long h);
+    public static native void nativeVidEncFlush(long h);
+    public static native void nativeVidEncClose(long h);
 }

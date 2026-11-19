@@ -737,13 +737,16 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     public void setOnHierarchyChangeListener(OnHierarchyChangeListener l) { this.hierarchyListener = l; }
     public OnHierarchyChangeListener getOnHierarchyChangeListener() { return hierarchyListener; }
 
-    // Animation cache flags (deprecated AOSP API; some libs still set).
-    public boolean isAnimationCacheEnabled() { return false; }
-    public void setAnimationCacheEnabled(boolean enabled) {}
-    public boolean isAlwaysDrawnWithCacheEnabled() { return false; }
-    public void setAlwaysDrawnWithCacheEnabled(boolean enabled) {}
-    public int getPersistentDrawingCache() { return 0; }
-    public void setPersistentDrawingCache(int drawingCacheToKeep) {}
+    // Animation cache flags (deprecated AOSP API; some libs still set and read back).
+    private boolean mAnimationCacheEnabled;
+    private boolean mAlwaysDrawnWithCacheEnabled;
+    private int mPersistentDrawingCache;
+    public boolean isAnimationCacheEnabled() { return mAnimationCacheEnabled; }
+    public void setAnimationCacheEnabled(boolean enabled) { mAnimationCacheEnabled = enabled; }
+    public boolean isAlwaysDrawnWithCacheEnabled() { return mAlwaysDrawnWithCacheEnabled; }
+    public void setAlwaysDrawnWithCacheEnabled(boolean enabled) { mAlwaysDrawnWithCacheEnabled = enabled; }
+    public int getPersistentDrawingCache() { return mPersistentDrawingCache; }
+    public void setPersistentDrawingCache(int drawingCacheToKeep) { mPersistentDrawingCache = drawingCacheToKeep; }
     /** AOSP FLAG_SPLIT_MOTION_EVENTS (ViewGroup.java:392), set in
      *  initViewGroup() (ViewGroup.java:714-716):
      *
@@ -3294,8 +3297,9 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
      *  animated transition. We don't run real transitions. */
     public void endViewTransition(View view) {}
     public void startViewTransition(View view) {}
-    public boolean isTransitionGroup() { return false; }
-    public void setTransitionGroup(boolean isTransitionGroup) {}
+    private boolean mIsTransitionGroup;
+    public boolean isTransitionGroup() { return mIsTransitionGroup; }
+    public void setTransitionGroup(boolean isTransitionGroup) { mIsTransitionGroup = isTransitionGroup; }
     /** AOSP ViewGroup.mTransition (ViewGroup.java:5658-5681, android14-release).
      *
      *  These two used to be a hardcoded `return null` and an empty setter, on the

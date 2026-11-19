@@ -289,21 +289,25 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     public void play()  { com.macapk.loader.AudioTrace.hit("AudioTrack.play");
         if (honestUninitialized())
             throw new IllegalStateException("play() called on uninitialized AudioTrack.");
-        if (handle != 0) com.macapk.loader.NativeAudio.nativePlay(handle); }
+        if (handle != 0) com.macapk.loader.NativeAudio.nativePlay(handle);
+        macapkWakePositionWatcher(); }
     public void pause() { com.macapk.loader.AudioTrace.hit("AudioTrack.pause");
         if (honestUninitialized())
             throw new IllegalStateException("pause() called on uninitialized AudioTrack.");
-        if (handle != 0) com.macapk.loader.NativeAudio.nativePause(handle); }
+        if (handle != 0) com.macapk.loader.NativeAudio.nativePause(handle);
+        macapkWakePositionWatcher(); }
     public void stop()  { com.macapk.loader.AudioTrace.hit("AudioTrack.stop");
         if (honestUninitialized())
             throw new IllegalStateException("stop() called on uninitialized AudioTrack.");
-        if (handle != 0) com.macapk.loader.NativeAudio.nativeStop(handle); }
-    public void flush() { com.macapk.loader.AudioTrace.hit("AudioTrack.flush"); if (handle != 0) com.macapk.loader.NativeAudio.nativeFlush(handle); }
+        if (handle != 0) com.macapk.loader.NativeAudio.nativeStop(handle);
+        macapkWakePositionWatcher(); }
+    public void flush() { com.macapk.loader.AudioTrace.hit("AudioTrack.flush"); if (handle != 0) com.macapk.loader.NativeAudio.nativeFlush(handle); macapkWakePositionWatcher(); }
     public void release() {
         com.macapk.loader.AudioTrace.hit("AudioTrack.release");
         // Stop the position watcher first, or an app that churns through tracks
         // leaks one daemon thread per released track.
         mReleased = true;
+        macapkWakePositionWatcher();
         Thread w = mPosWatcher;
         if (w != null) w.interrupt();
         if (handle != 0) com.macapk.loader.NativeAudio.nativeRelease(handle);
@@ -458,12 +462,24 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     }
 
     public static int getMinBufferSize(int sampleRateInHz, int channelConfig, int audioFormat) {
+        if (sampleRateInHz < 4000 || sampleRateInHz > 192000) {
+            return ERROR_BAD_VALUE;
+        }
+        if (channelConfig != 2 && channelConfig != 3 && channelConfig != 1
+                && (channelConfig <= 0 || (channelConfig & ~0x3FFFFC) != 0)) {
+            return ERROR_BAD_VALUE;
+        }
+        if (audioFormat != AudioFormat.ENCODING_PCM_16BIT
+                && audioFormat != AudioFormat.ENCODING_PCM_8BIT
+                && audioFormat != AudioFormat.ENCODING_PCM_FLOAT
+                && audioFormat != 1 /* ENCODING_DEFAULT */) {
+            return ERROR_BAD_VALUE;
+        }
         int ch  = channelsFromConfig(channelConfig);
         int bps = bytesPerSample(normalizeEncoding(audioFormat));
-        // ~ minimum sane buffer: 25 ms, floored so callers that multiply it
-        // still land on a usable size. Matches the spirit of AOSP's native
-        // min (device-specific) without pretending a fixed 4096.
-        int frames = Math.max(sampleRateInHz / 40, 512);
+        // ~ minimum sane buffer: 80 ms, matching AOSP normal mixer sizing so
+        // 1024-frame AAC bursts don't starve the ring.
+        int frames = Math.max((sampleRateInHz * 2) / 25, 2048);
         int bytes  = frames * ch * bps;
         return Math.max(bytes, 4096);
     }
@@ -623,6 +639,7 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         // ERROR_INVALID_OPERATION; }" before native_set_marker_pos.
         if (honestUninitialized()) return ERROR_INVALID_OPERATION;
         mMarkerPositionInFrames = markerInFrames;
+        macapkWakePositionWatcher();
         return SUCCESS;
     }
     public int setPositionNotificationPeriod(int periodInFrames) {
@@ -630,6 +647,7 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         // native_set_pos_update_period.
         if (honestUninitialized()) return ERROR_INVALID_OPERATION;
         mPositionNotificationPeriod = periodInFrames;
+        macapkWakePositionWatcher();
         return SUCCESS;
     }
     // AOSP fires onMarkerReached / onPeriodicNotification from the native event
@@ -644,8 +662,13 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     // track that actually arms a notification; nothing is started otherwise.
     private volatile OnPlaybackPositionUpdateListener mPosListener;
     private volatile android.os.Handler mPosHandler;
+    private final Object mPosLock = new Object();
     private Thread mPosWatcher;
     private volatile boolean mReleased;
+
+    private void macapkWakePositionWatcher() {
+        synchronized (mPosLock) { mPosLock.notifyAll(); }
+    }
 
     public void setPlaybackPositionUpdateListener(OnPlaybackPositionUpdateListener listener) {
         setPlaybackPositionUpdateListener(listener, null);
@@ -655,6 +678,7 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         mPosListener = listener;
         mPosHandler = handler;
         if (listener != null) macapkStartPositionWatcher();
+        macapkWakePositionWatcher();
     }
 
     /** Post to the app's Handler when it supplied one, else the main looper --
@@ -681,9 +705,14 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
             int armedMarker = -1;
             long nextPeriod = -1;
             for (;;) {
-                if (mReleased) return;
-                try { Thread.sleep(20L); } catch (InterruptedException e) { return; }
-                if (mReleased) return;
+                synchronized (mPosLock) {
+                    while (!mReleased && (mPosListener == null
+                            || (mMarkerPositionInFrames <= 0 && mPositionNotificationPeriod <= 0)
+                            || getPlayState() != PLAYSTATE_PLAYING)) {
+                        try { mPosLock.wait(); } catch (InterruptedException e) { return; }
+                    }
+                    if (mReleased) return;
+                }
                 final OnPlaybackPositionUpdateListener l = mPosListener;
                 if (l == null) continue;
                 int pos;
@@ -717,6 +746,10 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
                             l.onPeriodicNotification(AudioTrack.this); } });
                     }
                 } else nextPeriod = -1;
+                synchronized (mPosLock) {
+                    if (mReleased) return;
+                    try { mPosLock.wait(20L); } catch (InterruptedException e) { return; }
+                }
             }
         } }, "macapk-audiotrack-pos");
         mPosWatcher.setDaemon(true);

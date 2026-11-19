@@ -1,0 +1,501 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at_utc": "2026-11-18T02:10:00Z",
+  "ranking_formula": "severity_weight(critical=4,high=3,medium=2,low=1) * independent_scenario_breadth * confidence_weight(high=3,medium=2,low=1)",
+  "diagnostic_logger_added": false,
+  "diagnostic_logger_rationale": "Existing MACAPK_CODEC_OBS=1 (OBS-001), FeatureGatesTest.py (GATE-001), scan_apk.py (SCAN-001), RemoteServiceProcessTest, and offline GapProbe isolate every gap without modifying runtime binaries or hot paths.",
+  "counts": {
+    "total": 18,
+    "observed": 0,
+    "predicted": 4,
+    "fixed": 14
+  },
+  "gaps": [
+    {
+      "gap_id": "GAP-IPC-001",
+      "status": "fixed",
+      "title": "ServiceManager.getServiceOrThrow(String) returns null instead of throwing ServiceNotFoundException; ServiceNotFoundException class absent; SystemProperties.set() silently discards writes",
+      "source": [
+        "GAPLOG-001/GapProbe",
+        "CAP-001",
+        "CONTRACT-001/CTR-IPC-XFAIL-001"
+      ],
+      "severity": "high",
+      "severity_weight": 3,
+      "independent_scenarios": [
+        "GapProbe",
+        "CAP-001:service_property",
+        "runtime_ServiceManager"
+      ],
+      "independent_scenario_breadth": 3,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 27,
+      "capability_id": "IPC-004",
+      "code_anchors": [
+        "runtime/java/android/os/ServiceManager.java:21-33"
+      ],
+      "observed_evidence": "FIXED in PILOT-001 (ServiceManager.getServiceOrThrow throws ServiceNotFoundException; CTR-IPC-XFAIL-001 PASS); SystemProperties.set() remains read-only no-op",
+      "candidate_test": "ContractSuiteRunner (CTR-IPC-XFAIL-001)",
+      "owner_task": "PILOT-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-GATE-001",
+      "status": "fixed",
+      "title": "Four MACAPK_EXPERIMENTAL_* surface/looper gates default ON in Launcher/Stub (=1) vs OFF in direct macapk-runtime CLI and MACAPK_BROKER_RUNTIME dev spawns",
+      "source": [
+        "GATE-001",
+        "GAPLOG-001/validate_gates"
+      ],
+      "severity": "high",
+      "severity_weight": 3,
+      "independent_scenarios": [
+        "direct_runtime_cli",
+        "launcher_control_panel",
+        "app_stub_dock"
+      ],
+      "independent_scenario_breadth": 3,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 27,
+      "capability_id": "SURF-002",
+      "code_anchors": [
+        "runtime/translator/src/bionic_shim.cpp:36788",
+        "runtime/translator/src/bionic_shim.cpp:64381",
+        "runtime/src/cocoa_bridge.mm:8947",
+        "runtime/translator/src/bionic_shim.cpp:67590",
+        "launcher/MacApkLauncherApp.swift:4510-4513",
+        "launcher/AppStubMain.swift:1020-1029"
+      ],
+      "observed_evidence": "FIXED in GATE-002: runtime defaults aligned to default-ON (!e || strcmp(e, \"0\") != 0) with =0 opt-out across direct CLI, broker, launcher panel, and app stub; validate_gates PASS",
+      "candidate_test": "FeatureGatesTest",
+      "owner_task": "GATE-002 (DONE)"
+    },
+    {
+      "gap_id": "GAP-IPC-003",
+      "status": "fixed",
+      "title": "Manifest-declared :worker Service binds in-process (shared PID and static state) when macapk-system broker is absent",
+      "source": [
+        "SCAN-001",
+        "COMP-001",
+        "GAPLOG-001/RemoteServiceProcessTest"
+      ],
+      "severity": "high",
+      "severity_weight": 3,
+      "independent_scenarios": [
+        "comp-service-ipc-abi",
+        "RemoteServiceProcessTest_nobroker",
+        "RemoteServiceProcessTest_broker"
+      ],
+      "independent_scenario_breadth": 2,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 18,
+      "capability_id": "IPC-003",
+      "code_anchors": [
+        "runtime/java/android/app/ServiceRegistry.java:384-396",
+        "runtime/java/com/macapk/loader/SystemClient.java:394-670",
+        "runtime/java/com/macapk/loader/SystemServer.java:405-455",
+        "debug/run_remote_service_broker_test.py"
+      ],
+      "observed_evidence": "FIXED in IPC-001/GAP-IPC-003 (commit 0312791): ServiceRegistry.bind routes cross-process :worker targets via SystemClient.bindBlockingIfRemote (with IN_BROKER_BIND ping-pong guard and LAST_REMOTE_BIND_HANDLED); RemoteServiceProcessTest via python3 scripts/run_tests.py --test RemoteServiceProcessTest --strict PASS (rc=0, workerPid != clientPid, clientState=17, workerState=42, callerPid=clientPid, headless MACAPK_SERVICE_HOST=1, zero leaked LaunchAgents/PIDs)",
+      "candidate_test": "RemoteServiceProcessTest / ProcessBrokerRoutingTest",
+      "owner_task": "IPC-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-MED-001",
+      "status": "fixed",
+      "title": "MediaExtractor ignores non-file:// URIs silently, omits track index validation, and surfaces only a single audio track (video tracks unsupported)",
+      "source": [
+        "GAPLOG-001/GapProbe",
+        "CAP-001"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "GapProbe",
+        "MediaExtractor_source_inspection"
+      ],
+      "independent_scenario_breadth": 2,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 12,
+      "capability_id": "MED-002",
+      "code_anchors": [
+        "runtime/java/android/media/MediaExtractor.java:1-5",
+        "runtime/java/android/media/MediaExtractor.java:103-146"
+      ],
+      "observed_evidence": "FIXED in MEDIA-001: MediaExtractor validates URI scheme (throws IOException) and validates track index (throws IllegalArgumentException/IllegalStateException); CTR-MEDIA-XFAIL-001 PASS",
+      "candidate_test": "ContractSuiteRunner (CTR-MEDIA-XFAIL-001)",
+      "owner_task": "MEDIA-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-MED-002",
+      "status": "fixed",
+      "title": "MediaCodec.createEncoderByType unimplemented (throws IOException) and VideoToolbox retains trailing H.264 frames unless BUFFER_FLAG_END_OF_STREAM is queued",
+      "source": [
+        "OBS-001",
+        "GAPLOG-001/GapProbe",
+        "GAPLOG-001/comp_surface_media_video"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "GapProbe",
+        "comp-surface-media"
+      ],
+      "independent_scenario_breadth": 2,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 12,
+      "capability_id": "MED-001",
+      "code_anchors": [
+        "runtime/java/android/media/MediaCodec.java:274",
+        "runtime/java/android/media/MediaCodec.java:2071-2100",
+        "runtime/java/android/media/MediaCodecList.java:166-215",
+        "runtime/src/video_toolbox.mm",
+        "runtime/src/media_decode.mm",
+        "debug/MediaCodecEncoderTest.java"
+      ],
+      "observed_evidence": "FIXED in MEDIA-001 (EOS + GAP-MED-002 commit df2d74c): MediaCodec.createEncoderByType/createByCodecName and MediaCodecList expose VideoToolbox H.264/HEVC (ByteBuffer + createInputSurface/setInputSurface + signalEndOfInputStream) and AudioToolbox AAC-LC (AudioConverterNew) hardware/OS encoders; MediaCodecEncoderTest PASS via run_tests.py (11/11 checks: H.264 I420/NV12/BGRA32/YUV420Flexible/InputSurface/Async+PersistentInputSurface/flush, HEVC, AAC asc=1210)",
+      "candidate_test": "MediaCodecEncoderTest",
+      "owner_task": "MEDIA-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-GATE-002",
+      "status": "fixed",
+      "title": "MACAPK_LOG_LEVEL & MACAPK_QUIET_CLASSLOAD defaults diverge across Launcher/Stub (4/1), direct CLI (7/0), and SystemServer spawns (7/unset)",
+      "source": [
+        "GATE-001",
+        "GAPLOG-001/FeatureGatesTest"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "FeatureGatesTest:FG-LOG",
+        "launch_entry_matrix"
+      ],
+      "independent_scenario_breadth": 2,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 12,
+      "capability_id": "LIFE-002",
+      "code_anchors": [
+        "launcher/MacApkLauncherApp.swift:4502-4505",
+        "launcher/AppStubMain.swift:1006-1011",
+        "runtime/java/com/macapk/loader/SystemServer.java:395-398",
+        "runtime/java/android/util/Log.java:111"
+      ],
+      "observed_evidence": "FIXED in GATE-002: stale level 5 comments cleaned across NativeLog.java, Log.java, native_methods.cpp, aligning with default level 4 (INFO); validate_gates PASS",
+      "candidate_test": "FeatureGatesTest",
+      "owner_task": "GATE-002 (DONE)"
+    },
+    {
+      "gap_id": "GAP-GFX-001",
+      "status": "predicted",
+      "title": "Seven gpu_pixel Metal/ANGLE/IOSurface pixel tests and live GL readback/present/power metrics remain unverified in headless offline runs",
+      "source": [
+        "TEST-001",
+        "COMP-001",
+        "PERF-001",
+        "OBS-001"
+      ],
+      "severity": "high",
+      "severity_weight": 3,
+      "independent_scenarios": [
+        "comp-surface-media",
+        "gpu_pixel_suite"
+      ],
+      "independent_scenario_breadth": 2,
+      "contract_confidence": "medium",
+      "confidence_weight": 2,
+      "priority_score": 12,
+      "capability_id": "SURF-002",
+      "code_anchors": [
+        "scripts/run_tests.py",
+        "PERFORMANCE.md"
+      ],
+      "observed_evidence": "offline gpu_pixel 7/7 PASS (21c7a6e); MACAPK_GL_WINDOW_READBACK_TRACE=1 and MACAPK_PRESENT_TRACE=1 require windowed/Sidecar GUI playback",
+      "candidate_test": "gpu_pixel group + Sidecar GUI sweep",
+      "owner_task": "GFX-001 / VIDEO-PWR-001 (PENDING)"
+    },
+    {
+      "gap_id": "GAP-IDX-001",
+      "status": "predicted",
+      "title": "Absent android-api.idx.gz / tools/api-index/gen.py leaves true upstream Android 16 (API 36) missing-API denominator unmeasured",
+      "source": [
+        "CAP-001",
+        "SCAN-001"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "comp-ui-resources",
+        "comp-surface-media",
+        "comp-service-ipc-abi"
+      ],
+      "independent_scenario_breadth": 3,
+      "contract_confidence": "medium",
+      "confidence_weight": 2,
+      "priority_score": 12,
+      "capability_id": "RES-005",
+      "code_anchors": [
+        "docs/compat/CAPABILITIES.md:8",
+        "docs/compat/SCAN_REPORT.md:19-21"
+      ],
+      "observed_evidence": "scan_apk.py reports Methods Missing=0 against local android-framework.jar only; android-api.idx.gz absent",
+      "candidate_test": "ApiIndexDenominatorCheck",
+      "owner_task": "CONTRACT-001"
+    },
+    {
+      "gap_id": "GAP-IPC-002",
+      "status": "fixed",
+      "title": "Binder.getCallingUidOrThrow() unconditionally returns own UID instead of throwing IllegalStateException outside incoming transactions",
+      "source": [
+        "GAPLOG-001/GapProbe"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "GapProbe"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 6,
+      "capability_id": "IPC-002",
+      "code_anchors": [
+        "runtime/java/android/os/Binder.java:162-169"
+      ],
+      "observed_evidence": "FIXED in IPC-001: Binder tracks transaction depth and explicit identity; getCallingUidOrThrow throws IllegalStateException outside transaction and succeeds inside transact/clearCallingIdentity; CTR-IPC-XFAIL-002 PASS",
+      "candidate_test": "ContractSuiteRunner (CTR-IPC-XFAIL-002)",
+      "owner_task": "IPC-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-CONTRACT-BUNDLE-001",
+      "status": "fixed",
+      "title": "API 33 Bundle.getParcelableArrayList(k,Class)/getSerializable(k,Class) omit runtime element/value clazz.isInstance checks and leak raw incompatible elements",
+      "source": [
+        "CONTRACT-001/CTR-BUNDLE-XFAIL-001"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "ContractSuiteTest:CTR-BUNDLE-XFAIL-001"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 6,
+      "capability_id": "IPC-001",
+      "code_anchors": [
+        "runtime/java/android/os/Bundle.java:275-314"
+      ],
+      "observed_evidence": "FIXED in PILOT-001: CTR-BUNDLE-XFAIL-001 PASS",
+      "candidate_test": "ContractSuiteRunner (CTR-BUNDLE-XFAIL-001)",
+      "owner_task": "PILOT-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-CONTRACT-INTENT-001",
+      "status": "fixed",
+      "title": "Intent.parseUri(..., URI_ANDROID_APP_SCHEME) degrades android-app:// URI instead of extracting target package and inner scheme data URI",
+      "source": [
+        "CONTRACT-001/CTR-INTENT-XFAIL-001"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "ContractSuiteTest:CTR-INTENT-XFAIL-001"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 6,
+      "capability_id": "LIFE-001",
+      "code_anchors": [
+        "runtime/java/android/content/Intent.java:445-485"
+      ],
+      "observed_evidence": "FIXED in PILOT-001: CTR-INTENT-XFAIL-001 PASS",
+      "candidate_test": "ContractSuiteRunner (CTR-INTENT-XFAIL-001)",
+      "owner_task": "PILOT-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-CONTRACT-PM-001",
+      "status": "fixed",
+      "title": "PatternMatcher(PATTERN_ADVANCED_GLOB) falls back to simple glob matching and skips syntax validation",
+      "source": [
+        "CONTRACT-001/CTR-PM-XFAIL-001"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "ContractSuiteTest:CTR-PM-XFAIL-001"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 6,
+      "capability_id": "RES-001",
+      "code_anchors": [
+        "runtime/java/android/os/PatternMatcher.java:75-166"
+      ],
+      "observed_evidence": "FIXED in PILOT-001: CTR-PM-XFAIL-001 PASS",
+      "candidate_test": "ContractSuiteRunner (CTR-PM-XFAIL-001)",
+      "owner_task": "PILOT-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-CONTRACT-AUDIO-001",
+      "status": "fixed",
+      "title": "AudioTrack.getMinBufferSize omits invalid sampleRate/audioFormat validation instead of returning ERROR_BAD_VALUE (-2)",
+      "source": [
+        "CONTRACT-001/CTR-AUDIO-XFAIL-001"
+      ],
+      "severity": "low",
+      "severity_weight": 1,
+      "independent_scenarios": [
+        "ContractSuiteTest:CTR-AUDIO-XFAIL-001"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 3,
+      "capability_id": "MED-003",
+      "code_anchors": [
+        "runtime/java/android/media/AudioTrack.java:450-485"
+      ],
+      "observed_evidence": "FIXED in PILOT-001: CTR-AUDIO-XFAIL-001 PASS",
+      "candidate_test": "ContractSuiteRunner (CTR-AUDIO-XFAIL-001)",
+      "owner_task": "PILOT-001 (DONE)"
+    },
+    {
+      "gap_id": "GAP-NAT-001",
+      "status": "predicted",
+      "title": "Dynamic JNI registration (JNI_OnLoad / RegisterNatives) in libcompprobe.so is statically unresolvable until app execution",
+      "source": [
+        "SCAN-001",
+        "GAPLOG-001/comp-service-ipc-abi_cli"
+      ],
+      "severity": "medium",
+      "severity_weight": 2,
+      "independent_scenarios": [
+        "comp-service-ipc-abi"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "medium",
+      "confidence_weight": 2,
+      "priority_score": 4,
+      "capability_id": "IPC-003",
+      "code_anchors": [
+        "debug/fixtures/service_ipc_abi/jni/compprobe.c",
+        "docs/compat/scan-report.json:11-17"
+      ],
+      "observed_evidence": "scan_apk.py blind_spot=native_dynamic_jni_registration; --extract-only installs lib/arm64/libcompprobe.so without loading it",
+      "candidate_test": "RuntimeDynamicJniProbeTest",
+      "owner_task": "CONTRACT-001"
+    },
+    {
+      "gap_id": "GAP-GATE-003",
+      "status": "fixed",
+      "title": "Harness environment variable scrubbing exists only in MacApkLauncherApp.swift, not in AppStubMain.swift or macapk-runtime",
+      "source": [
+        "GATE-001"
+      ],
+      "severity": "low",
+      "severity_weight": 1,
+      "independent_scenarios": [
+        "launch_entry_matrix"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 3,
+      "capability_id": "LIFE-002",
+      "code_anchors": [
+        "launcher/MacApkLauncherApp.swift:153-161",
+        "launcher/AppStubMain.swift:1006-1040",
+        "runtime/src/main.cpp:475-524"
+      ],
+      "observed_evidence": "FIXED in GATE-002: AppStubMain.swift cleans 9 testing/harness environment variables (matching MacApkLauncherApp.swift:153-161) before launching stub; validate_gates PASS",
+      "candidate_test": "FeatureGatesTest",
+      "owner_task": "GATE-002 (DONE)"
+    },
+    {
+      "gap_id": "GAP-GATE-004",
+      "status": "fixed",
+      "title": "PresentedSdk.java comments retain stale revert notes contradicting active MACAPK_SDK_FROM_TARGET=1 implementation",
+      "source": [
+        "GATE-001",
+        "GAPLOG-001/FeatureGatesTest"
+      ],
+      "severity": "low",
+      "severity_weight": 1,
+      "independent_scenarios": [
+        "FeatureGatesTest:FG-SDK"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 3,
+      "capability_id": "LIFE-004",
+      "code_anchors": [
+        "runtime/java/com/macapk/loader/PresentedSdk.java:94-96",
+        "runtime/java/com/macapk/loader/PresentedSdk.java:205"
+      ],
+      "observed_evidence": "FIXED in GATE-002: PresentedSdk.java stale revert comments cleaned, logging aligned with active !\"0\".equals(getenv(...)) default-ON behavior; validate_gates PASS",
+      "candidate_test": "FeatureGatesTest",
+      "owner_task": "GATE-002 (DONE)"
+    },
+    {
+      "gap_id": "GAP-GATE-005",
+      "status": "fixed",
+      "title": "MACAPK_EXPERIMENTAL_ALPHA_PROBE compares ==\"1\" in Java SurfaceView vs non-null pointer presence in C++/ObjC",
+      "source": [
+        "GATE-001"
+      ],
+      "severity": "low",
+      "severity_weight": 1,
+      "independent_scenarios": [
+        "source_gate_audit"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "high",
+      "confidence_weight": 3,
+      "priority_score": 3,
+      "capability_id": "SURF-002",
+      "code_anchors": [
+        "runtime/java/android/view/SurfaceView.java:4253",
+        "runtime/translator/src/bionic_shim.cpp:38052",
+        "runtime/src/cocoa_bridge.mm:9229"
+      ],
+      "observed_evidence": "FIXED in GATE-002: bionic_shim.cpp and cocoa_bridge.mm unified to strict strcmp(..., \"1\") == 0 probe comparison, matching SurfaceView.java; validate_gates PASS",
+      "candidate_test": "FeatureGatesTest",
+      "owner_task": "GATE-002 (DONE)"
+    },
+    {
+      "gap_id": "GAP-RES-001",
+      "status": "predicted",
+      "title": "PackageManager non-self queries outside synthetic Play/GMS/browser stand-ins and multi-density/dynamic Resources overlays remain uncompared against AOSP",
+      "source": [
+        "CAP-001",
+        "COMP-001"
+      ],
+      "severity": "low",
+      "severity_weight": 1,
+      "independent_scenarios": [
+        "comp-ui-resources"
+      ],
+      "independent_scenario_breadth": 1,
+      "contract_confidence": "medium",
+      "confidence_weight": 2,
+      "priority_score": 2,
+      "capability_id": "RES-001",
+      "code_anchors": [
+        "runtime/java/com/macapk/loader/MacApkPackageManager.java:1-5",
+        "runtime/java/com/macapk/loader/MacApkPackageManager.java:6346-6382"
+      ],
+      "observed_evidence": "Source design intentionally models single-APK host view; complex theme overlays & multi-package resolution uncompared",
+      "candidate_test": "PackageManagerContractTest",
+      "owner_task": "CONTRACT-001"
+    }
+  ]
+}

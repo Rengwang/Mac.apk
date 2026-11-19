@@ -140,7 +140,12 @@ public class Application extends ContextWrapper
         // NOT invoked from inside this constructor (calling an overridable method
         // during construction is unsafe, and we are not changing whether/when
         // such overrides run -- a separate pre-existing concern).
-        super.attachBaseContext(new AppBaseContext(this));
+        this.macapkTerminator = new AppBaseContext(this);
+        LoadedApk initialPkg = new LoadedApk(
+                ActivityThread.currentActivityThread(), null, null, null, this.classLoader);
+        this.mLoadedApk = initialPkg;
+        this.macapkTerminator.mPackageInfo = initialPkg;
+        super.attachBaseContext(this.macapkTerminator);
         macapkTraceLaunchStack();
     }
 
@@ -190,6 +195,7 @@ public class Application extends ContextWrapper
      *  base -> app -> base -> ... and stack-overflow. Field access cannot cycle. */
     private static final class AppBaseContext extends Context {
         private final Application app;
+        LoadedApk mPackageInfo;
         AppBaseContext(Application app) { this.app = app; }
         // The 8 abstract getters + close kin, served from the app's fields.
         @Override public String getPackageName()            { return macapkResolvePackageName(app.packageName); }
@@ -198,6 +204,9 @@ public class Application extends ContextWrapper
         @Override public AssetManager getAssets()           { return app.assets != null ? app.assets : app.macapkPrimaryAssets; }
         @Override public Context getApplicationContext()    { return app; }
         @Override public ClassLoader getClassLoader() {
+            if (mPackageInfo != null && mPackageInfo.mClassLoader != null) {
+                return mPackageInfo.mClassLoader;
+            }
             return app.classLoader != null ? app.classLoader
                                            : Thread.currentThread().getContextClassLoader();
         }
@@ -464,8 +473,34 @@ public class Application extends ContextWrapper
      *  here fixes class lookups regardless of which thread is asking. */
     public void macapkSetClassLoader(ClassLoader cl) {
         this.classLoader = cl;
+        if (this.mLoadedApk != null) {
+            this.mLoadedApk.mClassLoader = cl;
+        }
+        if (this.macapkTerminator != null && this.macapkTerminator.mPackageInfo != null) {
+            this.macapkTerminator.mPackageInfo.mClassLoader = cl;
+        }
     }
+
+    /** Bind the LoadedApk built by ActivityThread/LoadedApk.makeApplicationInner
+     *  to both this Application and its ContextImpl-shaped terminator so
+     *  plugin/bundle loaders (mPackageInfo -> mClassLoader) see one shared
+     *  LoadedApk instance. */
+    /* package */ void macapkBindLoadedApk(LoadedApk pkg) {
+        if (pkg == null) return;
+        this.mLoadedApk = pkg;
+        if (this.macapkTerminator != null) {
+            this.macapkTerminator.mPackageInfo = pkg;
+        }
+        if (pkg.mClassLoader == null && this.classLoader != null) {
+            pkg.mClassLoader = this.classLoader;
+        } else if (this.classLoader == null && pkg.mClassLoader != null) {
+            this.classLoader = pkg.mClassLoader;
+        }
+    }
+
     private ClassLoader classLoader;
+    private final AppBaseContext macapkTerminator;
+    public LoadedApk mLoadedApk;
 
     public String getMacApkApkPath()     { return apkPath; }
     public File   getMacApkAppDir()      { return appDir; }
@@ -1018,11 +1053,21 @@ public class Application extends ContextWrapper
      *  this; and being private is what lets AppBaseContext.getPackageCodePath
      *  reach the same record without a hop an app could turn into a cycle. */
     private android.content.pm.ApplicationInfo macapkApplicationInfoReal() {
+        // A packer can construct the real Application and attach our existing
+        // base Context without calling macapkInit on that delegate. Its package
+        // record belongs to the attached base, just like its resources/assets;
+        // consult it before an empty pre-attach fallback cached on this object.
+        Context delegate = macapkUninitDelegate();
+        android.content.pm.ApplicationInfo delegated = null;
+        if (delegate != null) {
+            try { delegated = delegate.getApplicationInfo(); }
+            catch (Throwable ignored) { /* retain the non-null, non-throwing fallback */ }
+        }
         android.content.pm.ApplicationInfo cached = cachedApplicationInfo;
-        if (cached != null) return cached;
-        android.content.pm.ApplicationInfo info = null;
+        if (delegated == null && cached != null) return cached;
+        android.content.pm.ApplicationInfo info = delegated;
         try {
-            PackageManager pm = macapkPackageManagerReal();
+            PackageManager pm = info == null ? macapkPackageManagerReal() : null;
             if (pm != null && packageName != null) {
                 info = pm.getApplicationInfo(packageName,
                         PackageManager.GET_SHARED_LIBRARY_FILES);
@@ -1133,6 +1178,9 @@ public class Application extends ContextWrapper
     // for every meta-data value, typed the way AOSP PackageParser types it.
 
     @Override public ClassLoader getClassLoader() {
+        LoadedApk pkg = mLoadedApk != null ? mLoadedApk
+                : (macapkTerminator != null ? macapkTerminator.mPackageInfo : null);
+        if (pkg != null && pkg.mClassLoader != null) return pkg.mClassLoader;
         if (classLoader != null) return classLoader;
         return Thread.currentThread().getContextClassLoader();
     }

@@ -114,7 +114,11 @@ public final class MacApkGlWindow {
     private java.nio.ByteBuffer mRgba;
     private final java.util.concurrent.ConcurrentLinkedQueue<int[]> mFree =
         new java.util.concurrent.ConcurrentLinkedQueue<>();
-    private final java.util.function.Consumer<int[]> mRecycler = mFree::offer;
+    private final java.util.function.Consumer<int[]> mRecycler = pixels -> {
+        if (mDestroyed) return;
+        mFree.offer(pixels);
+        if (mDestroyed) mFree.remove(pixels);
+    };
 
     private MacApkGlWindow(android.opengl.EGLDisplay dpy, android.opengl.EGLConfig cfg,
                            SurfaceTexture st, boolean allowShared) {
@@ -268,6 +272,7 @@ public final class MacApkGlWindow {
                     mSharedToken = next[0];
                     mPbuffer = android.opengl.EGLSurface.macapkWrapNativeHandle(next[1]);
                     mFrames++;
+                    SurfaceTexture.macapkNoteEglDirectSwap();
                     if (TRACE_READBACK) {
                         mTraceFrames++;
                         if (traceNativeLayer() && (mFrames < 6 || mFrames % 120 == 0)) {
@@ -302,8 +307,9 @@ public final class MacApkGlWindow {
             GLES20.glFinish();
             boolean copied = com.macapk.loader.SharedGlFrameBridge.copyDrawingArgb(mSharedPool, mSharedToken, pixels);
             if (copied) {
-                mSt.macapkQueueProducerFrame(pixels, w, h, w, FLIP_V, mRecycler, true);
+                mSt.macapkQueueProducerFrame(this, pixels, w, h, w, FLIP_V, mRecycler, true);
                 mFrames++;
+                SurfaceTexture.macapkNoteEglPbufferSwap();
                 if (TRACE_READBACK) {
                     mTraceFrames++; mTraceBytes += (long)w*h*4;
                     mTraceTotalNanos += System.nanoTime()-copyStart;
@@ -345,10 +351,13 @@ public final class MacApkGlWindow {
             if (savedSkipPixels != 0) GLES20.glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
         }
 
+        final long readStart = System.nanoTime();
         mRgba.clear();
         final long traceReadStart = TRACE_READBACK ? System.nanoTime() : 0L;
         GLES20.glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, mRgba);
         final long traceReadEnd = TRACE_READBACK ? System.nanoTime() : 0L;
+        final long readNs = traceReadEnd != 0L ? traceReadEnd - readStart
+                                               : System.nanoTime() - readStart;
 
         if (es3) {
             if (savedSkipPixels != 0) GLES20.glPixelStorei(GL_PACK_SKIP_PIXELS, savedSkipPixels);
@@ -359,6 +368,7 @@ public final class MacApkGlWindow {
         if (savedAlign != 4) GLES20.glPixelStorei(GL_PACK_ALIGNMENT, savedAlign);
         if (savedFb != 0) GLES20.glBindFramebuffer(fbTarget, savedFb);
 
+        final long convertStart = System.nanoTime();
         mRgba.position(0);
         int[] argb = mFree.poll();
         while (argb != null && argb.length != n) argb = mFree.poll();  // a stale size: drop it
@@ -415,8 +425,9 @@ public final class MacApkGlWindow {
         }
         // premultipliedSource=true: a GL consumer (updateTexImage) must see the
         // premultiplied bytes a device buffer holds, not our straight copy.
-        mSt.macapkQueueProducerFrame(argb, w, h, w, FLIP_V, mRecycler, true); /*GLPREMUL*/
+        mSt.macapkQueueProducerFrame(this, argb, w, h, w, FLIP_V, mRecycler, true); /*GLPREMUL*/
         mFrames++;
+        SurfaceTexture.macapkNoteEglPbufferSwap();
         if (TRACE_READBACK) {
             mTraceFrames++;
             mTraceBytes += (long) w * h * 4;
@@ -428,7 +439,32 @@ public final class MacApkGlWindow {
                     + " total_ns=" + mTraceTotalNanos + " size=" + w + "x" + h);
             }
         }
+        reportSlowSwap(w, h, readNs, System.nanoTime() - convertStart);
         return null;
+    }
+
+    /** Slow swaps, measured (2026-11-13): apps draw video through eglSwapBuffers
+     *  while holding their own locks (WebRTC holds its global EglBase.lock), so a
+     *  swap that takes longer than a 30 fps frame starves every other thread that
+     *  needs that lock -- in a Signal call, the outgoing video's frame
+     *  conversion, which fell to 0 fps behind a 2940x1780 preview. The split
+     *  between the GPU readback and the CPU conversion says which half to fix.
+     *  Logged at most SLOW_SWAP_REPORTS times per process. */
+    private static final long SLOW_SWAP_NS = 33_000_000L;
+    private static final int SLOW_SWAP_REPORTS = 20;
+    private static final java.util.concurrent.atomic.AtomicInteger sSlowSwapReports =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    private static void reportSlowSwap(int w, int h, long readNs, long convertNs) {
+        if (readNs + convertNs < SLOW_SWAP_NS) return;
+        if (sSlowSwapReports.getAndIncrement() >= SLOW_SWAP_REPORTS) return;
+        try {
+            com.macapk.loader.NativeLog.w(TAG14, "slow eglSwapBuffers to a SurfaceTexture: "
+                + w + "x" + h + ", GPU readback " + readNs / 1_000_000 + " ms, conversion "
+                + convertNs / 1_000_000 + " ms, on thread " + Thread.currentThread().getName());
+        } catch (Throwable ignored) {
+            // NativeLog is native; a harness JVM without it logs nothing.
+        }
     }
 
     /** Premultiplied channel back to straight alpha, rounded to nearest. */
@@ -552,6 +588,9 @@ public final class MacApkGlWindow {
      *  ANativeWindow_fromSurface hands NDK code), with the app's attrib list.
      *  Not an EGL error code (those are 0x3000-0x300E), so -2 is unambiguous. */
     private static final long EGL14_SURFACEVIEW_WINDOW = -2;
+    /** egl14CreateWindowSurface: -(EGL14_DIRECT_KEY_BASE + key) signals a
+     *  TextureView direct keyed CAMetalLayer candidate (key > 0). */
+    private static final long EGL14_DIRECT_KEY_BASE = 100000L;
 
     /** MACAPK_EGL14_SURFACEVIEW_WINDOW (default ON; GitHub #15). =0 restores the
      *  pre-change refusal of a SurfaceView's Surface (EGL_BAD_NATIVE_WINDOW). */
@@ -594,6 +633,30 @@ public final class MacApkGlWindow {
      */
     public static long egl14CreateWindowSurface(android.opengl.EGLDisplay dpy,
             android.opengl.EGLConfig cfg, Object win, int[] attribs, int offset) {
+        return egl14CreateWindowSurfaceImpl(dpy, cfg, win, attribs, offset, true);
+    }
+
+    public static long egl14CreatePbufferWindowSurface(android.opengl.EGLDisplay dpy,
+            android.opengl.EGLConfig cfg, Object win, int[] attribs, int offset) {
+        return egl14CreateWindowSurfaceImpl(dpy, cfg, win, attribs, offset, false);
+    }
+
+    public static void egl14DisconnectDirectKey(int key) {
+        if (key > 0) {
+            SurfaceTexture.macapkDisconnectDirectGlLayerByKey(key);
+        }
+    }
+
+    public static void egl14NoteDirectSwap(int key) {
+        SurfaceTexture.macapkNoteEglDirectSwap();
+        if (key > 0) {
+            SurfaceTexture.macapkNoteDirectGlLayerSwap(key);
+        }
+    }
+
+    private static long egl14CreateWindowSurfaceImpl(android.opengl.EGLDisplay dpy,
+            android.opengl.EGLConfig cfg, Object win, int[] attribs, int offset,
+            boolean allowDirectLayer) {
         android.view.Surface sur = null;
         if (win instanceof android.view.SurfaceView) {
             sur = ((android.view.SurfaceView) win).getHolder().getSurface();
@@ -654,6 +717,19 @@ public final class MacApkGlWindow {
                 "eglCreateWindowSurface() can only be called with an instance of "
                 + "Surface, SurfaceView, SurfaceTexture or SurfaceHolder at the moment, "
                 + "this will be fixed later.");
+        }
+        // Direct zero-readback CAMetalLayer path when st is hosted by an
+        // eligible TextureView (MACAPK_TEXTUREVIEW_DIRECT_GL_LAYER, default ON).
+        if (allowDirectLayer && dpy != null && dpy.getNativeHandle() != 0
+                && cfg != null && cfg.getNativeHandle() != 0) {
+            int directKey = st.macapkConnectDirectGlLayerKey();
+            if (directKey > 0) {
+                if (log14()) {
+                    info14("eglCreateWindowSurface(" + kind + " key=" + directKey
+                        + ") -> TextureView direct CAMetalLayer window");
+                }
+                return -(EGL14_DIRECT_KEY_BASE + directKey);
+            }
         }
         // The window's own attributes (EGL_RENDER_BUFFER, EGL_GL_COLORSPACE_KHR)
         // have no pbuffer counterpart; the stream buffer is RGBA8888 sRGB.

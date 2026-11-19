@@ -354,6 +354,9 @@ struct CliArgs {
     // this APK on the current main screen (JSON on stdout), then exit. No JVM,
     // no window, no extraction.
     std::string peek_window_policy;
+    // Headless service / broker-spawned secondary process hints.
+    bool service_only = false;
+    std::string process_name;
 };
 
 void Usage(const char* exe) {
@@ -474,6 +477,15 @@ CliArgs ParseArgs(int argc, char** argv) {
         }
         else if (s == "--verbose") { a.verbose = true; }
         else if (s == "--extract-only") { a.extract_only = true; }
+        else if (s == "--service-only") {
+            a.service_only = true;
+            setenv("MACAPK_SERVICE_HOST", "1", 1);
+        }
+        else if (s == "--process-name") {
+            need(1);
+            a.process_name = argv[++i];
+            setenv("MACAPK_PROCESS_NAME", a.process_name.c_str(), 1);
+        }
         else if (s == "--gms") {
             // Everything after --gms belongs to the subcommand, verbatim. A
             // token can legitimately contain characters this parser would
@@ -519,6 +531,14 @@ CliArgs ParseArgs(int argc, char** argv) {
     if (a.android_root.empty()) {
         const char* env = std::getenv("MACAPK_ANDROID_ROOT");
         if (env && *env) a.android_root = env;
+    }
+    if (a.process_name.empty()) {
+        const char* env = std::getenv("MACAPK_PROCESS_NAME");
+        if (env && *env) a.process_name = env;
+    }
+    if (!a.service_only) {
+        const char* env = std::getenv("MACAPK_SERVICE_HOST");
+        if (env && std::strcmp(env, "1") == 0) a.service_only = true;
     }
     return a;
 }
@@ -1952,20 +1972,30 @@ static int RunPeekWindowPolicy(const std::string& apk, const std::string& cli_ro
     return 0;
 }
 
+static bool EnvIs(const char* name, const char* value) {
+    const char* e = std::getenv(name);
+    return e && std::strcmp(e, value) == 0;
+}
+
+static bool MacapkHeadlessService(const CliArgs& cli) {
+    if (EnvIs("MACAPK_FORCE_SECONDARY_WINDOW", "1")) return false;
+    if (EnvIs("MACAPK_HEADLESS_SERVICE", "0")) return false;
+    return cli.service_only
+        || EnvIs("MACAPK_SERVICE_HOST", "1")
+        || EnvIs("MACAPK_SECONDARY_PROCESS", "1")
+        || (!cli.process_name.empty() && cli.process_name.find(':') != std::string::npos);
+}
+
 // Whether this launch puts the window up BEFORE the unpack (see "0c. WINDOW
 // FIRST" in main). A function rather than a local because the ANGLE backend
 // decision, which runs earlier, needs the same answer to know whether it may
 // defer its scan onto the unpack worker. Not for --extract-only (the installer
-// has no window); MACAPK_WINDOW_FIRST=0 restores the old ordering for an A/B.
+// has no window) or headless service/secondary processes; MACAPK_WINDOW_FIRST=0
+// restores the old ordering for an A/B.
 static bool MacapkWindowFirst(const CliArgs& cli) {
-    if (cli.extract_only) return false;
+    if (cli.extract_only || MacapkHeadlessService(cli)) return false;
     const char* wf = std::getenv("MACAPK_WINDOW_FIRST");
     return !(wf && std::strcmp(wf, "0") == 0);
-}
-
-static bool EnvIs(const char* name, const char* value) {
-    const char* e = std::getenv(name);
-    return e && std::strcmp(e, value) == 0;
 }
 
 static void LogAngleAutoDetect(bool want_vulkan) {
@@ -2024,29 +2054,67 @@ static bool ApkNeedsGles1Cached(const std::string& apk_path,
                                 const std::string& cli_root) {
     std::string fp = ComputeApkFingerprintQuick(apk_path);
     if (fp.empty()) return ApkNeedsGles1(apk_path);
-    fs::path cache_file = Gles31CacheDir(cli_root) / (fp + ".es1");
-    std::error_code ec;
-    if (fs::exists(cache_file, ec)) {
-        std::ifstream in(cache_file);
+    const fs::path macapk_cache = fs::path(ResolveAndroidRootDir(cli_root)) / ".macapk" / "gles1_scan_v1.cache";
+    const fs::path legacy_cache = Gles31CacheDir(cli_root) / (fp + ".es1");
+    auto try_read_v1 = [&](const fs::path& p, bool* out) -> bool {
+        std::error_code ec;
+        if (!fs::exists(p, ec)) return false;
+        std::ifstream in(p);
         std::string line;
-        if (in && std::getline(in, line) && !line.empty()) {
-            auto colon = line.find(':');
-            if (colon != std::string::npos && colon + 1 < line.size()) {
-                int ver = std::atoi(line.substr(0, colon).c_str());
-                char v = line[colon + 1];
-                if (ver == kGles1ScanVersion && (v == '0' || v == '1')) {
-                    std::fprintf(stderr,
-                        "[macapk] ApkNeedsGles1: cache hit (ES%d) -- skipping scan\n",
-                        v == '1' ? 1 : 2);
-                    return v == '1';
+        if (!in || !std::getline(in, line) || line.empty()) return false;
+        if (p == macapk_cache) {
+            auto sp1 = line.find(':');
+            auto sp2 = line.rfind(':');
+            // Format: <fp>|<ver>:<0|1>
+            auto bar = line.find('|');
+            if (bar != std::string::npos && line.substr(0, bar) == fp) {
+                std::string rest = line.substr(bar + 1);
+                auto colon = rest.find(':');
+                if (colon != std::string::npos && colon + 1 < rest.size()) {
+                    int ver = std::atoi(rest.substr(0, colon).c_str());
+                    char v = rest[colon + 1];
+                    if (ver == kGles1ScanVersion && (v == '0' || v == '1')) {
+                        *out = (v == '1');
+                        return true;
+                    }
                 }
             }
+            (void)sp1; (void)sp2;
+            return false;
         }
+        auto colon = line.find(':');
+        if (colon != std::string::npos && colon + 1 < line.size()) {
+            int ver = std::atoi(line.substr(0, colon).c_str());
+            char v = line[colon + 1];
+            if (ver == kGles1ScanVersion && (v == '0' || v == '1')) {
+                *out = (v == '1');
+                return true;
+            }
+        }
+        return false;
+    };
+    bool cached_val = false;
+    if (try_read_v1(macapk_cache, &cached_val) || try_read_v1(legacy_cache, &cached_val)) {
+        std::fprintf(stderr,
+            "[macapk] ApkNeedsGles1: cache hit (ES%d) -- skipping scan\n",
+            cached_val ? 1 : 2);
+        return cached_val;
     }
     bool result = ApkNeedsGles1(apk_path);
     std::error_code mec;
-    fs::create_directories(cache_file.parent_path(), mec);
-    std::ofstream out(cache_file);
+    fs::create_directories(macapk_cache.parent_path(), mec);
+    {
+        fs::path tmp = macapk_cache;
+        tmp += ".tmp." + std::to_string((long long)getpid());
+        std::ofstream out(tmp);
+        if (out) {
+            out << fp << '|' << kGles1ScanVersion << ':' << (result ? '1' : '0') << '\n';
+            out.close();
+            fs::rename(tmp, macapk_cache, mec);
+        }
+    }
+    fs::create_directories(legacy_cache.parent_path(), mec);
+    std::ofstream out(legacy_cache);
     if (out) out << kGles1ScanVersion << ':' << (result ? '1' : '0') << '\n';
     return result;
 }
@@ -2532,6 +2600,29 @@ int main(int argc, char** argv) {
         // a 3.1 app (MCPE) render from the .app with no flags while every
         // ES 2.0/3.0 app keeps its native Metal path unchanged. Generic: no
         // per-APK/package branch. v1.0.608.
+        // Apply forwarded MACAPK_* diagnostic/tunable flags written by the main
+        // app process before spawning secondary service hosts.
+        const bool headless_service = MacapkHeadlessService(cli);
+        if (headless_service) {
+            const char* ce = std::getenv("MACAPK_APP_CACHE_DIR");
+            fs::path cache_dir = (ce && *ce)
+                ? fs::path(ce)
+                : (fs::path(ResolveAndroidRootDir(cli.android_root)) / "data" / "data");
+            fs::path env_cfg = cache_dir / ".macapk_child_env.cfg";
+            std::error_code eec;
+            if (fs::exists(env_cfg, eec)) {
+                std::ifstream ein(env_cfg);
+                std::string eline;
+                while (ein && std::getline(ein, eline)) {
+                    auto eq = eline.find('=');
+                    if (eq == std::string::npos || eq == 0) continue;
+                    std::string k = eline.substr(0, eq);
+                    std::string v = eline.substr(eq + 1);
+                    if (k.rfind("MACAPK_", 0) != 0) continue;
+                    setenv(k.c_str(), v.c_str(), 0);
+                }
+            }
+        }
         const char* be = std::getenv("MACAPK_ANGLE_BACKEND");
         bool want_vulkan;
         if (be && std::string(be) == "vulkan") {
@@ -2540,6 +2631,9 @@ int main(int argc, char** argv) {
         } else if (be && std::string(be) == "metal") {
             want_vulkan = false;
             std::fprintf(stderr, "[macapk] ANGLE backend: METAL (env override)\n");
+        } else if (headless_service) {
+            want_vulkan = false;
+            std::fprintf(stderr, "[macapk] ANGLE backend: METAL (headless service -- skipping GLES31 scan)\n");
         } else if (MacapkWindowFirst(cli) && !EnvIs("MACAPK_DEFER_ES31", "0")) {
             // Decided on the unpack worker; see need_es31_scan. Nothing reads
             // ANGLE_DEFAULT_PLATFORM before the join except CocoaInit's
@@ -2570,6 +2664,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                 "[macapk] GLES1 fixed-function context: %s (env override)\n",
                 g1[0] == '1' ? "YES" : "no");
+        } else if (headless_service) {
+            setenv("MACAPK_GLES1_CONTEXT", "0", 1);
+            std::fprintf(stderr, "[macapk] GLES1 auto-detect: skipping scan for headless service\n");
         } else {
             need_es1_scan = true;
         }

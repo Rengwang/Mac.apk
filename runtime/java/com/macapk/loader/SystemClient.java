@@ -188,6 +188,7 @@ public final class SystemClient {
 
     /** Attach this app to the broker (Boot, before Application.onCreate). */
     static boolean attach(Application app, String pkg) {
+        if (!isServiceHost()) writeInheritedChildEnv();
         if (!enabled()) return false;
         try {
             IBinder sys = broker();
@@ -365,9 +366,13 @@ public final class SystemClient {
             final CountDownLatch done = new CountDownLatch(1);
             // ActivityThread.handleBindService: on the main looper.
             new Handler(Looper.getMainLooper()).post(() -> {
+                IN_BROKER_BIND.set(Boolean.TRUE);
                 try { out.set(ServiceRegistry.bind(sApp, intent)); }
                 catch (Throwable t) { err.set(t); }
-                finally { done.countDown(); }
+                finally {
+                    IN_BROKER_BIND.remove();
+                    done.countDown();
+                }
             });
             try {
                 if (!done.await(60, TimeUnit.SECONDS)) {
@@ -378,11 +383,20 @@ public final class SystemClient {
                 throw new IllegalStateException("interrupted");
             }
             if (err.get() instanceof RuntimeException) throw (RuntimeException) err.get();
+            if (err.get() != null) throw new RuntimeException(err.get());
             reply.writeNoException();
             reply.writeStrongBinder(out.get());
             return true;
         }
     }
+
+    /** Set while a bind operation the BROKER sent is running on this thread, so
+     *  ServiceRegistry.bind does not bounce it straight back to the broker. */
+    private static final ThreadLocal<Boolean> IN_BROKER_BIND = new ThreadLocal<>();
+    /** Tracks whether the last bindBlockingIfRemote() call on this thread was
+     *  completed by the broker (so an intentional remote null binding does not
+     *  fall back to instantiating the service in-process). */
+    private static final ThreadLocal<Boolean> LAST_REMOTE_BIND_HANDLED = new ThreadLocal<>();
 
     /** Set while a job operation the BROKER sent is being run here, so the local
      *  scheduler does not hand it straight back (the broker only sends a job to
@@ -520,8 +534,143 @@ public final class SystemClient {
         ComponentName cn = intent.getComponent();
         String target = cn != null ? cn.getPackageName() : intent.getPackage();
         if (target == null) return false;
-        if (target.equals(sPackage)) return servedByAnotherProcess(intent);
+        if (target.equals(sPackage)) {
+            if (Boot.macapkManifest() != null) return servedByAnotherProcess(intent);
+            return resolvesToRemoteProcess(ctx, intent, sPackage);
+        }
         return apkOf(target) != null;
+    }
+
+    /** Consume and clear whether the preceding bindBlockingIfRemote() call was
+     *  handled by a remote broker. */
+    public static boolean consumeRemoteBindHandled() {
+        boolean handled = LAST_REMOTE_BIND_HANDLED.get() == Boolean.TRUE;
+        LAST_REMOTE_BIND_HANDLED.remove();
+        return handled;
+    }
+
+    private static String contextPackageName(Context ctx) {
+        if (ctx == null) return null;
+        try { return ctx.getPackageName(); }
+        catch (Throwable ignored) { return null; }
+    }
+
+    private static String currentProcessName(String callerPkg) {
+        String p = sProcess;
+        if (p != null && !p.isEmpty()) return p;
+        p = Boot.processName();
+        if (p != null && !p.isEmpty()) return p;
+        p = System.getenv("MACAPK_PROCESS_NAME");
+        if (p != null && !p.isEmpty()) return p;
+        return callerPkg;
+    }
+
+    private static boolean brokerConfiguredForDirectBind() {
+        String explicit = System.getenv("MACAPK_BROKER");
+        if (explicit != null && !explicit.isEmpty()) return "1".equals(explicit);
+        String name = System.getenv("MACAPK_SYSTEM_NAME");
+        if (name != null && !name.isEmpty()) return true;
+        return enabled();
+    }
+
+    private static boolean resolvesToRemoteProcess(Context ctx, Intent intent, String callerPkg) {
+        if (ctx == null || intent == null) return false;
+        try {
+            android.content.pm.PackageManager pm = ctx.getPackageManager();
+            if (pm == null) return false;
+            android.content.pm.ServiceInfo si = null;
+            ComponentName cn = intent.getComponent();
+            if (cn != null) {
+                try { si = pm.getServiceInfo(cn, 0); }
+                catch (Throwable ignored) {}
+            } else if (intent.getAction() != null) {
+                android.content.pm.ResolveInfo ri = pm.resolveService(intent, 0);
+                if (ri != null) si = ri.serviceInfo;
+            }
+            if (si == null || !si.enabled) return false;
+            String svcPkg = si.packageName != null
+                    ? si.packageName
+                    : (cn != null ? cn.getPackageName() : null);
+            if (svcPkg != null && callerPkg != null && !svcPkg.equals(callerPkg)) return true;
+            if (splitOff()) return false;
+            String proc = si.processName;
+            if (proc == null || proc.isEmpty()) return false;
+            return !proc.equals(currentProcessName(callerPkg));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean brokerKnowsPackage(IBinder sys, String pkg) {
+        if (sys == null || pkg == null || pkg.isEmpty()) return false;
+        Parcel d = Parcel.obtain(), r = Parcel.obtain();
+        try {
+            d.writeInterfaceToken(SystemServer.DESCRIPTOR);
+            d.writeString(pkg);
+            sys.transact(SystemServer.TX_HAS_PACKAGE, d, r, 0);
+            r.readException();
+            return r.readInt() != 0;
+        } catch (Throwable ignored) {
+            return false;
+        } finally {
+            d.recycle();
+            r.recycle();
+        }
+    }
+
+    /** Synchronous cross-process service bind for ServiceRegistry.bind().
+     *  Routes to the broker via TX_BIND when the target belongs to another app
+     *  or another android:process, returning the remote BinderProxy. Returns
+     *  null when running inside TX_SCHEDULE_BIND, when no broker applies, or
+     *  when the service is hosted in this process. */
+    public static IBinder bindBlockingIfRemote(Context ctx, Intent intent) {
+        LAST_REMOTE_BIND_HANDLED.remove();
+        if (intent == null || IN_BROKER_BIND.get() == Boolean.TRUE) return null;
+        if ("0".equals(System.getenv("MACAPK_BROKER"))) return null;
+
+        IBinder sys = sSystem;
+        String callerPkg = sPackage != null ? sPackage : contextPackageName(ctx);
+        ComponentName cn = intent.getComponent();
+        String targetPkg = cn != null ? cn.getPackageName() : intent.getPackage();
+
+        if (sys != null) {
+            if (!bindsRemotely(ctx, intent)) return null;
+        } else {
+            boolean crossApp = targetPkg != null && callerPkg != null && !targetPkg.equals(callerPkg);
+            if (!crossApp && !resolvesToRemoteProcess(ctx, intent, callerPkg)) return null;
+            if (!brokerConfiguredForDirectBind()) return null;
+            sys = broker();
+            if (sys == null) return null;
+            if (crossApp && !brokerKnowsPackage(sys, targetPkg)) return null;
+        }
+
+        Parcel d = Parcel.obtain(), r = Parcel.obtain();
+        try {
+            d.writeInterfaceToken(SystemServer.DESCRIPTOR);
+            d.writeString(callerPkg);
+            d.writeTypedObject(intent, 0);
+            sys.transact(SystemServer.TX_BIND, d, r, 0);
+            r.readException();
+            boolean ok = r.readInt() != 0;
+            if (!ok) {
+                if (sSystem != null) LAST_REMOTE_BIND_HANDLED.set(Boolean.TRUE);
+                return null;
+            }
+            r.readTypedObject(ComponentName.CREATOR);
+            IBinder service = r.readStrongBinder();
+            LAST_REMOTE_BIND_HANDLED.set(Boolean.TRUE);
+            return service;
+        } catch (RemoteException e) {
+            if (sSystem == null) forgetBroker(sys);
+            NativeLog.w(TAG, "blocking remote bind " + intent + " failed: " + e);
+            return null;
+        } catch (Throwable t) {
+            NativeLog.w(TAG, "blocking remote bind " + intent + " failed: " + t);
+            return null;
+        } finally {
+            d.recycle();
+            r.recycle();
+        }
     }
 
     /** An intent for one of THIS package's own services: does the manifest put
@@ -634,6 +783,7 @@ public final class SystemClient {
             throw new SecurityException("Not allowed to bind to service " + (cn != null ? cn : intent));
         }
         final Intent fi = new Intent(intent);
+        sLastRemoteSpawnMs.set(System.currentTimeMillis());
         final Handler main = new Handler(Looper.getMainLooper());
         final Executor deliver = executor != null ? executor : main::post;
         // The record is also a generation token: an old completion/death
@@ -780,6 +930,7 @@ public final class SystemClient {
             throw new SecurityException("Not allowed to start service " + (cn != null ? cn : intent));
         }
         final Intent fi = new Intent(intent);
+        sLastRemoteSpawnMs.set(System.currentTimeMillis());
         Thread t = new Thread(() -> {
             Parcel d = Parcel.obtain(), r = Parcel.obtain();
             try {
@@ -831,5 +982,181 @@ public final class SystemClient {
             }
         }
         return true;
+    }
+
+    private static final AtomicBoolean sMediaPrewarmScheduled = new AtomicBoolean(false);
+    private static final java.util.concurrent.atomic.AtomicLong sLastRemoteSpawnMs =
+        new java.util.concurrent.atomic.AtomicLong(0L);
+    private static final String[] MEDIA_PREWARM_KEYWORDS = {
+        "media", "player", "ijk", "playback", "audio", "exo"
+    };
+
+    private static boolean shouldForwardEnvKey(String k) {
+        if (k == null || !k.startsWith("MACAPK_")) return false;
+        if (k.equals("MACAPK_SERVICE_HOST")
+                || k.equals("MACAPK_SECONDARY_PROCESS")
+                || k.equals("MACAPK_PROCESS_NAME")
+                || k.equals("MACAPK_SYSTEM_NAME")
+                || k.equals("MACAPK_APP_CACHE_DIR")
+                || k.equals("MACAPK_ANDROID_ROOT")
+                || k.equals("MACAPK_EXTRACT_ONLY")
+                || k.equals("MACAPK_APP_ICON")
+                || k.equals("MACAPK_DEFAULT_ICON")
+                || k.equals("MACAPK_APP_LABEL")
+                || k.equals("MACAPK_HOST_DISPLAY")
+                || k.equals("MACAPK_LAUNCH_ACTIVITY")
+                || k.equals("MACAPK_INJECT_FILE")
+                || k.equals("MACAPK_RECORD_INPUT")
+                || k.startsWith("MACAPK_AUTOMATION")
+                || k.startsWith("MACAPK_BROKER")) {
+            return false;
+        }
+        return true;
+    }
+
+    /** Persist main-process MACAPK_* runtime flags/traces so broker-spawned
+     *  secondary processes inherit them even when the broker does not pass
+     *  the caller's environment directly. */
+    private static void writeInheritedChildEnv() {
+        String cacheDir = System.getenv("MACAPK_APP_CACHE_DIR");
+        if (cacheDir == null || cacheDir.isEmpty()) return;
+        java.io.File dir = new java.io.File(cacheDir);
+        if (!dir.isDirectory() && !dir.mkdirs()) return;
+        java.io.File dst = new java.io.File(dir, ".macapk_child_env.cfg");
+        java.io.File tmp = new java.io.File(dir, ".macapk_child_env.cfg.tmp." + ProcessHandle.current().pid());
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, String> e : System.getenv().entrySet()) {
+                String k = e.getKey();
+                String v = e.getValue();
+                if (!shouldForwardEnvKey(k) || v == null) continue;
+                if (k.indexOf('\n') >= 0 || k.indexOf('\r') >= 0 || k.indexOf('=') >= 0
+                        || v.indexOf('\n') >= 0 || v.indexOf('\r') >= 0) {
+                    continue;
+                }
+                sb.append(k).append('=').append(v).append('\n');
+            }
+            java.nio.file.Files.writeString(tmp.toPath(), sb.toString(),
+                java.nio.charset.StandardCharsets.UTF_8);
+            try {
+                java.nio.file.Files.move(tmp.toPath(), dst.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.io.IOException atomicUnsupported) {
+                java.nio.file.Files.move(tmp.toPath(), dst.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (Throwable t) {
+            try { tmp.delete(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static boolean containsMediaKeyword(String s) {
+        if (s == null || s.isEmpty()) return false;
+        String lower = s.toLowerCase(java.util.Locale.ROOT);
+        for (String kw : MEDIA_PREWARM_KEYWORDS) {
+            if (lower.contains(kw)) return true;
+        }
+        return false;
+    }
+
+    private static String pickMediaFilterAction(Manifest.ServiceEntry se) {
+        if (se == null || se.filters == null) return null;
+        for (Manifest.IntentFilterEntry fe : se.filters) {
+            if (fe == null || fe.actions == null) continue;
+            for (String act : fe.actions) {
+                if (containsMediaKeyword(act)) return act;
+            }
+        }
+        return null;
+    }
+
+    /** After the main process's first Activity resumes, asynchronously pre-warm
+     *  at most 1 manifest-declared remote `:suffix` media/player service process
+     *  so remote playback workers are warm before the user taps a video. */
+    public static void scheduleMediaServicePrewarm(final Application app, final Manifest manifest) {
+        if ("0".equals(System.getenv("MACAPK_PREWARM_MEDIA_SERVICES"))) return;
+        if (isServiceHost() || app == null || manifest == null || manifest.services == null) return;
+        if (!splitActive() || sSystem == null) return;
+        if (!sMediaPrewarmScheduled.compareAndSet(false, true)) return;
+
+        String chosenService = null;
+        String chosenProcess = null;
+        String chosenAction = null;
+        String myProc = sProcess != null ? sProcess : manifest.packageName;
+        for (Manifest.ServiceEntry se : manifest.services.values()) {
+            if (se == null || !se.enabled) continue;
+            String rawProc = manifest.componentProcesses != null
+                ? manifest.componentProcesses.get(se.name) : null;
+            String resolvedProc = manifest.resolveProcessName(rawProc);
+            if (resolvedProc == null || resolvedProc.equals(myProc)) continue;
+            boolean isColonRemote = (rawProc != null && rawProc.startsWith(":"))
+                || resolvedProc.indexOf(':') >= 0;
+            if (!isColonRemote) continue;
+            String filterAction = pickMediaFilterAction(se);
+            if (containsMediaKeyword(rawProc) || containsMediaKeyword(resolvedProc)
+                    || containsMediaKeyword(se.name) || filterAction != null) {
+                chosenService = se.name;
+                chosenProcess = resolvedProc;
+                chosenAction = filterAction;
+                break;
+            }
+        }
+        if (chosenService == null) return;
+
+        final String svcName = chosenService;
+        final String procName = chosenProcess;
+        final String action = chosenAction;
+        Thread t = new Thread(() -> {
+            try {
+                // Pre-populate vtcaps_v1.cache off-path immediately so the media worker
+                // sees a warm disk cache on first decode (no-op in bare JVM tests).
+                if (!"0".equals(System.getenv("MACAPK_VTCAPS_DISK_CACHE"))) {
+                    Thread vtWarm = new Thread(() -> {
+                        try {
+                            NativeMedia.nativeVideoCapabilities("video/avc");
+                            NativeMedia.nativeVideoCapabilities("video/hevc");
+                        } catch (Throwable ignored) {}
+                    }, "macapk-vtcaps-prewarm");
+                    vtWarm.setDaemon(true);
+                    vtWarm.start();
+                }
+                Thread.sleep(150L);
+                // Stagger briefly if Application.onCreate / MainActivity just spawned
+                // other sibling services so secondary cold-boot setup doesn't stampede.
+                long deadline = System.currentTimeMillis() + 600L;
+                while (System.currentTimeMillis() < deadline) {
+                    long lastSpawn = sLastRemoteSpawnMs.get();
+                    if (lastSpawn == 0L || (System.currentTimeMillis() - lastSpawn) >= 500L) break;
+                    Thread.sleep(100L);
+                }
+                if (sSystem == null || isServiceHost()) return;
+                Intent intent = new Intent();
+                if (action != null) intent.setAction(action);
+                intent.setComponent(new ComponentName(manifest.packageName, svcName));
+                final ServiceConnection[] holder = new ServiceConnection[1];
+                ServiceConnection prewarmConn = new ServiceConnection() {
+                    @Override public void onServiceConnected(ComponentName name, IBinder service) {
+                        NativeLog.i(TAG, "prewarmed media service " + svcName + " (" + procName + ")");
+                        unbindRemote(holder[0]);
+                    }
+                    @Override public void onServiceDisconnected(ComponentName name) {
+                        unbindRemote(holder[0]);
+                    }
+                    @Override public void onNullBinding(ComponentName name) {
+                        NativeLog.i(TAG, "prewarmed media service host " + svcName + " (" + procName + ")");
+                        unbindRemote(holder[0]);
+                    }
+                };
+                holder[0] = prewarmConn;
+                bindRemote(app, intent, Context.BIND_AUTO_CREATE, Runnable::run, prewarmConn);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable th) {
+                NativeLog.w(TAG, "media service prewarm failed for " + svcName + ": " + th);
+            }
+        }, "macapk-media-prewarm");
+        t.setDaemon(true);
+        t.start();
     }
 }

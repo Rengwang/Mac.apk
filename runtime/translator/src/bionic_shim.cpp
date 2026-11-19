@@ -79,6 +79,7 @@
 #include <ifaddrs.h>       // getifaddrs -- backs the AF_NETLINK RTM_GETADDR emulation
 #include <net/if.h>        // if_nametoindex for the emulated netlink ifa_index
 #include <net/if_dl.h>     // sockaddr_dl / LLADDR for the Linux-shaped getifaddrs
+#include <sys/sockio.h>    // SIOCGIFFLAGS, translated from Linux's in macapk_ifreq_ioctl
 #include <arpa/inet.h>     // inet_ntop for the net-trace diagnostic
 #include <mach/mach.h>     // mach_vm_read_overwrite for tracer safe-read
 #include <mach/mach.h>     // mach_vm_read_overwrite for tracer safe-read
@@ -2740,14 +2741,6 @@ extern "C" void* __macapk_pairip_run_resolver(void* realfn, void* env, void* cls
     return nullptr;
 }
 
-// v1.0.1582: the JVM's JNI String-family functions (jni_GetStringLength,
-// GetStringUTFLength, GetStringChars, ...), by their raw entry address. Captured
-// once from the JNIEnv vtable in __macapk_install_jni_bionic_variadic_bridge so
-// the SEGV handler can recognise a fault inside one WITHOUT a signal-unsafe
-// dladdr. See try_recover_jni_getstring_fault.
-static void* g_jni_string_fns[8] = {0};
-static int   g_jni_string_fn_count = 0;
-
 // ---- SAFE jstring PROBE (v1.0.1595) -- the fix for the fast-JNI GC deadlock ----
 //
 // THE BUG THIS REPLACES. Facebook's fast-JNI (Instagram/Threads/Messenger, via
@@ -2920,48 +2913,12 @@ static bool macapk_jstring_handle_ok(jstring s) {
     return ok;
 }
 
-// Recover a SIGSEGV that faulted INSIDE one of the JVM's JNI GetString* functions
-// on a garbage jstring, by returning 0/null to the guest caller (x0=0, pc=lr)
-// instead of aborting.
-//
-// WHY THIS IS SAFE and WHY IT UNBLOCKS. These functions start by resolving the
-// jstring handle to an oop and reading a field of it; a bad jstring faults on
-// THAT early deref, before any lock is taken or object allocated, so forcing an
-// immediate `return 0` leaves the JVM in a clean state (x0 is the return
-// register, lr the caller's return address; the callee-saved frame is untouched
-// because the fault is in the prologue/first load). The motivating caller is
-// Facebook's crash-reporter fast-JNI SELF-TEST (Instagram): it reads ART object
-// internals via Unsafe -- which HotSpot cannot provide, so MacApkUnsafe answers
-// EMPTY -- builds a bogus jstring, GetStringLengths it to check the fast path,
-// and on ART would get a length; here it faults. Returning 0 makes the self-test
-// see "fast-JNI is broken" and FALL BACK to standard JNI, which works. A genuine
-// GetStringLength on a valid jstring never faults, so this only ever fires on a
-// guest's own bad handle. Kill switch MACAPK_JNI_STRING_RECOVERY_OFF.
-static bool try_recover_jni_getstring_fault(siginfo_t* /*info*/, ucontext_t* uc) {
-    static const bool s_off = std::getenv("MACAPK_JNI_STRING_RECOVERY_OFF") != nullptr;
-    if (s_off || !uc || !uc->uc_mcontext || g_jni_string_fn_count == 0) return false;
-    uintptr_t pc = uc->uc_mcontext->__ss.__pc;
-    for (int i = 0; i < g_jni_string_fn_count; ++i) {
-        uintptr_t fn = reinterpret_cast<uintptr_t>(g_jni_string_fns[i]);
-        // The fault lands in the function's prologue/first oop deref -- measured
-        // at +0x60 for GetStringLength. 0x600 covers the whole small function
-        // while staying far short of the next JNI entry.
-        if (fn && pc >= fn && pc < fn + 0x600) {
-            uc->uc_mcontext->__ss.__x[0] = 0;                 // return 0 / null
-            uc->uc_mcontext->__ss.__pc  = uc->uc_mcontext->__ss.__lr;  // return to caller
-            static std::atomic<int> n{0};
-            if (n.fetch_add(1) < 8) {
-                std::fprintf(stderr,
-                    "[jni-str-recover] fault inside JVM JNI GetString* (fn#%d @%p, "
-                    "pc=%p) on a bad jstring -> returned 0 (guest fast-JNI probe will "
-                    "fall back to standard JNI)\n", i, (void*)fn, (void*)pc);
-                std::fflush(stderr);
-            }
-            return true;
-        }
-    }
-    return false;
-}
+// Never recover by jumping out of a HotSpot JNI entry. Its prologue can have
+// changed SP/LR and transitioned the thread into the VM; bypassing its epilogue
+// strands safepoints. A former +0x600 string-function PC range also matched
+// GetArrayLength and jumped back inside that function, spinning indefinitely.
+// Bad-string probing remains in the native wrappers before they enter the JVM.
+// Faults inside the JVM continue through the normal HotSpot signal chain.
 
 // A guest STORE into one of OUR host executable pages: an inline-hook install.
 // Measured on Instagram, libbreakpad (Google's crash reporter) mprotects a
@@ -3240,6 +3197,22 @@ static void macapk_fatal_reraise(int sig) {
 }
 
 #include "guest_rwx.h"
+
+extern "C" void* __macapk_arm64_memcpy(void* destination,const void* source,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::copy(destination,source,length,false,result)) return result;
+    return std::memcpy(destination,source,length);
+}
+extern "C" void* __macapk_arm64_memmove(void* destination,const void* source,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::copy(destination,source,length,true,result)) return result;
+    return std::memmove(destination,source,length);
+}
+extern "C" void* __macapk_arm64_memset(void* destination,int value,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::fill(destination,value,length,result)) return result;
+    return std::memset(destination,value,length);
+}
 #include "guest_jit_pages.h"
 #include "guest_jit_canary.h"
 #include "guest_return_alias.h"
@@ -3325,18 +3298,17 @@ static void macapk_log_sigbus_4g_image_alias(int sig, siginfo_t* info,
     }
 }
 
-// Experimental recovery for the deterministic +4 GiB return-address fault seen
-// in libchronos. This is intentionally much narrower than "if pc-looks-like-an-
+// Recovery for the deterministic +4 GiB return-address fault seen in
+// libchronos. This is intentionally much narrower than "if pc-looks-like-an-
 // image, unwind it": both the faulting PC and LR must carry the alias, and the
-// corrected instruction must overwrite x30 before any indirect control flow.
-// With that shape the bad alias cannot survive into a later return. Default off
-// until repeated real cold starts establish that the producer is gone or safely
-// bypassed.
+// corrected instructions must overwrite x30 before any indirect control flow or
+// x30 read. With that shape the bad alias cannot survive into a later return.
+// Default ON (set MACAPK_RECOVER_4G_RETURN_ALIAS=0 to disable for bisecting).
 static bool macapk_maybe_recover_4g_return_alias(
     int sig, siginfo_t* info, ucontext_t* uc) {
     static const bool s_enabled = [] {
         const char* v = std::getenv("MACAPK_RECOVER_4G_RETURN_ALIAS");
-        return v && v[0] && v[0] != '0';
+        return !v || !v[0] || v[0] != '0';
     }();
     if (!s_enabled || (sig != SIGSEGV && sig != SIGBUS) || !info || !uc
         || !uc->uc_mcontext) return false;
@@ -3353,27 +3325,45 @@ static bool macapk_maybe_recover_4g_return_alias(
     if (!macapk_diag_fixed_guest_image_for_pc(
             corrected, &image, &image_base, &off)) return false;
 
-    uint32_t insn[3] = {};
+    uint32_t insn[4] = {};
     if (!macapk_diag_safe_read(reinterpret_cast<const void*>(corrected),
-                               insn, sizeof insn)) return false;
+                               insn, sizeof insn)) {
+        size_t nread = 0;
+        for (; nread < 4; ++nread) {
+            if (!macapk_diag_safe_read(
+                    reinterpret_cast<const void*>(corrected + nread * 4),
+                    &insn[nread], sizeof insn[nread])) {
+                break;
+            }
+        }
+        if (nread == 0) return false;
+    }
 
     if (!macapk_return_alias_target(pc, lr, fa, insn, &corrected, &shape)) return false;
+
+    const char* shape_name = "unknown";
+    switch (shape) {
+        case MacapkReturnAliasShape::RestoreLr: shape_name = "restore-lr"; break;
+        case MacapkReturnAliasShape::AdrpAddBl: shape_name = "adrp-add-bl"; break;
+        case MacapkReturnAliasShape::SetupBl:   shape_name = "setup-bl"; break;
+        case MacapkReturnAliasShape::None:      break;
+    }
 
     static std::atomic<int> s_recovered{0};
     const int n = s_recovered.fetch_add(1, std::memory_order_relaxed);
     if (n < 8) {
         std::fprintf(stderr,
             "[sigbus-4g-alias] recovered #%d image=%s base=%#llx offset=%#llx "
-            "bad=%#llx corrected=%#llx shape=%s insn=%08x,%08x,%08x\n",
+            "bad=%#llx corrected=%#llx shape=%s insn=%08x,%08x,%08x,%08x\n",
             n + 1, image, static_cast<unsigned long long>(image_base),
             static_cast<unsigned long long>(off),
             static_cast<unsigned long long>(pc),
             static_cast<unsigned long long>(corrected),
-            shape == MacapkReturnAliasShape::RestoreLr ? "restore-lr" : "adrp-add-bl",
-            insn[0], insn[1], insn[2]);
+            shape_name, insn[0], insn[1], insn[2], insn[3]);
         std::fflush(stderr);
     }
     ss.__pc = corrected;
+    ss.__lr = corrected;
     return true;
 }
 
@@ -4041,12 +4031,6 @@ static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
         // A guest inline-hook store into our host code pages (breakpad/profilo
         // patching libc): skip it so the hook no-ops and our .text stays intact.
         if (try_recover_guest_host_write(
-                info, static_cast<ucontext_t*>(ucontext))) {
-            return;
-        }
-        // A fault INSIDE a JVM JNI GetString* on a guest's garbage jstring:
-        // return 0 to the caller (turns a fast-JNI probe crash into a fallback).
-        if (try_recover_jni_getstring_fault(
                 info, static_cast<ucontext_t*>(ucontext))) {
             return;
         }
@@ -14416,14 +14400,47 @@ chain:
 // Default ON so Breakpad/Crashpad apps (Minecraft, many games) run out of the
 // box; set MACAPK_TRAP_INLINE_SYSCALLS=0 to disable (kill switch).
 #if defined(__APPLE__) && defined(__aarch64__)
-static long macapk_forward_inline_syscall(uint64_t nr, uint64_t /*a0*/,
-        uint64_t /*a1*/, uint64_t /*a2*/, uint64_t /*a3*/, uint64_t /*a4*/,
-        uint64_t /*a5*/) {
+extern "C" int __macapk_arm64_faccessat(int, const char*, int, int);
+extern "C" int __macapk_arm64_openat(int, const char*, int, mode_t);
+extern "C" int __macapk_errno_mac2lin(int);
+static long macapk_forward_inline_syscall(uint64_t nr, uint64_t a0,
+        uint64_t a1, uint64_t a2, uint64_t a3, uint64_t /*a4*/,
+        uint64_t /*a5*/, bool arguments_intact) {
     // Linux arm64 generic-ABI syscall numbers (verified against
     // include/uapi/asm-generic/unistd.h, 2026-07-02). The Linux syscall return
     // convention is: >=0 on success, or the NEGATED errno on failure. So an
     // error must return -errno (Linux/Bionic numbering), NEVER 0 (0 = success).
     switch (nr) {
+        case 48: // faccessat(dirfd, pathname, mode); no flags in this syscall
+        case 56: { // openat(dirfd, pathname, flags, mode)
+            // An invalid negative Mach selector raises EXC_SYSCALL before
+            // changing the saved registers. A positive BSD selector instead
+            // overwrites return registers. Only the former retains the real
+            // dirfd/path/mode; never guess arguments from a BSD error return.
+            if (!arguments_intact) return -38; // Linux ENOSYS
+            if (nr == 48 && (static_cast<uint32_t>(a2) & ~7u)) return -22; // EINVAL
+            const int saved_errno = errno;
+            if (!a1) { errno = saved_errno; return -14; } // EFAULT
+            char pathname[4096];
+            size_t n = 0;
+            for (; n < sizeof(pathname); ++n) {
+                if (!macapk_diag_safe_read(reinterpret_cast<const void*>(a1 + n),
+                                          pathname + n, 1)) {
+                    errno = saved_errno;
+                    return -14; // Linux EFAULT
+                }
+                if (!pathname[n]) break;
+            }
+            if (n == sizeof(pathname)) { errno = saved_errno; return -36; } // ENAMETOOLONG
+            const int rc = nr == 48
+                ? __macapk_arm64_faccessat(static_cast<int>(a0), pathname,
+                                           static_cast<int>(a2), 0)
+                : __macapk_arm64_openat(static_cast<int>(a0), pathname,
+                                        static_cast<int>(a2), static_cast<mode_t>(a3));
+            const int error = errno;
+            errno = saved_errno;
+            return rc < 0 ? -__macapk_errno_mac2lin(error) : rc;
+        }
         case 132: // sigaltstack   -- neutralize the crash handler's alt stack
         case 134: // rt_sigaction  -- neutralize: keep OUR crash handlers in place
         case 135: // rt_sigprocmask
@@ -14545,7 +14562,8 @@ static void macapk_sigsys_handler(int sig, siginfo_t* info, void* ucontext) {
                         "-> forwarded\n",
                         (unsigned long long)ss.__x[8], (void*)pc, esr);
                 long ret = macapk_forward_inline_syscall(ss.__x[8], ss.__x[0],
-                        ss.__x[1], ss.__x[2], ss.__x[3], ss.__x[4], ss.__x[5]);
+                        ss.__x[1], ss.__x[2], ss.__x[3], ss.__x[4], ss.__x[5],
+                        static_cast<int32_t>(ss.__x[16]) < 0);
                 ss.__x[0] = (uint64_t)ret;   // Linux ABI returns in x0
                 ss.__pc  = resume;
                 return;
@@ -36786,7 +36804,7 @@ static jobject g_macapk_nw_surface_gref = nullptr;
 static bool macapk_keyed_native_windows_enabled() {
     static const bool enabled = [] {
         const char* e = std::getenv("MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS");
-        return e && std::strcmp(e, "1") == 0;
+        return !e || std::strcmp(e, "0") != 0;
     }();
     return enabled;
 }
@@ -38049,7 +38067,8 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
     static SwapFn real =
         reinterpret_cast<SwapFn>(dlsym(RTLD_DEFAULT, "eglSwapBuffers"));
     const int32_t alpha_probe_key = macapk_keyed_egl_surface_key(surf);
-    if (std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE") && alpha_probe_key > 0) {
+    const char* alphaProbe = std::getenv("MACAPK_EXPERIMENTAL_ALPHA_PROBE");
+    if (alphaProbe && std::strcmp(alphaProbe, "1") == 0 && alpha_probe_key > 0) {
         static std::atomic<unsigned> alphaSamples{0};
         unsigned count = alphaSamples.fetch_add(1, std::memory_order_relaxed);
         if (count < 3 || count == 100) {
@@ -39941,9 +39960,9 @@ extern "C" void* __macapk_arm64_dlvsym(void* handle, const char* symbol, const c
 // snapshot invalid and could not be inferred from settings" before its first
 // frame (Feeel 2.4.1, Ente Auth). So the redirect remembers which library a
 // handle stands for, and a host-dlsym miss on that handle asks the loaded ELF
-// image itself (__macapk_arm64_native_lookup_latest). Function lookups are
-// unchanged: the host dlsym answers them first. =0 restores the host-only
-// answer.
+// image itself (__macapk_arm64_native_lookup_latest). Function lookups
+// keep the wrapper's own exports; inherited dependency functions are adapted
+// below when they require a Bionic ABI. =0 disables only the data fallback.
 extern "C" void* __macapk_arm64_native_lookup_latest(const char* soname,
                                                      const char* sym);
 static bool macapk_wrapper_data_dlsym_on() {
@@ -39962,7 +39981,7 @@ static std::unordered_map<void*, std::string>& macapk_wrapper_handles() {
 // <dir>/lib_native/libX.dylib -> "libX.so", the name the wrapper's
 // constructor registers its ELF image under.
 static void macapk_note_wrapper_handle(void* h, const std::string& dylib_path) {
-    if (!h || !macapk_wrapper_data_dlsym_on()) return;
+    if (!h) return;
     std::string base = dylib_path.substr(dylib_path.rfind('/') + 1);
     static const char kExt[] = ".dylib";
     const size_t n = sizeof(kExt) - 1;
@@ -40213,7 +40232,33 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
             name, p);
         return p;
     }
-    if (void* p = dlsym(handle, name)) return p;
+    if (void* p = dlsym(handle, name)) {
+        std::string wrapper_soname;
+        {
+            std::lock_guard<std::mutex> lk(macapk_wrapper_handles_mu());
+            auto it = macapk_wrapper_handles().find(handle);
+            if (it != macapk_wrapper_handles().end()) wrapper_soname = it->second;
+        }
+        if (!wrapper_soname.empty()) {
+            // dyld searches a translated wrapper's Mach-O dependencies too.
+            // A guest which dlopens itself can therefore receive libSystem's
+            // pthread/stdio/varargs ABI instead of the Bionic adapter used by
+            // its ordinary ELF imports. Preserve guest dependency exports;
+            // adapt only definitions actually owned by the host's libSystem.
+            std::string ours = std::string("__macapk_arm64_") + name;
+            if (void* adapted = dlsym(RTLD_DEFAULT, ours.c_str())) {
+                Dl_info provider{};
+                if (!::dladdr(p, &provider) || !provider.dli_fname) return p;
+                const std::string image = provider.dli_fname;
+                const bool host_libc = image.compare(0, 19, "/usr/lib/system/lib") == 0
+                    || image == "/usr/lib/libSystem.B.dylib";
+                if (!host_libc) return p;
+                if (void* defined = macapk_wrapper_elf_dlsym(handle, name)) return defined;
+                return adapted;
+            }
+        }
+        return p;
+    }
     return macapk_wrapper_elf_dlsym(handle, name);
 }
 
@@ -47559,11 +47604,15 @@ extern "C" int __macapk_arm64_scandirat(int parent_fd, const char* path,
     if (!macapk_path_shims_on()) {   // MACAPK_PATH_SHIMS=0: the pre-shim binding
         // Darwin's scandirat is macOS 26.4+ (dirent.h:191); below that the import
         // had nothing to bind to, and ENOSYS is the honest stand-in.
+        // An SDK older than 26.4 does not DECLARE scandirat at all, so the call
+        // must be compiled out there (the default shim path above is unaffected).
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
         if (__builtin_available(macOS 26.4, *)) {
             return ::scandirat(parent_fd, path, reinterpret_cast<struct dirent***>(namelist),
                 reinterpret_cast<int (*)(const struct dirent*)>(filter),
                 reinterpret_cast<int (*)(const struct dirent**, const struct dirent**)>(compar));
         }
+#endif
         errno = 38;
         return -1;
     }
@@ -49895,7 +49944,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 38:  return (long)__macapk_arm64_renameat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (const char*)macapk_untag_ptr((void*)a4));  // renameat
         case 43:  return (long)__macapk_arm64_statfs((const char*)macapk_untag_ptr((void*)a1), (void*)macapk_untag_ptr((void*)a2));  // statfs
         case 44:  return (long)__macapk_arm64_fstatfs((int)a1, (void*)macapk_untag_ptr((void*)a2));  // fstatfs
-        case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (int)a4);  // faccessat
+        case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, 0);  // raw faccessat has three arguments
         case 53:  return (long)__macapk_arm64_fchmodat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (mode_t)a3, (int)a4);  // fchmodat
         case 56:  return (long)__macapk_arm64_openat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (mode_t)a4);  // openat
         // 36/37/45/49/54/88 added with the S0 path shims (2026-09-26), by this
@@ -52621,6 +52670,8 @@ uint32_t __macapk_shim_poll(uint32_t fds, uint32_t nfds, uint32_t timeout,
 //                            Linux 0x5413 <-> macOS 0x40087468
 //   TIOCSWINSZ  struct winsize
 //                            Linux 0x5414 <-> macOS 0x80087467
+// SIOCGIFFLAGS (Linux 0x8913) is translated too, but its struct ifreq and
+// flag bits differ, so it has its own handler: macapk_ifreq_ioctl below.
 // Linux values from bionic's vendored uapi asm-generic/ioctls.h; macOS
 // values are the host macros, not literals, so they cannot be mistyped.
 //
@@ -52634,10 +52685,67 @@ constexpr uint32_t kLinuxTIOCGWINSZ = 0x5413;
 constexpr uint32_t kLinuxTIOCSWINSZ = 0x5414;
 constexpr uint32_t kLinuxFIONBIO    = 0x5421;
 constexpr uint32_t kLinuxFIOASYNC   = 0x5452;
+constexpr uint32_t kLinuxSIOCGIFFLAGS = 0x8913;   // uapi linux/sockios.h
+constexpr short    kLinuxIFF_MULTICAST = 0x1000;  // uapi linux/if.h
+constexpr int      kLinuxENODEV = 19;             // uapi asm-generic/errno-base.h
 }  // namespace
+
+// SIOCGIFFLAGS: an interface's flags, by name. Unlike the requests above, its
+// payload (struct ifreq) and its flag bits differ between the two systems, so
+// it is rebuilt rather than passed through.
+//
+// THE CALLER THAT NEEDS IT is WebRTC's own interface enumerator
+// (rtc_base/ifaddrs_android.cc): for every address the netlink dump returns
+// (see the AF_NETLINK emulation), set_flags() opens an AF_INET datagram socket
+// and asks ioctl(SIOCGIFFLAGS) -- and ONE failure discards the whole list.
+// Refused with ENOTTY, WebRTC logged "getifaddrs failed to gather interface
+// data" and saw no networks at all, so it gathered no ICE candidates of its
+// own: measured 2026-11-13 on Signal 8.35.2 (RingRTC), whose outgoing call
+// reached the other phone but never connected: it never rang there, and
+// hanging up left a missed call. 16 refusals of 0x8913 in the log.
+//
+//   Linux struct ifreq (uapi linux/if.h): char ifr_name[16]; union { ...;
+//       short ifru_flags; ...; struct ifmap } -- 40 bytes on arm64 (32 on arm32)
+//   macOS struct ifreq (net/if.h):        char ifr_name[16]; union { ...;
+//       short ifru_flags; ... }           -- 32 bytes
+// The name and the flags sit at the same offsets (0 and 16) in both, so only
+// those two fields are copied. IFF_* bits 0x1..0x200 (UP, BROADCAST, DEBUG,
+// LOOPBACK, POINTOPOINT, NOTRAILERS, RUNNING, NOARP, PROMISC, ALLMULTI) mean
+// the same on both; above that they do not (macOS IFF_MULTICAST is 0x8000,
+// Linux's is 0x1000, and macOS 0x400..0x4000 are OACTIVE, SIMPLEX and LINK0-2
+// where Linux has MASTER, SLAVE, MULTICAST, PORTSEL and AUTOMEDIA), so the
+// shared bits are kept and MULTICAST is moved; the macOS-only bits have no
+// Linux meaning and are dropped.
+static bool macapk_ifreq_ioctl(int fd, uint32_t op, void* argp, int* rc) {
+    if (op != kLinuxSIOCGIFFLAGS) return false;
+    if (!argp) { errno = EFAULT; *rc = -1; return true; }
+    struct ifreq host;
+    std::memset(&host, 0, sizeof host);
+    std::memcpy(host.ifr_name, argp, IFNAMSIZ - 1);   // NUL-terminated by the memset
+    if (::ioctl(fd, SIOCGIFFLAGS, &host) != 0) {
+        // An unknown name is ENXIO on macOS but ENODEV (19) from a Linux
+        // kernel, which is what an Android caller is written against.
+        errno = (errno == ENXIO) ? kLinuxENODEV : errno_mac2lin(errno);
+        *rc = -1;
+        return true;
+    }
+    const unsigned short mac = static_cast<unsigned short>(host.ifr_flags);
+    short linux_flags = static_cast<short>(mac & 0x03ff);   // the shared bits
+    if (mac & IFF_MULTICAST) linux_flags |= kLinuxIFF_MULTICAST;
+    std::memcpy(static_cast<char*>(argp) + IFNAMSIZ, &linux_flags, sizeof linux_flags);
+    *rc = 0;
+    return true;
+}
 
 uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
                                uint32_t) {
+    {
+        // A null argp reaches the handler too, so a null SIOCGIFFLAGS gets
+        // EFAULT here as it does on the arm64 path.
+        int irc = 0;
+        if (macapk_ifreq_ioctl(static_cast<int>(fd), op, argp ? gptr(argp) : nullptr, &irc))
+            return static_cast<uint32_t>(irc);
+    }
     unsigned long host_op = 0;
     switch (op) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
@@ -52703,6 +52811,7 @@ static bool macapk_ashmem_ioctl(int fd, uint32_t op, void* argp, int* rc) {
 }
 extern "C" int __macapk_arm64_ioctl(int fd, int op, void* argp) {
     { int arc = 0; if (macapk_ashmem_ioctl(fd, static_cast<uint32_t>(op), argp, &arc)) return arc; }
+    { int irc = 0; if (macapk_ifreq_ioctl(fd, static_cast<uint32_t>(op), argp, &irc)) return irc; }
     unsigned long host_op = 0;
     switch (static_cast<uint32_t>(op)) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
@@ -56454,8 +56563,7 @@ int __macapk_arm64___android_log_print(int /*prio*/, const char* /*tag*/,
         "ret\n"
     );
 }
-__attribute__((naked))
-[[noreturn]] void __macapk_arm64___android_log_assert(const char* /*cond*/,
+__attribute__((naked, noreturn)) void __macapk_arm64___android_log_assert(const char* /*cond*/,
                                                          const char* /*tag*/,
                                                          const char* /*fmt*/,
                                                          ...) {
@@ -62242,6 +62350,54 @@ static jclass macapk_findclass_onload_ctx_noinit(JNIEnv* env, const char* name) 
     return static_cast<jclass>(cls);
 }
 
+// ★ FindClass from JNI_OnLoad, take 2 (2026-11-05): the guest's class may be
+// defined by a CHILD ClassLoader -- an app-embedded dex loaded by a custom
+// loader -- rather than by ActivityHost's main app loader. AppClassLoader
+// deliberately loads the native against an AppClassLoader, so both
+// NativeLibraries.getFromClass() and the onload-context pass above name that
+// loader, and the guest's own class (o.getViewByDomId in Binance) is invisible
+// to it. MacApkNativeLoad.loadFrom records the caller's ACTUAL loader in a
+// thread-local around the load; resolve through it here, still WITHOUT
+// initializing, exactly as ART's FindClass does.
+// Returns null (no pending exception) when there is no context, it is one of
+// the loaders already tried, or the class is a genuine miss.
+static jclass macapk_findclass_threadctx_noinit(JNIEnv* env, const char* name) {
+    static jclass s_class_cls = nullptr;    // java/lang/Class (global ref)
+    static jclass s_mnl_cls = nullptr;      // MacApkNativeLoad (global ref)
+    static jmethodID s_ctx = nullptr;       // currentJniOnLoadContext()
+    static jmethodID s_for_name = nullptr;  // Class.forName(String,Z,ClassLoader)
+    static bool s_failed = false;
+    if (s_failed) return nullptr;
+    if (!s_class_cls) {
+        jclass cc = g_orig_FindClass_slot(env, "java/lang/Class");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jclass mnl = g_orig_FindClass_slot(env, "com/macapk/loader/MacApkNativeLoad");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!cc || !mnl) { s_failed = true; return nullptr; }
+        s_ctx = g_orig_GetStaticMethodID(env, mnl, "currentJniOnLoadContext",
+                                         "()Ljava/lang/ClassLoader;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        s_for_name = g_orig_GetStaticMethodID(env, cc, "forName",
+            "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!s_ctx || !s_for_name) { s_failed = true; return nullptr; }
+        s_class_cls = static_cast<jclass>(env->NewGlobalRef(cc));
+        s_mnl_cls = static_cast<jclass>(env->NewGlobalRef(mnl));
+    }
+    jobject loader = env->CallStaticObjectMethod(s_mnl_cls, s_ctx);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    if (!loader) return nullptr;
+    std::string dotted(name ? name : "");
+    for (char& ch : dotted) if (ch == '/') ch = '.';
+    jstring jn = env->NewStringUTF(dotted.c_str());
+    if (!jn) { env->DeleteLocalRef(loader); env->ExceptionClear(); return nullptr; }
+    jobject cls = env->CallStaticObjectMethod(s_class_cls, s_for_name, jn, JNI_FALSE, loader);
+    env->DeleteLocalRef(jn);
+    env->DeleteLocalRef(loader);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    return static_cast<jclass>(cls);
+}
+
 jclass macapk_jni_FindClass_guard(JNIEnv* env, const char* name) {
     if (env->ExceptionCheck()) {
         jthrowable pend = env->ExceptionOccurred();
@@ -62265,6 +62421,10 @@ jclass macapk_jni_FindClass_guard(JNIEnv* env, const char* name) {
         if (env->ExceptionCheck()) env->ExceptionClear();  // forName's CNFE is not the guest's
         if (!ni) {
             ni = macapk_findclass_onload_ctx_noinit(env, name);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        if (!ni) {
+            ni = macapk_findclass_threadctx_noinit(env, name);
             if (env->ExceptionCheck()) env->ExceptionClear();
         }
         if (ni) return ni;
@@ -62337,6 +62497,20 @@ jint macapk_RegisterNatives_wrap(JNIEnv* env, jclass clazz,
             n,
             (n > 0 && methods && methods[0].name) ? methods[0].name : "?",
             (n > 0 && methods && methods[0].signature) ? methods[0].signature : "");
+    }
+    // A NULL jclass reaches HotSpot's jni_RegisterNatives when the caller's
+    // FindClass missed and the guest did not check the result (Binance's
+    // protected liba8357a.so does exactly this). HotSpot dereferences it and
+    // SIGSEGVs the whole VM; ART fails the call. Return JNI_ERR and leave any
+    // pending exception with its owner instead of crashing.
+    if (!clazz) {
+        std::fprintf(stderr,
+            "[jni-reg] ⚠ RegisterNatives(NULL jclass, n=%d first=%s%s) -> "
+            "JNI_ERR (guest did not check FindClass)\n",
+            n,
+            (n > 0 && methods && methods[0].name) ? methods[0].name : "?",
+            (n > 0 && methods && methods[0].signature) ? methods[0].signature : "");
+        return JNI_ERR;
     }
     bool wrapped = false;
     std::vector<JNINativeMethod> copy(methods, methods + (n > 0 ? n : 0));
@@ -64067,18 +64241,6 @@ extern "C" void __macapk_install_jni_bionic_variadic_bridge(JNIEnv* env) {
     // Save originals BEFORE patching. We need both V (for Apple-compiled
     // callers we forward unchanged) and A (for Bionic-compiled callers
     // we repack into).
-    // v1.0.1582: record the JNI String-family entry addresses so the SEGV
-    // handler can recognise (and recover from) a fault inside one on a garbage
-    // jstring without a signal-unsafe dladdr. See try_recover_jni_getstring_fault.
-    {
-        int k = 0;
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringLength);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringUTFLength);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringChars);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringUTFChars);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringCritical);
-        g_jni_string_fn_count = k;
-    }
     // v1.0.1595: the same family, saved as callable originals so the handle-probe
     // guards can front them (see macapk_jstring_handle_ok).
     g_orig_GetStringLength         = vtable->GetStringLength;
@@ -64379,7 +64541,7 @@ struct AttachGuard {
 static void* macapk_native_stream_create(void* dpy, void* config, void* win, bool* recognized) {
     *recognized = false;
     const char* enabled = std::getenv("MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE");
-    if (!enabled || std::strcmp(enabled, "1") != 0 || !win) return nullptr;
+    if ((enabled && std::strcmp(enabled, "0") == 0) || !win) return nullptr;
     // A stream window needs the native swap/resolve bridge to enqueue frames.
     // Do not create an invisible pbuffer if that bridge was disabled.
     const char* nativeBridge = std::getenv("MACAPK_EGL14_NATIVE_WINDOW");
@@ -67588,7 +67750,7 @@ std::vector<MacApkLooper*> g_loopers;     // registry for the vsync broadcast
 static bool macapk_native_choreo_pipe_wake_enabled() {
     static const bool enabled = [] {
         const char* e = std::getenv("MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE");
-        return e && std::strcmp(e, "1") == 0;
+        return !e || std::strcmp(e, "0") != 0;
     }();
     return enabled;
 }

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Worktree-local pre-commit gate: enforce 1+1 doc sync and link hygiene.
+# Never blocks worktrees/branches that do not carry scripts/check_doc_sync.py.
+
+set -euo pipefail
+
+if [ -f "scripts/check_doc_sync.py" ]; then
+    exec python3 scripts/check_doc_sync.py --mode staged
+fi

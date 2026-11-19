@@ -34,6 +34,23 @@ public class ActivityManagerTasksTest {
         info.baseActivity = null;
         check(handles.get(0).getTaskInfo().baseActivity != null,
               "caller mutation escaped the task-info snapshot");
-        System.out.println("PASS: AppTask exposes coherent base/top/count/run-state snapshots");
+
+        List<ActivityManager.RunningTaskInfo> running = manager.getRunningTasks(1);
+        check(running.size() == 1, "getRunningTasks(1) did not expose live task");
+        check(running.get(0).baseActivity.getClassName().equals(RootActivity.class.getName()),
+              "RunningTaskInfo.baseActivity mismatch");
+        check(running.get(0).topActivity.getClassName().equals(ChildActivity.class.getName()),
+              "RunningTaskInfo.topActivity mismatch");
+        check(running.get(0).numActivities == 2 && running.get(0).numRunning == 2 && running.get(0).isRunning,
+              "RunningTaskInfo counts/state mismatch");
+        check(manager.getRunningTasks(0).isEmpty(), "getRunningTasks(0) must respect maxNum=0");
+
+        List<ActivityManager.RecentTaskInfo> recent = manager.getRecentTasks(1, 0);
+        check(recent.size() == 1 && recent.get(0).numActivities == 2
+              && recent.get(0).topActivity.getClassName().equals(ChildActivity.class.getName()),
+              "getRecentTasks(1, 0) mismatch");
+        check(manager.getRecentTasks(0, 0).isEmpty(), "getRecentTasks(0, 0) must respect maxNum=0");
+
+        System.out.println("PASS: AppTask/RunningTasks/RecentTasks expose coherent snapshots");
     }
 }

@@ -1,0 +1,337 @@
+{
+  "schema_version": 1,
+  "task": "COMP-001",
+  "recorded_at": "2026-11-14",
+  "baseline_commit": "e90ef146008d8d0335793d684b26be4588850bf4",
+  "builder_command": "python3 debug/fixtures/build_comp_fixtures.py --out work/upgrade/COMP-001/fixtures",
+  "environment": {
+    "display": "Built-in Retina Display (1710x1112 pt @2x, visible 1710x1074 pt, unlocked, console session=1, no iPad Sidecar connected)",
+    "interactive_gui_executed": false,
+    "interactive_gui_reason": "No Sidecar display attached and COMP-001 headless verification avoids launching unrequested Cocoa windows"
+  },
+  "toolchain": {
+    "apktool": "3.0.3",
+    "clang": "Apple clang version 21.0.0 (clang-2100.4.1.1)",
+    "ffmpeg": "ffmpeg version 7.1.5",
+    "framework_res_apk": "thirdparty/framework-res/framework-res-api36.apk",
+    "framework_res_sha256": "aa6582552e614539ca85c0debd76a6283d80e26456895c829e11e755521d7cd4"
+  },
+  "scenarios": [
+    {
+      "id": "comp-ui-resources",
+      "category": "normal_ui_resources",
+      "package": "org.macapk.comp.uires",
+      "version_code": 100,
+      "version_name": "1.0.0",
+      "target_sdk": 36,
+      "min_sdk": 24,
+      "presented_sdk": 36,
+      "source_dir": "debug/fixtures/ui_resources",
+      "license": "Repository original synthetic test fixture (no third-party or user APK payloads)",
+      "built_apk_path": "work/upgrade/COMP-001/fixtures/comp-ui-resources.apk",
+      "apk_size_bytes": 3937,
+      "apk_sha256": "f5506201ed15ecb3b7147720a6c8ebf78bb911c00c0164fa45c1e9e5e0eeec0c",
+      "isolated_android_root": "work/upgrade/COMP-001/roots/comp-ui-resources",
+      "overall_status": "PARTIAL",
+      "commands": {
+        "build": "python3 debug/fixtures/build_comp_fixtures.py --out work/upgrade/COMP-001/fixtures",
+        "peek_manifest": "runtime/build/bin/macapk-runtime --peek-manifest work/upgrade/COMP-001/fixtures/comp-ui-resources.apk",
+        "gles_scan": "runtime/build/bin/macapk-runtime --gles-scan work/upgrade/COMP-001/fixtures/comp-ui-resources.apk",
+        "peek_window_policy": "runtime/build/bin/macapk-runtime --peek-window-policy work/upgrade/COMP-001/fixtures/comp-ui-resources.apk",
+        "extract_only": "runtime/build/bin/macapk-runtime --apk work/upgrade/COMP-001/fixtures/comp-ui-resources.apk --android-root work/upgrade/COMP-001/roots/comp-ui-resources --extract-only",
+        "fixture_tests": "python3 scripts/run_tests.py --group runtime_fixture --apk work/upgrade/COMP-001/fixtures/comp-ui-resources.apk --out-dir work/upgrade/COMP-001/run_tests_fixture",
+        "bare_jvm_resource_tests": "python3 scripts/run_tests.py --test ResourceIndexCacheKeyTest --test UpstreamResourceAliasTest --out-dir work/upgrade/COMP-001/run_tests_barejvm",
+        "cleanup": "rm -rf work/upgrade/COMP-001/roots/comp-ui-resources"
+      },
+      "checks": [
+        {
+          "name": "offline_apk_build",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Built 3937-byte APK offline via apktool 3.0.3 + framework-res-api36.apk"
+        },
+        {
+          "name": "peek_manifest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "{\"package\":\"org.macapk.comp.uires\",\"versionCode\":100,\"versionName\":\"1.0.0\",\"launcherOrientation\":1,\"iconRef\":\"0x7f020000\"}"
+        },
+        {
+          "name": "gles_scan",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "{\"es31\":0,\"es1\":0}"
+        },
+        {
+          "name": "peek_window_policy",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "class=C1-free boxPt=[1710,1042] boxPx=[3420,2084] universal=1 resizeable=1 targetSdk=36"
+        },
+        {
+          "name": "extract_only_and_vector_icon",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Presented SDK 36; ARSC parsed 10 rows (2 strings, 3 colors, 1 style, 4 file rows); VectorDrawable icon.png rasterized"
+        },
+        {
+          "name": "DrawableIdentityAndTintTest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Verified >=2 distinct drawable keys and SRC_IN/SRC_ATOP alpha tint coverage (987.6ms)"
+        },
+        {
+          "name": "UpstreamPackageFeaturesTest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Verified PackageManager GET_CONFIGURATIONS feature metadata match (332.5ms)"
+        },
+        {
+          "name": "bare_jvm_resource_unit_tests",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "ResourceIndexCacheKeyTest (291.8ms) + UpstreamResourceAliasTest (280.5ms)"
+        },
+        {
+          "name": "interactive_gui_launch",
+          "status": "NOT_RUN",
+          "exit_code": null,
+          "detail": "Live Cocoa/NSWindow Activity layout & visual window launch not executed (no Sidecar display; headless policy)"
+        }
+      ]
+    },
+    {
+      "id": "comp-surface-media",
+      "category": "multi_surface_canvas_media",
+      "package": "org.macapk.comp.surfmedia",
+      "version_code": 100,
+      "version_name": "1.0.0",
+      "target_sdk": 36,
+      "min_sdk": 24,
+      "presented_sdk": 36,
+      "source_dir": "debug/fixtures/surface_media",
+      "license": "Repository original synthetic test fixture + ffmpeg-generated synthetic sine tone & testsrc2 clip",
+      "built_apk_path": "work/upgrade/COMP-001/fixtures/comp-surface-media.apk",
+      "apk_size_bytes": 10737,
+      "apk_sha256": "27a86ae8a8bc46020e9661dcc9422ec57704380c7dee015ec65f58fdc166f469",
+      "bundled_assets": {
+        "probe_tone.m4a": {
+          "size_bytes": 3223,
+          "sha256": "6ddca8d0fa5f6f4534ddd4855cf24f3e0395d89df009ff510ed2f8930e85a135"
+        },
+        "probe_clip.h264": {
+          "size_bytes": 3463,
+          "sha256": "1062b94181ca0c719ad492a70b2a2876422ab342ceade79f1a3c9bda5bef5fca"
+        }
+      },
+      "isolated_android_root": "work/upgrade/COMP-001/roots/comp-surface-media",
+      "overall_status": "PARTIAL",
+      "commands": {
+        "build": "python3 debug/fixtures/build_comp_fixtures.py --out work/upgrade/COMP-001/fixtures",
+        "peek_manifest": "runtime/build/bin/macapk-runtime --peek-manifest work/upgrade/COMP-001/fixtures/comp-surface-media.apk",
+        "gles_scan": "runtime/build/bin/macapk-runtime --gles-scan work/upgrade/COMP-001/fixtures/comp-surface-media.apk",
+        "peek_window_policy": "runtime/build/bin/macapk-runtime --peek-window-policy work/upgrade/COMP-001/fixtures/comp-surface-media.apk",
+        "extract_only": "runtime/build/bin/macapk-runtime --apk work/upgrade/COMP-001/fixtures/comp-surface-media.apk --android-root work/upgrade/COMP-001/roots/comp-surface-media --extract-only",
+        "features_test": "python3 scripts/run_tests.py --test UpstreamPackageFeaturesTest --apk work/upgrade/COMP-001/fixtures/comp-surface-media.apk --out-dir work/upgrade/COMP-001/run_tests_surfmedia_feat",
+        "amedia_and_java_audio_selftest": "MACAPK_WINDOW_FIRST=0 MACAPK_AWT_MAIN_INIT=0 MACAPK_AMEDIA_SELFTEST=1 MACAPK_AMEDIA_SELFTEST_FILE=work/upgrade/COMP-001/probe_tone.m4a MACAPK_MEDIA_SELFTEST=1 MACAPK_MEDIA_SELFTEST_FILE=work/upgrade/COMP-001/probe_tone.m4a runtime/build/bin/macapk-runtime --apk work/upgrade/COMP-001/fixtures/comp-surface-media.apk --android-root work/upgrade/COMP-001/roots/comp-surface-media",
+        "video_image_selftest": "MACAPK_WINDOW_FIRST=0 MACAPK_AWT_MAIN_INIT=0 MACAPK_VIDEO_IMAGE_SELFTEST=1 MACAPK_VIDEO_IMAGE_SELFTEST_FILE=work/upgrade/COMP-001/probe_clip.h264 MACAPK_VIDEO_IMAGE_SELFTEST_OUT=work/upgrade/COMP-001/goi_mine.png runtime/build/bin/macapk-runtime --apk work/upgrade/COMP-001/fixtures/comp-surface-media.apk --android-root work/upgrade/COMP-001/roots/comp-surface-media",
+        "bare_jvm_surface_media_tests": "python3 scripts/run_tests.py --test MediaCodecDequeueTest --test SurfaceTextureRoutingTest --test SurfaceVideoTargetIsolationTest --out-dir work/upgrade/COMP-001/run_tests_barejvm",
+        "cleanup": "rm -rf work/upgrade/COMP-001/roots/comp-surface-media work/upgrade/COMP-001/probe_tone.m4a work/upgrade/COMP-001/probe_clip.h264 work/upgrade/COMP-001/goi_mine.png"
+      },
+      "checks": [
+        {
+          "name": "offline_apk_build",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Built 10737-byte APK offline with SurfaceView + TextureView + Canvas smali and synthetic AAC/H.264 assets"
+        },
+        {
+          "name": "peek_manifest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "{\"package\":\"org.macapk.comp.surfmedia\",\"versionCode\":100,\"versionName\":\"1.0.0\",\"launcherOrientation\":0,\"iconRef\":\"0x7f010000\"}"
+        },
+        {
+          "name": "gles_scan",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "{\"es31\":0,\"es1\":0}"
+        },
+        {
+          "name": "peek_window_policy",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "class=C1-free boxPt=[1710,1042] boxPx=[3420,2084] universal=1 resizeable=1 targetSdk=36"
+        },
+        {
+          "name": "extract_only",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Presented SDK 36; ARSC parsed 4 rows; VectorDrawable icon.png rasterized"
+        },
+        {
+          "name": "UpstreamPackageFeaturesTest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Verified glEsVersion=0x30000 and audio.output feature entries (322.8ms)"
+        },
+        {
+          "name": "AMEDIA_SELFTEST_and_MediaSelfTest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "AMEDIA_SELFTEST 12288 frames rms=2776.2 PASS; MediaSelfTest 12288 frames rms=2776 PASS on probe_tone.m4a"
+        },
+        {
+          "name": "VideoImageSelfTest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "20 MediaCodecList codecs; decoded 3 VideoToolbox frames (64x64 YUV420) motionDelta=8.74 PASS"
+        },
+        {
+          "name": "bare_jvm_surface_media_unit_tests",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "MediaCodecDequeueTest (454.6ms), SurfaceTextureRoutingTest (254.3ms), SurfaceVideoTargetIsolationTest (244.6ms)"
+        },
+        {
+          "name": "interactive_surface_compositing_and_display_frames",
+          "status": "NOT_RUN",
+          "exit_code": null,
+          "detail": "Live SurfaceView/TextureView Metal layer compositing & presented display frames not run (no Sidecar / headless policy)"
+        }
+      ]
+    },
+    {
+      "id": "comp-service-ipc-abi",
+      "category": "service_ipc_native_abi",
+      "package": "org.macapk.comp.ipcabi",
+      "version_code": 100,
+      "version_name": "1.0.0",
+      "target_sdk": 36,
+      "min_sdk": 24,
+      "presented_sdk": 36,
+      "source_dir": "debug/fixtures/service_ipc_abi",
+      "native_source": "debug/fixtures/native/compprobe.c",
+      "license": "Repository original synthetic test fixture + freestanding C native probe",
+      "built_apk_path": "work/upgrade/COMP-001/fixtures/comp-service-ipc-abi.apk",
+      "apk_size_bytes": 7932,
+      "apk_sha256": "f99997d30187f29993c09cb3ddd26e617100948e6d9b3495e6a89c7801d149dc",
+      "native_lib": {
+        "archive_path": "lib/arm64-v8a/libcompprobe.so",
+        "size_bytes": 4704,
+        "sha256": "12e110f6069160ff9bfaea03e6d6bfd972e985839d02ffd4f3acf5d7ed670f10",
+        "exports": [
+          "compprobe_add",
+          "JNI_OnLoad",
+          "Java_org_macapk_comp_ipcabi_MainActivity_nativeProbe"
+        ]
+      },
+      "isolated_android_root": "work/upgrade/COMP-001/roots/comp-service-ipc-abi",
+      "overall_status": "PARTIAL",
+      "commands": {
+        "build": "python3 debug/fixtures/build_comp_fixtures.py --out work/upgrade/COMP-001/fixtures",
+        "peek_manifest": "runtime/build/bin/macapk-runtime --peek-manifest work/upgrade/COMP-001/fixtures/comp-service-ipc-abi.apk",
+        "gles_scan": "runtime/build/bin/macapk-runtime --gles-scan work/upgrade/COMP-001/fixtures/comp-service-ipc-abi.apk",
+        "peek_window_policy": "runtime/build/bin/macapk-runtime --peek-window-policy work/upgrade/COMP-001/fixtures/comp-service-ipc-abi.apk",
+        "extract_only": "runtime/build/bin/macapk-runtime --apk work/upgrade/COMP-001/fixtures/comp-service-ipc-abi.apk --android-root work/upgrade/COMP-001/roots/comp-service-ipc-abi --extract-only",
+        "features_test": "python3 scripts/run_tests.py --test UpstreamPackageFeaturesTest --apk work/upgrade/COMP-001/fixtures/comp-service-ipc-abi.apk --out-dir work/upgrade/COMP-001/run_tests_ipcabi_feat",
+        "bare_jvm_ipc_tests": "python3 scripts/run_tests.py --test ParcelBinderTransportTest --test ParcelWireTest --out-dir work/upgrade/COMP-001/run_tests_barejvm",
+        "broker_fixture_test": "python3 scripts/run_tests.py --group runtime_fixture --apk work/upgrade/COMP-001/fixtures/comp-ui-resources.apk --out-dir work/upgrade/COMP-001/run_tests_fixture",
+        "cleanup": "rm -rf work/upgrade/COMP-001/roots/comp-service-ipc-abi"
+      },
+      "checks": [
+        {
+          "name": "offline_apk_build_and_elf64_emit",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Built 7932-byte APK + 4704-byte ET_DYN ELF64 arm64-v8a libcompprobe.so exporting 3 symbols"
+        },
+        {
+          "name": "peek_manifest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "{\"package\":\"org.macapk.comp.ipcabi\",\"versionCode\":100,\"versionName\":\"1.0.0\",\"launcherOrientation\":-2,\"iconRef\":\"0x7f010000\"}"
+        },
+        {
+          "name": "gles_scan",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "{\"es31\":0,\"es1\":0}"
+        },
+        {
+          "name": "peek_window_policy",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "class=C1-free boxPt=[1710,1042] boxPx=[3420,2084] universal=1 resizeable=1 targetSdk=36"
+        },
+        {
+          "name": "extract_only_and_arm64_lib_install",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "DEX->JAR converted 4 classes in 6ms; manifest reported services=1; installed lib/arm64/libcompprobe.so (0755); objdump -T verified 3 dynamic symbols in .text"
+        },
+        {
+          "name": "UpstreamPackageFeaturesTest",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "Verified faketouch feature entry (314.6ms)"
+        },
+        {
+          "name": "bare_jvm_ipc_unit_tests",
+          "status": "PASS",
+          "exit_code": 0,
+          "detail": "ParcelBinderTransportTest (262.1ms), ParcelWireTest (253.9ms)"
+        },
+        {
+          "name": "RemoteServiceProcessTest",
+          "status": "SKIP",
+          "exit_code": null,
+          "detail": "requires full macapk-runtime + macapk-system broker harness (not run in offline headless pass)"
+        },
+        {
+          "name": "live_jni_dlopen_and_worker_process_bind",
+          "status": "NOT_RUN",
+          "exit_code": null,
+          "detail": "In-process Guest ELF ET_DYN load + live :worker service bind not executed without interactive launch / broker harness"
+        }
+      ]
+    }
+  ],
+  "uncovered_stacks": [
+    {
+      "stack": "Jetpack Compose",
+      "status": "NOT_COVERED",
+      "reason": "Synthetic fixtures use View/Layout XML and Canvas; no Compose runtime/recomposer APK compiled offline yet"
+    },
+    {
+      "stack": "Flutter (libflutter.so + Impeller/Skia)",
+      "status": "NOT_COVERED",
+      "reason": "No Flutter engine binary or flutter_assets bundle in synthetic fixtures"
+    },
+    {
+      "stack": "Unity (libunity.so / IL2CPP / Vulkan-GLES)",
+      "status": "NOT_COVERED",
+      "reason": "No Unity player engine native binary in synthetic fixtures"
+    },
+    {
+      "stack": "Android WebView / Chromium",
+      "status": "NOT_COVERED",
+      "reason": "No WebView-hosting synthetic fixture or WebView provider harness run yet"
+    },
+    {
+      "stack": "ARM32 guest .so translation",
+      "status": "NOT_COVERED",
+      "reason": "comp-service-ipc-abi targets arm64-v8a; no armeabi-v7a ELF fixture built in COMP-001"
+    },
+    {
+      "stack": "Real third-party user APKs",
+      "status": "NOT_COVERED",
+      "reason": "Excluded from Git/COMP-001 fixtures by security and provenance rules"
+    },
+    {
+      "stack": "Interactive GUI & Sidecar multi-display frames",
+      "status": "NOT_RUN",
+      "reason": "Only Built-in Retina Display connected; no iPad Sidecar connected and no Cocoa GUI launch permitted in headless check"
+    }
+  ]
+}

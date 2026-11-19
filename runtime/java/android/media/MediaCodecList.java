@@ -140,9 +140,85 @@ public final class MediaCodecList {
                 out.add(MediaCodecInfo.fromHostCapability(c));
             }
         }
+        addBuiltInEncoders(out);
         MediaCodecInfo[] arr = out.toArray(new MediaCodecInfo[out.size()]);
         sCached = arr;
         return arr;
+    }
+
+    private static final int[] VIDEO_ENCODER_COLOR_FORMATS = new int[] {
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420PackedPlanar,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420PackedSemiPlanar,
+        MediaCodecInfo.CodecCapabilities.COLOR_Format32bitBGRA8888,
+        MediaCodecInfo.CodecCapabilities.COLOR_Format32bitARGB8888,
+        MediaCodecInfo.CodecCapabilities.COLOR_Format32bitABGR8888,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatRGBAFlexible,
+    };
+
+    private static void addBuiltInEncoders(List<MediaCodecInfo> out) {
+        int bitrateModes = (1 << MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                | (1 << MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+        out.add(MediaCodecInfo.createAudioEncoder(
+                "OMX.macapk.enc." + MediaFormat.MIMETYPE_AUDIO_AAC,
+                MediaFormat.MIMETYPE_AUDIO_AAC,
+                false,
+                new int[] { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000 },
+                6,
+                new android.util.Range<Integer>(8000, 510000),
+                new MediaCodecInfo.CodecProfileLevel[] {
+                    new MediaCodecInfo.CodecProfileLevel(
+                            MediaCodecInfo.CodecProfileLevel.AACObjectLC, 0)
+                },
+                bitrateModes));
+
+        String[] videoMimes;
+        try {
+            videoMimes = com.macapk.loader.NativeMedia.nativeVideoEncodeSupportedMimes();
+        } catch (RuntimeException | LinkageError e) {
+            return;
+        }
+        if (videoMimes == null) return;
+        for (String mime : videoMimes) {
+            if (mime == null || mime.isEmpty()) continue;
+            boolean hw = false;
+            try {
+                hw = com.macapk.loader.NativeMedia.nativeVideoEncodeIsHardware(mime);
+            } catch (RuntimeException | LinkageError ignored) { }
+            int[] probe = null;
+            if (PROFILE_LEVELS) {
+                try {
+                    probe = com.macapk.loader.NativeMedia.nativeVideoCapabilities(mime);
+                } catch (RuntimeException | LinkageError ignored) { }
+            }
+            MediaCodecInfo.CodecProfileLevel[] pls = new MediaCodecInfo.CodecProfileLevel[0];
+            android.util.Range<Integer> dims = VideoToolboxDecoders.SIZE_RANGE;
+            int maxMbs = 0;
+            if (probe != null && probe.length >= 4 && probe[3] > 0 && probe.length >= 4 + 2 * probe[3]) {
+                pls = new MediaCodecInfo.CodecProfileLevel[probe[3]];
+                for (int i = 0; i < pls.length; i++) {
+                    pls[i] = new MediaCodecInfo.CodecProfileLevel(probe[4 + 2 * i], probe[5 + 2 * i]);
+                }
+                int maxDim = Math.max(probe[0], probe[1]);
+                if (maxDim >= 2) dims = new android.util.Range<Integer>(2, maxDim);
+                maxMbs = probe[2];
+            }
+            out.add(MediaCodecInfo.createVideoEncoder(
+                    "OMX.macapk.enc." + mime,
+                    mime,
+                    hw,
+                    dims,
+                    dims,
+                    VideoToolboxDecoders.FRAME_RATE_RANGE,
+                    maxMbs,
+                    new android.util.Range<Integer>(64000, 100000000),
+                    pls,
+                    VIDEO_ENCODER_COLOR_FORMATS,
+                    bitrateModes));
+        }
     }
 
     /** Used by MediaCodecInfo.forName (MediaCodec.getCodecInfo()'s path) to
@@ -182,11 +258,9 @@ public final class MediaCodecList {
      *  (findCodecForFormat dereferences format immediately). */
     public String findDecoderForFormat(MediaFormat format) { return findCodecForFormat(false, format); }
 
-    /** No encoder is ever registered (MediaCodec's native backing is
-     *  decode-only -- see MediaCodec.java's header comment), so AOSP's "or
-     *  null if no such codec has been found" is the whole answer -- but the
-     *  format is still dereferenced first so a null argument raises the same
-     *  NullPointerException AOSP raises. */
+    /** AOSP: "the name of an encoder that supports the given format and
+     *  feature requests, or null if no such codec has been found".
+     *  Dereferences format first so null raises NullPointerException. */
     public String findEncoderForFormat(MediaFormat format) { return findCodecForFormat(true, format); }
 
     private String findCodecForFormat(boolean encoder, MediaFormat format) {

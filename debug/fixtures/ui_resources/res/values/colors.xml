@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="probe_bg">#FF101820</color>
+    <color name="probe_accent">#FF2B90D9</color>
+    <color name="probe_text">#FFF4F7FA</color>
+</resources>

@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git *--no-verify*)",
+      "Bash(git commit -n *)",
+      "Bash(git commit * -n *)",
+      "Bash(*MACAPK_SKIP_DOC_CHECK=1*)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/check_doc_sync.py --mode agent-stop"
+          }
+        ]
+      }
+    ]
+  }
+}

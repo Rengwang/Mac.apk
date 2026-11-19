@@ -62,7 +62,7 @@ public class BitmapDrawable extends Drawable {
     public android.graphics.Paint getPaint() { return paint; }
     public void setAntiAlias(boolean a)    { paint.setAntiAlias(a); invalidateSelf(); }
     public boolean hasAntiAlias()          { return paint.isAntiAlias(); }
-    public void setFilterBitmap(boolean f) {}
+    @Override public void setFilterBitmap(boolean f) { super.setFilterBitmap(f); }
     public void setDither(boolean d)       {}
     /** AOSP BitmapDrawable.setMipMap(boolean) forwards to the Bitmap; ours has
      *  no mip chain, so it records the request so hasMipMap() can answer it. */
@@ -71,8 +71,8 @@ public class BitmapDrawable extends Drawable {
      *  enabled on this drawable's bitmap." Reports what setMipMap was given. */
     public boolean hasMipMap()             { return mMipMap; }
     private boolean mMipMap;
-    public void setAutoMirrored(boolean m) {}
-    public boolean isAutoMirrored()        { return false; }
+    @Override public void setAutoMirrored(boolean m) { super.setAutoMirrored(m); }
+    @Override public boolean isAutoMirrored()        { return super.isAutoMirrored(); }
 
     // ---- tile modes -------------------------------------------------
     // AOSP: "By default, the drawable does not repeat its bitmap" -- both

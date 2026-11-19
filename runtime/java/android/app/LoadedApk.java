@@ -50,7 +50,7 @@ public final class LoadedApk {
 
     private static final String TAG = "Mac.apk.LoadedApk";
 
-    final ClassLoader mClassLoader;
+    public ClassLoader mClassLoader;
     final String mPackageName;
     final String mAppClassName;
     final ActivityThread mActivityThread;
@@ -113,6 +113,11 @@ public final class LoadedApk {
 
     String getPackageName() {
         return mPackageName;
+    }
+
+    /** AOSP LoadedApk.getClassLoader(): returns the mutable mClassLoader. */
+    public ClassLoader getClassLoader() {
+        return mClassLoader;
     }
 
     /** AOSP makeApplication (:1384-1388), @UnsupportedAppUsage. NOT on the
@@ -220,6 +225,9 @@ public final class LoadedApk {
         // untouched, so the launch aborts exactly as it does today.
 
         mApplication = app;
+        if (app != null) {
+            app.macapkBindLoadedApk(this);
+        }
         return app;
     }
 }

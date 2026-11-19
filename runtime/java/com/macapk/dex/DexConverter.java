@@ -60,8 +60,18 @@ public final class DexConverter {
 
     /** Open a resident session over one or more DEX files. */
     public static Session open(byte[]... dexes) {
-        return new Session(dexes);
+        return new Session(true, dexes);
     }
+
+    /** Open a resident session for live mutable in-memory DEX images where an
+     *  unprepared all-nop method body must fail class conversion rather than
+     *  being stubbed before decryption completes. */
+    public static Session openLive(byte[]... dexes) {
+        return new Session(false, dexes);
+    }
+
+    private static final ThreadLocal<Boolean> REJECT_EMPTY_BODY =
+        ThreadLocal.withInitial(() -> Boolean.FALSE);
 
     // ==================================================================
     // Session
@@ -121,8 +131,14 @@ public final class DexConverter {
          * than scanning every method, so constructing it is free.
          */
         private final SuperInterfacePlan superIfacePlan;
+        private final boolean stubEmpty;
 
         Session(byte[]... dexes) {
+            this(true, dexes);
+        }
+
+        Session(boolean stubEmpty, byte[]... dexes) {
+            this.stubEmpty = stubEmpty;
             for (byte[] d : dexes) {
                 if (d == null) continue;
                 DexFile f = DexFile.parse(d);
@@ -192,11 +208,15 @@ public final class DexConverter {
             DexClass c = byName.get(normalize(name));
             if (c == null) return null;
             InitRepointPlan plan = repointPlan();
+            boolean prevRejectEmpty = REJECT_EMPTY_BODY.get();
+            REJECT_EMPTY_BODY.set(!stubEmpty);
             try {
                 return convertOne(c, hierarchy, plan, superIfacePlan, nestIndex);
             } catch (RuntimeException e) {
                 errors.put(c.name(), describe(e));
                 return null;
+            } finally {
+                REJECT_EMPTY_BODY.set(prevRejectEmpty);
             }
         }
 
@@ -619,6 +639,10 @@ public final class DexConverter {
                 Translator.translate(m, mw, hierarchy, plan, superIfaces, allowOutlining);
                 CodeWriter empty = mw.code();
                 if (empty != null && empty.measuredLength() == 0) {
+                    if (REJECT_EMPTY_BODY.get()) {
+                        throw new IllegalStateException(
+                            "Empty method body in live DEX: " + cls.name() + "." + m.name() + m.descriptor());
+                    }
                     mw.resetCode();
                     Translator.emitEmptyBody(mw, cls, m);
                     emptyStubs.incrementAndGet();

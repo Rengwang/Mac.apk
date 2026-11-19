@@ -1,0 +1,3437 @@
+{
+  "schema_version": "1.0.0",
+  "baseline_commit": "304eb3297d31f69ac4cd2b4b25c6e56f2b60793b",
+  "inventory_summary": {
+    "scan_roots": [
+      "runtime",
+      "launcher",
+      "scripts",
+      "debug"
+    ],
+    "excluded_dirs": [
+      "build",
+      "prebuilt",
+      ".git"
+    ],
+    "files_scanned": 3353,
+    "distinct_tokens": 2109,
+    "dex2jvm_tokens": 43,
+    "experimental_tokens": 7,
+    "priority_gates_documented": 75
+  },
+  "launch_entries": [
+    {
+      "id": "direct_runtime_cli",
+      "name": "Direct CLI (macapk-runtime --apk)",
+      "source": [
+        "runtime/src/main.cpp:475-524",
+        "runtime/src/main.cpp:2379-2553"
+      ],
+      "sets_env": {
+        "MACAPK_APK_PATH": "<cli.apk>",
+        "MACAPK_BUILD_JAVA_ID": "<build_id.java_id>",
+        "MACAPK_BUILD_NATIVE_ID": "<build_id.native_id>",
+        "MACAPK_FW_RES_APK": "<bin_dir>/tools/framework-res.apk (overwrite=0)",
+        "MACAPK_PAIRIP_IMPORT_TABLE": "<pairip-refs>/pairip_import_table.txt (overwrite=0 unless MACAPK_PAIRIP_GATE_OFF)",
+        "MACAPK_PAIRIP_INJECT_STRINGS": "<pairip-refs>/pool_inject.bin (overwrite=0 unless MACAPK_PAIRIP_GATE_OFF)",
+        "MACAPK_PAIRIP_CODE_PATCH_DIR": "<pairip-refs>/code_patches (overwrite=0 unless MACAPK_PAIRIP_GATE_OFF)",
+        "MACAPK_FORCE_ABI": "<argv when --force-abi passed>",
+        "MACAPK_DEV_TRACE": "1 (when --dev-trace passed)",
+        "MACAPK_TRACE_BL": "1 (when --dev-trace passed)",
+        "MACAPK_TRACE_JNI_HANDLES": "1 (when --dev-trace passed)"
+      },
+      "unsets_env": [],
+      "notes": "Does NOT set the 4 MACAPK_EXPERIMENTAL_* rendering/looper flags, MACAPK_LOG_LEVEL, or MACAPK_QUIET_CLASSLOAD, and does NOT scrub harness vars."
+    },
+    {
+      "id": "launcher_control_panel",
+      "name": "Mac.apk Control Panel (direct Process + NSWorkspace.openApplication)",
+      "source": [
+        "launcher/MacApkLauncherApp.swift:153-161",
+        "launcher/MacApkLauncherApp.swift:4441-4525",
+        "launcher/MacApkLauncherApp.swift:4718-4746"
+      ],
+      "sets_env": {
+        "MACAPK_LOG_LEVEL": "4 (direct Process when !model.verboseLogging; overridable by defaultEnv/app.env)",
+        "MACAPK_QUIET_CLASSLOAD": "1 (direct Process when !model.verboseLogging; overridable by defaultEnv/app.env)",
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS": "1 (overridable by defaultEnv/app.env)",
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE": "1 (overridable by defaultEnv/app.env)",
+        "MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA": "1 (overridable by defaultEnv/app.env)",
+        "MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE": "1 (overridable by defaultEnv/app.env)",
+        "MACAPK_FORCE_ABI": "armeabi-v7a (only when devMenuRevealed && forceArm32)",
+        "MACAPK_DEV_TRACE": "1 (only when devMenuRevealed && verboseDevTrace)"
+      },
+      "unsets_env": [
+        "MACAPK_NO_ACTIVATE",
+        "MACAPK_PAUSE_WHEN_HIDDEN",
+        "MACAPK_INSTALL_LOCK_HELD",
+        "MACAPK_INJECT_FILE",
+        "MACAPK_DEBUG_HOSTKEY_FILE",
+        "MACAPK_RECORD_INPUT",
+        "MACAPK_EXTERNAL_URLS",
+        "MACAPK_SYSTEM_APPS_DIR",
+        "MACAPK_USER_APPS_DIR"
+      ],
+      "notes": "Scrubs 9 harness variables at MacApkLauncherApp.init() (:153-161) and forces the 4 MACAPK_EXPERIMENTAL_* flags to 1 in both direct Process (:4510-4513) and NSWorkspace.openApplication (:4730-4733) before applying model.defaultEnv and app.env."
+    },
+    {
+      "id": "app_stub_dock",
+      "name": "Installed App Stub / Dock Launch (AppStubMain.swift)",
+      "source": [
+        "launcher/AppStubMain.swift:1006-1040",
+        "launcher/AppStubMain.swift:1330-1335"
+      ],
+      "sets_env": {
+        "MACAPK_LOG_LEVEL": "4 (if nil)",
+        "MACAPK_QUIET_CLASSLOAD": "1 (if nil)",
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS": "1 (if nil)",
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE": "1 (if nil)",
+        "MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA": "1 (if nil)",
+        "MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE": "1 (if nil)",
+        "MACAPK_AWAIT_SYSTEM_READY": "<readyFile.path> (for Google Play when MACAPK_PLAY_OVERLAP != 0)",
+        "MACAPK_AWAIT_SYSTEM_READY_TIMEOUT_S": "180 (for Google Play when MACAPK_PLAY_OVERLAP != 0)"
+      },
+      "unsets_env": [],
+      "notes": "Applies row.env from RegistryStore afterwards (setenv overwrite=1). Does NOT scrub the 9 harness vars that MacApkLauncherApp.swift scrubs."
+    },
+    {
+      "id": "system_broker_spawn",
+      "name": "System Broker (SystemBrokerMain.c + SystemServer.java)",
+      "source": [
+        "launcher/SystemBrokerMain.c:31-59",
+        "runtime/java/com/macapk/loader/SystemServer.java:373-415"
+      ],
+      "sets_env": {
+        "MACAPK_SYSTEM_NAME": "org.macapk.processes (when --app-processes) or org.macapk.system",
+        "MACAPK_BROKER_APP_PROCESSES_ONLY": "1 (when --app-processes)",
+        "MACAPK_BROKER_BOOT_SYSTEM": "0 (when --app-processes)",
+        "MACAPK_LOG_LEVEL": "7 (broker own process only; stripped before child spawn)",
+        "MACAPK_SERVICE_HOST": "1 (on spawned service hosts)",
+        "MACAPK_BROKER": "1 (on spawned service hosts)",
+        "MACAPK_PROCESS_NAME": "<proc> (on spawned service hosts when split())",
+        "MACAPK_SECONDARY_PROCESS": "1 (on spawned secondary process)"
+      },
+      "unsets_env": [
+        "MACAPK_LOG_LEVEL",
+        "MACAPK_BROKER_APKS",
+        "MACAPK_BROKER_RUNTIME",
+        "MACAPK_BROKER_ROOT",
+        "MACAPK_BROKER_LOGDIR",
+        "MACAPK_PROCESS_NAME"
+      ],
+      "notes": "Product mode spawns the app's installed stub (inherits AppStubMain defaults); dev mode via MACAPK_BROKER_RUNTIME spawns macapk-runtime --apk directly without setting the 4 MACAPK_EXPERIMENTAL_* flags, MACAPK_LOG_LEVEL=4, or MACAPK_QUIET_CLASSLOAD=1."
+    }
+  ],
+  "entry_mismatches": [
+    {
+      "id": "GAP-GATE-001",
+      "severity": "high",
+      "title": "4 MACAPK_EXPERIMENTAL_* defaults diverge between Launcher/Stub (=1) and direct runtime/broker dev spawns (unset -> OFF)",
+      "gates": [
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS",
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE",
+        "MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA",
+        "MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE"
+      ],
+      "affected_entries": [
+        "direct_runtime_cli",
+        "launcher_control_panel",
+        "app_stub_dock",
+        "system_broker_spawn"
+      ],
+      "evidence": [
+        "runtime/translator/src/bionic_shim.cpp:36788",
+        "runtime/translator/src/bionic_shim.cpp:64381",
+        "runtime/src/cocoa_bridge.mm:8947",
+        "runtime/translator/src/bionic_shim.cpp:67590",
+        "launcher/MacApkLauncherApp.swift:4510-4513",
+        "launcher/MacApkLauncherApp.swift:4730-4733",
+        "launcher/AppStubMain.swift:1020-1029",
+        "runtime/java/com/macapk/loader/SystemServer.java:377-382",
+        "docs/MACAPK_UPGRADE_HANDBOOK.md:732,836-839"
+      ],
+      "impact": "Direct macapk-runtime --apk invocations and MACAPK_BROKER_RUNTIME dev broker spawns silently run with all 4 Surface/Choreo capabilities OFF, whereas Control Panel and Dock launches force all 4 ON. Handbook 8.7/12 describes them as production defaults (=0 disables) without documenting runtime's unset=OFF default.",
+      "followup_card": "GATE-002"
+    },
+    {
+      "id": "GAP-GATE-002",
+      "severity": "medium",
+      "title": "MACAPK_LOG_LEVEL & MACAPK_QUIET_CLASSLOAD defaults differ across Launcher/Stub, direct runtime, and SystemServer spawns (+ stale level-5 comments)",
+      "gates": [
+        "MACAPK_LOG_LEVEL",
+        "MACAPK_QUIET_CLASSLOAD"
+      ],
+      "affected_entries": [
+        "direct_runtime_cli",
+        "launcher_control_panel",
+        "app_stub_dock",
+        "system_broker_spawn"
+      ],
+      "evidence": [
+        "launcher/MacApkLauncherApp.swift:4502-4505",
+        "launcher/AppStubMain.swift:1006-1011",
+        "launcher/SystemBrokerMain.c:59",
+        "runtime/java/com/macapk/loader/SystemServer.java:395-398",
+        "runtime/java/com/macapk/loader/NativeLog.java:35",
+        "runtime/java/android/util/Log.java:111",
+        "runtime/src/native_methods.cpp:72",
+        "runtime/java/com/macapk/loader/AppClassLoader.java:92-94"
+      ],
+      "impact": "Control Panel (non-verbose) and Dock set MACAPK_LOG_LEVEL=4 + MACAPK_QUIET_CLASSLOAD=1; direct macapk-runtime and MACAPK_BROKER_RUNTIME spawns leave both unset (NativeLog floor 0 = emit all, android.util.Log floor 4 = INFO, QUIET_CLASSLOAD=false -> high classload log volume). NativeLog/Log comments still reference legacy level 5.",
+      "followup_card": "GATE-002"
+    },
+    {
+      "id": "GAP-GATE-003",
+      "severity": "low",
+      "title": "Harness environment scrubbing exists only in MacApkLauncherApp.swift, not in AppStubMain.swift or macapk-runtime",
+      "gates": [
+        "MACAPK_LOG_LEVEL"
+      ],
+      "affected_entries": [
+        "direct_runtime_cli",
+        "launcher_control_panel",
+        "app_stub_dock"
+      ],
+      "evidence": [
+        "launcher/MacApkLauncherApp.swift:153-161",
+        "launcher/AppStubMain.swift:1006-1040",
+        "runtime/src/main.cpp:475-524"
+      ],
+      "impact": "9 harness variables (MACAPK_NO_ACTIVATE, MACAPK_PAUSE_WHEN_HIDDEN, MACAPK_INSTALL_LOCK_HELD, MACAPK_INJECT_FILE, MACAPK_DEBUG_HOSTKEY_FILE, MACAPK_RECORD_INPUT, MACAPK_EXTERNAL_URLS, MACAPK_SYSTEM_APPS_DIR, MACAPK_USER_APPS_DIR) are unset by Control Panel startup only; Dock stub or direct CLI launched from a dirty shell inherits them.",
+      "followup_card": "GATE-002"
+    },
+    {
+      "id": "GAP-GATE-004",
+      "severity": "medium",
+      "title": "PresentedSdk.java retains stale revert comments contradicting active MACAPK_SDK_FROM_TARGET=ON code",
+      "gates": [
+        "MACAPK_SDK_FROM_TARGET"
+      ],
+      "affected_entries": [
+        "direct_runtime_cli",
+        "launcher_control_panel",
+        "app_stub_dock",
+        "system_broker_spawn"
+      ],
+      "evidence": [
+        "runtime/java/com/macapk/loader/PresentedSdk.java:94-96",
+        "runtime/java/com/macapk/loader/PresentedSdk.java:205",
+        "runtime/java/com/macapk/loader/PresentedSdk.java:241-270"
+      ],
+      "impact": "Active code at :205 enables per-app targetSdk clamping whenever != \"0\" (default ON), while block comments at :94-96 and :241-270 claim it was reverted to opt-in (=\"1\").",
+      "followup_card": "GATE-002"
+    },
+    {
+      "id": "GAP-GATE-005",
+      "severity": "low",
+      "title": "MACAPK_EXPERIMENTAL_ALPHA_PROBE uses ==\"1\" in Java vs presence (!=null) in native C++/ObjC",
+      "gates": [
+        "MACAPK_EXPERIMENTAL_ALPHA_PROBE"
+      ],
+      "affected_entries": [
+        "direct_runtime_cli",
+        "launcher_control_panel",
+        "app_stub_dock"
+      ],
+      "evidence": [
+        "runtime/java/android/view/SurfaceView.java:4253",
+        "runtime/java/android/view/SurfaceView.java:4379",
+        "runtime/translator/src/bionic_shim.cpp:38052",
+        "runtime/src/cocoa_bridge.mm:9229",
+        "runtime/src/cocoa_bridge.mm:9884"
+      ],
+      "impact": "Setting MACAPK_EXPERIMENTAL_ALPHA_PROBE=0 disables the Java probe in SurfaceView.java but still activates native alpha probing in bionic_shim.cpp and cocoa_bridge.mm.",
+      "followup_card": "GATE-002"
+    }
+  ],
+  "followup_cards": [
+    {
+      "id": "GATE-002",
+      "path": "docs/tasks/GATE-002.md",
+      "title": "GATE-002：统一启动入口开关默认与实验门升级条件",
+      "status": "DONE",
+      "summary": "Resolve GAP-GATE-001..005 by defining gpu_pixel/performance promotion thresholds for the 4 MACAPK_EXPERIMENTAL_* gates, aligning direct CLI / broker dev spawns with Launcher/Stub defaults, and cleaning stale comments/docs."
+    }
+  ],
+  "gates": [
+    {
+      "id": "GATE-EXP-001",
+      "name": "MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS",
+      "domain": "experimental",
+      "kind": "experimental",
+      "type": "boolean_01",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "C++ static const bool inside macapk_keyed_native_windows_enabled(); cached on first call for process lifetime.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 36788,
+          "symbol": "macapk_keyed_native_windows_enabled",
+          "expression": "!e || std::strcmp(e, \"0\") != 0"
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4612,
+          "symbol": "LauncherModel.launch",
+          "expression": "env[\"MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS\"] = \"1\""
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4851,
+          "symbol": "LauncherModel.openInstalledApp",
+          "expression": "env[\"MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS\"] = \"1\""
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 1123,
+          "symbol": "AppStubMain.main",
+          "expression": "setenv(\"MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS\", \"1\", 1) when nil"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 opt-out)",
+        "launcher_control_panel": "1 (ON; overridable by defaultEnv/app.env)",
+        "app_stub_dock": "1 (ON; overridable by row.env)",
+        "system_broker_spawn": "1 (ON via runtime default / installed stub; overridable)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA",
+        "MACAPK_EGL14_NATIVE_WINDOW"
+      ],
+      "capability_ids": [
+        "SURF-002",
+        "NAT-005"
+      ],
+      "test_ids": [
+        "SurfaceMetalLayerAlphaTest",
+        "SurfaceZOrderRequestTest",
+        "native_window_lifetime_test"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Promote to runtime default ON (opt-out =0) and drop EXPERIMENTAL prefix only after gpu_pixel multi-SurfaceView composition & leak gate pass in GATE-002."
+    },
+    {
+      "id": "GATE-EXP-002",
+      "name": "MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE",
+      "domain": "experimental",
+      "kind": "experimental",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read via std::getenv on each macapk_native_stream_create() invocation.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 64526,
+          "symbol": "macapk_native_stream_create",
+          "expression": "(enabled && std::strcmp(enabled, \"0\") == 0) || !win"
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4613,
+          "symbol": "LauncherModel.launch",
+          "expression": "env[\"MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE\"] = \"1\""
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4852,
+          "symbol": "LauncherModel.openInstalledApp",
+          "expression": "env[\"MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE\"] = \"1\""
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 1124,
+          "symbol": "AppStubMain.main",
+          "expression": "setenv(\"MACAPK_EXPERIMENTAL_NATIVE_SURFACETEXTURE\", \"1\", 1) when nil"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 opt-out)",
+        "launcher_control_panel": "1 (ON; overridable by defaultEnv/app.env)",
+        "app_stub_dock": "1 (ON; overridable by row.env)",
+        "system_broker_spawn": "1 (ON via runtime default / installed stub; overridable)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_EGL14_NATIVE_WINDOW"
+      ],
+      "capability_ids": [
+        "SURF-001",
+        "NAT-005"
+      ],
+      "test_ids": [
+        "SurfaceTextureRoutingTest",
+        "SurfaceVideoTargetIsolationTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Promote to runtime default ON (opt-out =0) after gpu_pixel NDK SurfaceTexture create/swap/resize/destroy parity passes in GATE-002."
+    },
+    {
+      "id": "GATE-EXP-003",
+      "name": "MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA",
+      "domain": "experimental",
+      "kind": "experimental",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read via std::getenv when creating each keyed CAMetalLayer in CocoaEnsureKeyedNativeEglLayer; latched onto the created layer class.",
+      "read_locations": [
+        {
+          "file": "runtime/src/cocoa_bridge.mm",
+          "line": 8961,
+          "symbol": "CocoaEnsureKeyedNativeEglLayer",
+          "expression": "(!preserveAlpha || std::strcmp(preserveAlpha, \"0\") != 0)"
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4614,
+          "symbol": "LauncherModel.launch",
+          "expression": "env[\"MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA\"] = \"1\""
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4853,
+          "symbol": "LauncherModel.openInstalledApp",
+          "expression": "env[\"MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA\"] = \"1\""
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 1125,
+          "symbol": "AppStubMain.main",
+          "expression": "setenv(\"MACAPK_EXPERIMENTAL_PRESERVE_SURFACE_ALPHA\", \"1\", 1) when nil"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 opt-out)",
+        "launcher_control_panel": "1 (ON; overridable by defaultEnv/app.env)",
+        "app_stub_dock": "1 (ON; overridable by row.env)",
+        "system_broker_spawn": "1 (ON via runtime default / installed stub; overridable)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS"
+      ],
+      "capability_ids": [
+        "SURF-002"
+      ],
+      "test_ids": [
+        "SurfaceMetalLayerAlphaTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Promote to runtime default ON alongside NATIVE_SURFACE_LAYERS once gpu_pixel alpha-compositing pixel tests pass in GATE-002."
+    },
+    {
+      "id": "GATE-EXP-004",
+      "name": "MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE",
+      "domain": "experimental",
+      "kind": "experimental",
+      "type": "boolean_01",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "C++ static const bool inside macapk_native_choreo_pipe_wake_enabled(); cached on first call.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 67735,
+          "symbol": "macapk_native_choreo_pipe_wake_enabled",
+          "expression": "!e || std::strcmp(e, \"0\") != 0"
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4615,
+          "symbol": "LauncherModel.launch",
+          "expression": "env[\"MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE\"] = \"1\""
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4854,
+          "symbol": "LauncherModel.openInstalledApp",
+          "expression": "env[\"MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE\"] = \"1\""
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 1126,
+          "symbol": "AppStubMain.main",
+          "expression": "setenv(\"MACAPK_EXPERIMENTAL_CHOREO_PIPE_WAKE\", \"1\", 1) when nil"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 opt-out)",
+        "launcher_control_panel": "1 (ON; overridable by defaultEnv/app.env)",
+        "app_stub_dock": "1 (ON; overridable by row.env)",
+        "system_broker_spawn": "1 (ON via runtime default / installed stub; overridable)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_CHOREO_VSYNC_THREADS"
+      ],
+      "capability_ids": [
+        "SCHED-001",
+        "NAT-002"
+      ],
+      "test_ids": [
+        "OwnerFrameBarrierTest"
+      ],
+      "owner": "scheduling_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Promote to runtime default ON (opt-out =0) after NDK ALooper fd wake cadence and idle power overhead are verified within PERF-001/OBS-001 budget."
+    },
+    {
+      "id": "GATE-EXP-005",
+      "name": "MACAPK_EXPERIMENTAL_ALPHA_PROBE",
+      "domain": "experimental",
+      "kind": "diagnostic",
+      "type": "boolean_presence",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read per SurfaceView update/alpha query and per Cocoa surface geometry tick (all checks require ==\"1\").",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/view/SurfaceView.java",
+          "line": 4253,
+          "symbol": "SurfaceView.macapkPublishNativeSurfaceState",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_EXPERIMENTAL_ALPHA_PROBE\"))"
+        },
+        {
+          "file": "runtime/java/android/view/SurfaceView.java",
+          "line": 4379,
+          "symbol": "SurfaceView.macapkUpdateOverlayAlpha",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_EXPERIMENTAL_ALPHA_PROBE\"))"
+        },
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 38052,
+          "symbol": "macapk_egl_swap_alpha_probe",
+          "expression": "alphaProbe && std::strcmp(alphaProbe, \"1\") == 0"
+        },
+        {
+          "file": "runtime/src/cocoa_bridge.mm",
+          "line": 9242,
+          "symbol": "MacapkApplySurfaceLayerGeometry",
+          "expression": "alphaProbe && std::strcmp(alphaProbe, \"1\") == 0"
+        },
+        {
+          "file": "runtime/src/cocoa_bridge.mm",
+          "line": 9919,
+          "symbol": "CocoaPresentSurfaceLayerProbe",
+          "expression": "alphaCoverageProbe && std::strcmp(alphaCoverageProbe, \"1\") == 0"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "SURF-002"
+      ],
+      "test_ids": [
+        "SurfaceMetalLayerAlphaTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Diagnostic only; align native checks to ==\"1\" (GAP-GATE-005) and retire once Surface alpha tracing moves to bounded OBS-001 diagnostics."
+    },
+    {
+      "id": "GATE-EXP-006",
+      "name": "MACAPK_EXPERIMENTAL_SURFACE_Z_BUMP",
+      "domain": "experimental",
+      "kind": "diagnostic",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read per frame in MacapkApplySurfaceLayerGeometry(); lifts every per-surface layer above canvas overlay when ==\"1\".",
+      "read_locations": [
+        {
+          "file": "runtime/src/cocoa_bridge.mm",
+          "line": 9221,
+          "symbol": "MacapkApplySurfaceLayerGeometry",
+          "expression": "std::getenv(\"MACAPK_EXPERIMENTAL_SURFACE_Z_BUMP\") == \"1\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS"
+      ],
+      "capability_ids": [
+        "SURF-002"
+      ],
+      "test_ids": [
+        "SurfaceZOrderRequestTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Diagnostic A/B only; never promote to default; remove once SURFACE-003 Z-order transaction contract lands."
+    },
+    {
+      "id": "GATE-EXP-007",
+      "name": "MACAPK_EXPERIMENTAL_SURFACE_BELOW_VIDEO",
+      "domain": "experimental",
+      "kind": "diagnostic",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read per frame in MacapkApplySurfaceLayerGeometry(); forces keyed CAMetalLayers to zPosition=0.20 when ==\"1\".",
+      "read_locations": [
+        {
+          "file": "runtime/src/cocoa_bridge.mm",
+          "line": 9228,
+          "symbol": "MacapkApplySurfaceLayerGeometry",
+          "expression": "std::getenv(\"MACAPK_EXPERIMENTAL_SURFACE_BELOW_VIDEO\") == \"1\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_EXPERIMENTAL_NATIVE_SURFACE_LAYERS"
+      ],
+      "capability_ids": [
+        "SURF-002"
+      ],
+      "test_ids": [
+        "SurfaceZOrderRequestTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Diagnostic A/B only; never promote to default; remove once SURFACE-003 Z-order transaction contract lands."
+    },
+    {
+      "id": "GATE-SDK-001",
+      "name": "MACAPK_SDK_FROM_TARGET",
+      "domain": "sdk_abi",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Read once in PresentedSdk.<clinit> before Build.VERSION.SDK_INT is finalized; process-constant.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/PresentedSdk.java",
+          "line": 202,
+          "symbol": "PresentedSdk.<clinit>",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_SDK_FROM_TARGET\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; clamps targetSdk to [29, CEILING]; falls back to 29 if MACAPK_APK_PATH missing)",
+        "launcher_control_panel": "inherited/unset -> 1 (ON)",
+        "app_stub_dock": "inherited/unset -> 1 (ON)",
+        "system_broker_spawn": "inherited/unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SDK_INT",
+        "MACAPK_SDK_CEILING",
+        "MACAPK_APK_PATH"
+      ],
+      "capability_ids": [
+        "LIFE-004"
+      ],
+      "test_ids": [
+        "FG-SDK-001_default_no_apk",
+        "FG-SDK-002_from_target_clamped",
+        "FG-SDK-005_from_target_optout"
+      ],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Already default ON; fix stale revert comments (GAP-GATE-004) and keep =0 kill switch until API 35..36 edge-to-edge/WindowInsets parity passes fleet regression."
+    },
+    {
+      "id": "GATE-SDK-002",
+      "name": "MACAPK_SDK_INT",
+      "domain": "sdk_abi",
+      "kind": "compat_opt_out",
+      "type": "integer",
+      "read_timing": "init_static",
+      "read_timing_detail": "Read once in PresentedSdk.<clinit>; overrides MACAPK_SDK_FROM_TARGET and CEILING when in [1, 10000] (capped at MAX_KNOWN_SDK=37).",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/PresentedSdk.java",
+          "line": 170,
+          "symbol": "PresentedSdk.<clinit>",
+          "expression": "System.getenv(\"MACAPK_SDK_INT\") parsed in [1, 10000], min(v, 37)"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (defers to MACAPK_SDK_FROM_TARGET or DEFAULT_SDK=29)",
+        "launcher_control_panel": "unset (overridable via Settings/Get Info)",
+        "app_stub_dock": "unset (overridable via row.env)",
+        "system_broker_spawn": "unset"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SDK_FROM_TARGET"
+      ],
+      "capability_ids": [
+        "LIFE-004"
+      ],
+      "test_ids": [
+        "FG-SDK-006_explicit_sdk_int_wins",
+        "FG-SDK-007_sdk_int_above_max_known",
+        "FG-SDK-008_sdk_int_invalid_fallback"
+      ],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "API 1..37 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Permanent diagnostic/compat override; retain for A/B bisect and per-app overrides."
+    },
+    {
+      "id": "GATE-SDK-003",
+      "name": "MACAPK_SDK_CEILING",
+      "domain": "sdk_abi",
+      "kind": "compat_opt_out",
+      "type": "integer",
+      "read_timing": "init_static",
+      "read_timing_detail": "Read once in PresentedSdk.ceilingFromEnv(36) during PresentedSdk.<clinit>; clamped to [29, 37].",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/PresentedSdk.java",
+          "line": 134,
+          "symbol": "PresentedSdk.ceilingFromEnv",
+          "expression": "System.getenv(\"MACAPK_SDK_CEILING\") clamped to [29, 37], default 36"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "36 (when unset)",
+        "launcher_control_panel": "unset -> 36",
+        "app_stub_dock": "unset -> 36",
+        "system_broker_spawn": "unset -> 36"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SDK_FROM_TARGET"
+      ],
+      "capability_ids": [
+        "LIFE-004"
+      ],
+      "test_ids": [
+        "FG-SDK-003_ceiling_clamp_34",
+        "FG-SDK-004_ceiling_raise_37"
+      ],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "API 29..37 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retain while raising target ceiling to 37 (Android 17 preview); retire once Android 17 release constants finalize."
+    },
+    {
+      "id": "GATE-SDK-004",
+      "name": "MACAPK_APK_PATH",
+      "domain": "sdk_abi",
+      "kind": "behavioral",
+      "type": "path",
+      "read_timing": "init_static",
+      "read_timing_detail": "Set by macapk-runtime main() before JVM launch; read in PresentedSdk.<clinit> and ManifestBackFlags.",
+      "read_locations": [
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 429,
+          "symbol": "ParseArgs",
+          "expression": "setenv(\"MACAPK_APK_PATH\", a.apk.c_str(), 1)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/PresentedSdk.java",
+          "line": 416,
+          "symbol": "PresentedSdk.readTargetSdk",
+          "expression": "System.getenv(\"MACAPK_APK_PATH\")"
+        },
+        {
+          "file": "runtime/java/android/window/ManifestBackFlags.java",
+          "line": 64,
+          "symbol": "ManifestBackFlags.fromEnv",
+          "expression": "forPath(System.getenv(\"MACAPK_APK_PATH\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "<cli.apk> (exported by macapk-runtime)",
+        "launcher_control_panel": "<cli.apk> via macapk-runtime",
+        "app_stub_dock": "<cli.apk> via macapk-runtime",
+        "system_broker_spawn": "<pr.apkPath> via macapk-runtime or stub"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SDK_FROM_TARGET"
+      ],
+      "capability_ids": [
+        "LIFE-004",
+        "LIFE-001"
+      ],
+      "test_ids": [
+        "FG-SDK-001_default_no_apk",
+        "FG-SDK-002_from_target_clamped",
+        "FG-CLI-001_peek_manifest"
+      ],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Internal runtime contract; required for PresentedSdk.<clinit> before Boot parses manifest."
+    },
+    {
+      "id": "GATE-SDK-005",
+      "name": "MACAPK_FORCE_ABI",
+      "domain": "sdk_abi",
+      "kind": "compat_opt_out",
+      "type": "enum",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Set by macapk-runtime --force-abi or Launcher dev toggle; read by apk_unpacker.cpp, main.cpp, InstalledSplits.java, AppClassLoader.java.",
+      "read_locations": [
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 510,
+          "symbol": "ParseArgs",
+          "expression": "setenv(\"MACAPK_FORCE_ABI\", argv[++i], 1)"
+        },
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 1026,
+          "symbol": "SetupAndroidRoot",
+          "expression": "std::getenv(\"MACAPK_FORCE_ABI\")"
+        },
+        {
+          "file": "runtime/src/apk_unpacker.cpp",
+          "line": 1453,
+          "symbol": "UnpackApk",
+          "expression": "std::getenv(\"MACAPK_FORCE_ABI\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/InstalledSplits.java",
+          "line": 188,
+          "symbol": "InstalledSplits.nativeLibDir",
+          "expression": "System.getenv(\"MACAPK_FORCE_ABI\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/AppClassLoader.java",
+          "line": 2627,
+          "symbol": "AppClassLoader.forcedAbi",
+          "expression": "System.getenv(\"MACAPK_FORCE_ABI\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (prefers arm64-v8a, falls back to armeabi-v7a/armeabi)",
+        "launcher_control_panel": "armeabi-v7a when devMenuRevealed && forceArm32, else unset",
+        "app_stub_dock": "unset (overridable via row.env)",
+        "system_broker_spawn": "unset"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "NAT-001",
+        "NAT-003",
+        "RES-002"
+      ],
+      "test_ids": [
+        "GuestReturnAliasTest",
+        "guest_jit_canary_test"
+      ],
+      "owner": "native_abi_team",
+      "applicable_versions": "arm64-v8a / armeabi-v7a / armeabi",
+      "promotion_or_sunset_criteria": "Permanent diagnostic/per-app ABI pin (also exposed in Launcher dev menu and --force-abi)."
+    },
+    {
+      "id": "GATE-SDK-006",
+      "name": "MACAPK_BUILD_JAVA_ID",
+      "domain": "sdk_abi",
+      "kind": "behavioral",
+      "type": "string",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Exported by macapk-runtime main() from embedded build ID; read by MacApkDexConverter for DEX cache stamping.",
+      "read_locations": [
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 2380,
+          "symbol": "main",
+          "expression": "setenv(\"MACAPK_BUILD_JAVA_ID\", id.java_id.c_str(), 1)"
+        },
+        {
+          "file": "runtime/java/dalvik/system/MacApkDexConverter.java",
+          "line": 246,
+          "symbol": "MacApkDexConverter.convert",
+          "expression": "System.getenv(\"MACAPK_BUILD_JAVA_ID\")"
+        },
+        {
+          "file": "runtime/java/dalvik/system/MacApkDexConverter.java",
+          "line": 500,
+          "symbol": "MacApkDexConverter.stampMatches",
+          "expression": "javaId12(System.getenv(\"MACAPK_BUILD_JAVA_ID\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "<embedded JAVA_ID>",
+        "launcher_control_panel": "<embedded JAVA_ID> via macapk-runtime",
+        "app_stub_dock": "<embedded JAVA_ID> via macapk-runtime",
+        "system_broker_spawn": "<embedded JAVA_ID> when spawned via macapk-runtime/stub"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "RES-004"
+      ],
+      "test_ids": [],
+      "owner": "runtime_core_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Internal build-identity stamp; prevents stale converted-DEX reuse across builds."
+    },
+    {
+      "id": "GATE-SDK-007",
+      "name": "MACAPK_BUILD_NATIVE_ID",
+      "domain": "sdk_abi",
+      "kind": "behavioral",
+      "type": "string",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Exported by macapk-runtime main(); read by apk_unpacker.cpp and AppClassLoader.java to invalidate stale translated dylibs.",
+      "read_locations": [
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 2382,
+          "symbol": "main",
+          "expression": "setenv(\"MACAPK_BUILD_NATIVE_ID\", id.native_id.c_str(), 1)"
+        },
+        {
+          "file": "runtime/src/apk_unpacker.cpp",
+          "line": 2782,
+          "symbol": "StampNativeId",
+          "expression": "std::getenv(\"MACAPK_BUILD_NATIVE_ID\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/AppClassLoader.java",
+          "line": 2731,
+          "symbol": "AppClassLoader.nativeIdMatches",
+          "expression": "System.getenv(\"MACAPK_BUILD_NATIVE_ID\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/AppClassLoader.java",
+          "line": 2756,
+          "symbol": "AppClassLoader.writeNativeIdStamp",
+          "expression": "System.getenv(\"MACAPK_BUILD_NATIVE_ID\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "<embedded NATIVE_ID>",
+        "launcher_control_panel": "<embedded NATIVE_ID> via macapk-runtime",
+        "app_stub_dock": "<embedded NATIVE_ID> via macapk-runtime",
+        "system_broker_spawn": "<embedded NATIVE_ID> when spawned via macapk-runtime/stub"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "NAT-001",
+        "NAT-002"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Internal build-identity stamp; prevents warm sweeps from running stale translated dylibs."
+    },
+    {
+      "id": "GATE-SURF-001",
+      "name": "MACAPK_AOSP_SURFACE_ORDER",
+      "domain": "surface_video_choreo",
+      "kind": "experimental",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final boolean in SurfaceView.<clinit> and ActivityHost.<clinit>; process-constant.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/view/SurfaceView.java",
+          "line": 286,
+          "symbol": "SurfaceView.sAospSurfaceOrder",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_AOSP_SURFACE_ORDER\"))"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/ActivityHost.java",
+          "line": 3426,
+          "symbol": "ActivityHost.sAospSurfaceOrder",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_AOSP_SURFACE_ORDER\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset)",
+        "launcher_control_panel": "unset -> 0 (OFF)",
+        "app_stub_dock": "unset -> 0 (OFF)",
+        "system_broker_spawn": "unset -> 0 (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "SURF-002",
+        "LIFE-001"
+      ],
+      "test_ids": [
+        "FG-SURF-001_aosp_surface_order",
+        "SurfaceZOrderRequestTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Default OFF until AGDK/Smash Hit/MC protected sweep passes with =1 under SURFACE-001/003."
+    },
+    {
+      "id": "GATE-SURF-002",
+      "name": "MACAPK_PRESENT_FASTPATH",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final LIVE_ARGB in Bitmap.<clinit>; also read in cocoa_bridge.mm and native_methods.cpp present paths.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/graphics/Bitmap.java",
+          "line": 2181,
+          "symbol": "Bitmap.LIVE_ARGB",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_PRESENT_FASTPATH\"))"
+        },
+        {
+          "file": "runtime/src/cocoa_bridge.mm",
+          "line": 7741,
+          "symbol": "CocoaPresentNeonOrFastpath",
+          "expression": "std::getenv(\"MACAPK_PRESENT_FASTPATH\") != \"0\""
+        },
+        {
+          "file": "runtime/src/native_methods.cpp",
+          "line": 669,
+          "symbol": "PresentFastpathGate",
+          "expression": "std::getenv(\"MACAPK_PRESENT_FASTPATH\") != \"0\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_PRESENT_LIVE_ARRAY"
+      ],
+      "capability_ids": [
+        "SURF-001",
+        "SURF-003"
+      ],
+      "test_ids": [
+        "FG-SURF-002_present_fastpath",
+        "WindowDamageLifecycleTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retain =0 bisect switch until GPU-001 copy/blit contract stabilizes without pixel regressions."
+    },
+    {
+      "id": "GATE-SURF-003",
+      "name": "MACAPK_PRESENT_LIVE_ARRAY",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final LIVE_ARGB in Bitmap.<clinit> combined with MACAPK_PRESENT_FASTPATH.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/graphics/Bitmap.java",
+          "line": 2182,
+          "symbol": "Bitmap.LIVE_ARGB",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_PRESENT_LIVE_ARRAY\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_PRESENT_FASTPATH"
+      ],
+      "capability_ids": [
+        "SURF-001"
+      ],
+      "test_ids": [
+        "FG-SURF-002_present_fastpath"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retain alongside MACAPK_PRESENT_FASTPATH for copy-vs-live-array bisect."
+    },
+    {
+      "id": "GATE-SURF-004",
+      "name": "MACAPK_EGL14_NATIVE_WINDOW",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "C++ static const bool inside macapk_egl14_native_window_on(); also checked per call in macapk_native_stream_create().",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 38009,
+          "symbol": "macapk_egl14_native_window_on",
+          "expression": "!(e && e[0] == '0' && e[1] == '\\0')"
+        },
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 64530,
+          "symbol": "macapk_native_stream_create",
+          "expression": "std::getenv(\"MACAPK_EGL14_NATIVE_WINDOW\") != \"0\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_EGL14_SURFACEVIEW_WINDOW"
+      ],
+      "capability_ids": [
+        "NAT-005",
+        "SURF-004"
+      ],
+      "test_ids": [
+        "native_window_lifetime_test"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retain =0 bisect gate until SURFACE-001..003 unify native EGL14 surface lifetime."
+    },
+    {
+      "id": "GATE-SURF-005",
+      "name": "MACAPK_EGL14_SURFACEVIEW_WINDOW",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final boolean in MacApkGlWindow.<clinit>.",
+      "read_locations": [
+        {
+          "file": "runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java",
+          "line": 589,
+          "symbol": "MacApkGlWindow.<clinit>",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_EGL14_SURFACEVIEW_WINDOW\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_EGL14_NATIVE_WINDOW"
+      ],
+      "capability_ids": [
+        "SURF-004",
+        "SURF-002"
+      ],
+      "test_ids": [
+        "SurfaceTextureRoutingTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retain =0 bisect switch until survivor EGL14 SurfaceView path passes gpu_pixel tests."
+    },
+    {
+      "id": "GATE-SURF-006",
+      "name": "MACAPK_CHOREO_VSYNC_THREADS",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final boolean Choreographer.VSYNC_THREADS read once at class init.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/view/Choreographer.java",
+          "line": 222,
+          "symbol": "Choreographer.VSYNC_THREADS",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_CHOREO_VSYNC_THREADS\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_CHOREO_NANOTIME_BASE"
+      ],
+      "capability_ids": [
+        "SCHED-001"
+      ],
+      "test_ids": [
+        "FG-SCHED-001_choreo_gates",
+        "OwnerFrameBarrierTest"
+      ],
+      "owner": "scheduling_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retire legacy =0 timer fallback after SCHED-001 multi-display vsync cadence stabilizes."
+    },
+    {
+      "id": "GATE-SURF-007",
+      "name": "MACAPK_CHOREO_NANOTIME_BASE",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final Choreographer.NANOTIME_BASE plus C++ static const flags in bionic_shim.cpp and cocoa_bridge.mm.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/view/Choreographer.java",
+          "line": 234,
+          "symbol": "Choreographer.NANOTIME_BASE",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_CHOREO_NANOTIME_BASE\"))"
+        },
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 29844,
+          "symbol": "swappy_offset_rewrite",
+          "expression": "std::getenv(\"MACAPK_CHOREO_NANOTIME_BASE\")"
+        },
+        {
+          "file": "runtime/src/cocoa_bridge.mm",
+          "line": 197,
+          "symbol": "CocoaChoreoNanotimeBase",
+          "expression": "std::getenv(\"MACAPK_CHOREO_NANOTIME_BASE\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 restores rebasedNanos)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_CHOREO_VSYNC_THREADS"
+      ],
+      "capability_ids": [
+        "SCHED-001"
+      ],
+      "test_ids": [
+        "FG-SCHED-001_choreo_gates",
+        "OwnerFrameBarrierTest"
+      ],
+      "owner": "scheduling_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retire =0 rebasedNanos fallback after SCHED-001 confirms frame timestamp parity across Unity/Compose."
+    },
+    {
+      "id": "GATE-SURF-008",
+      "name": "MACAPK_PRESENT_CAP",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "integer",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "C++ static PresentPacer and present_pacing_enabled() static const forced; valid K in [1, 3], default 2.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 37287,
+          "symbol": "PresentPacer::PresentPacer",
+          "expression": "std::getenv(\"MACAPK_PRESENT_CAP\") clamped to [1, 3], default 2"
+        },
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 37350,
+          "symbol": "present_pacing_enabled",
+          "expression": "std::getenv(\"MACAPK_PRESENT_CAP\") != nullptr -> forced=1"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (K=2 when decouple active without ring backpressure; stands down when ring backpressure active)",
+        "launcher_control_panel": "unset",
+        "app_stub_dock": "unset",
+        "system_broker_spawn": "unset"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_NO_PRESENT_CAP",
+        "MACAPK_PRESENT_CAP_TIMEOUT_MS",
+        "MACAPK_PRESENT_CAP_WITH_RING"
+      ],
+      "capability_ids": [
+        "SCHED-001",
+        "SURF-001"
+      ],
+      "test_ids": [
+        "shared_gl_frames_test",
+        "idle_present_policy_test"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retire PresentPacer substitute once SURFACE-002 bounded BufferQueue backpressure handles all Vulkan/Metal swap paths."
+    },
+    {
+      "id": "GATE-SURF-009",
+      "name": "MACAPK_NO_PRESENT_CAP",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "boolean_presence",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "C++ static const forced=-1 inside present_pacing_enabled().",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 37349,
+          "symbol": "present_pacing_enabled",
+          "expression": "std::getenv(\"MACAPK_NO_PRESENT_CAP\") != nullptr -> forced=-1"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (OFF)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_PRESENT_CAP"
+      ],
+      "capability_ids": [
+        "SCHED-001"
+      ],
+      "test_ids": [
+        "idle_present_policy_test"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Escape hatch paired with PresentPacer; sunset when PresentPacer is removed."
+    },
+    {
+      "id": "GATE-SURF-010",
+      "name": "MACAPK_PRESENT_CAP_TIMEOUT_MS",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "integer",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "Read once in PresentPacer constructor; clamped to [1, 1000], default 34 ms.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 37292,
+          "symbol": "PresentPacer::PresentPacer",
+          "expression": "std::getenv(\"MACAPK_PRESENT_CAP_TIMEOUT_MS\") clamped to [1, 1000], default 34"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "34 (ms)",
+        "launcher_control_panel": "unset -> 34",
+        "app_stub_dock": "unset -> 34",
+        "system_broker_spawn": "unset -> 34"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_PRESENT_CAP"
+      ],
+      "capability_ids": [
+        "SCHED-001"
+      ],
+      "test_ids": [
+        "idle_present_policy_test"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Diagnostic tuning knob paired with PresentPacer; sunset when PresentPacer is retired."
+    },
+    {
+      "id": "GATE-SURF-011",
+      "name": "MACAPK_PRESENT_CAP_WITH_RING",
+      "domain": "surface_video_choreo",
+      "kind": "diagnostic",
+      "type": "boolean_presence",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "C++ static const bool inside present_pacing_enabled() when decouple ring is active.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 37385,
+          "symbol": "present_pacing_enabled",
+          "expression": "std::getenv(\"MACAPK_PRESENT_CAP_WITH_RING\") != nullptr"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (OFF; avoids double-wait with decouple ring)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_PRESENT_CAP"
+      ],
+      "capability_ids": [
+        "SCHED-001"
+      ],
+      "test_ids": [],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Diagnostic A/B only; sunset when PresentPacer is retired."
+    },
+    {
+      "id": "GATE-SURF-012",
+      "name": "MACAPK_ANGLE_BACKEND",
+      "domain": "surface_video_choreo",
+      "kind": "behavioral",
+      "type": "enum",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Read in main.cpp before ANGLE initialization (else auto-detects GLES 3.1 -> vulkan, else metal), and cached once in bionic_shim.cpp.",
+      "read_locations": [
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 2535,
+          "symbol": "main",
+          "expression": "std::getenv(\"MACAPK_ANGLE_BACKEND\") == \"vulkan\" | \"metal\""
+        },
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 39719,
+          "symbol": "macapk_angle_backend",
+          "expression": "std::getenv(\"MACAPK_ANGLE_BACKEND\") == \"vulkan\" ? 1 : 0"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (auto: vulkan if ApkNeedsGles31Cached, else metal)",
+        "launcher_control_panel": "unset (auto)",
+        "app_stub_dock": "unset (auto)",
+        "system_broker_spawn": "unset (auto)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "SURF-004"
+      ],
+      "test_ids": [
+        "FG-CLI-002_gles_scan",
+        "egl_iosurface_probe"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "GLES 2.0/3.0 (metal) & 3.1 (vulkan via MoltenVK)",
+      "promotion_or_sunset_criteria": "Permanent backend selector; keep explicit override for GLES 3.0 vs 3.1/MoltenVK bisect."
+    },
+    {
+      "id": "GATE-SURF-013",
+      "name": "MACAPK_AWT_MAIN_INIT",
+      "domain": "surface_video_choreo",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Checked once during Boot.initAwtOnAppKitMainThread() on the AppKit main thread before macapk-activity starts.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/Boot.java",
+          "line": 458,
+          "symbol": "Boot.initAwtOnAppKitMainThread",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_AWT_MAIN_INIT\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 restores lazy init)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_BOOTSPEED_OVERLAP"
+      ],
+      "capability_ids": [
+        "LIFE-002",
+        "SCHED-001"
+      ],
+      "test_ids": [],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "JDK 21 / 25 macOS AppKit",
+      "promotion_or_sunset_criteria": "Retain =0 A/B switch while tracking AWT/AppKit startup overlap in Boot."
+    },
+    {
+      "id": "GATE-SURF-014",
+      "name": "MACAPK_VIDEO_FRAME_TRACE",
+      "domain": "surface_video_choreo",
+      "kind": "diagnostic",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Checked in SurfaceTexture frame trace helper when ==\"1\".",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/graphics/SurfaceTexture.java",
+          "line": 1186,
+          "symbol": "SurfaceTexture.traceVideoFrame",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_VIDEO_FRAME_TRACE\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "MED-001",
+        "SURF-001"
+      ],
+      "test_ids": [
+        "VideoPixelsTest"
+      ],
+      "owner": "media_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Pure diagnostic trace; keep default OFF; integrate bounded sampling in OBS-001."
+    },
+    {
+      "id": "GATE-SURF-015",
+      "name": "MACAPK_VIDEO_PRESENT_TRACE",
+      "domain": "surface_video_choreo",
+      "kind": "diagnostic",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final MediaCodec.PRESENT_TRACE read once at class init.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/media/MediaCodec.java",
+          "line": 1491,
+          "symbol": "MediaCodec.PRESENT_TRACE",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_VIDEO_PRESENT_TRACE\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "MED-001"
+      ],
+      "test_ids": [
+        "MediaCodecDequeueTest"
+      ],
+      "owner": "media_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Pure diagnostic trace; keep default OFF."
+    },
+    {
+      "id": "GATE-SURF-016",
+      "name": "MACAPK_TRACE_SURFACE_DISPATCH",
+      "domain": "surface_video_choreo",
+      "kind": "diagnostic",
+      "type": "boolean_presence",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final in SurfaceView.<clinit>.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/view/SurfaceView.java",
+          "line": 301,
+          "symbol": "SurfaceView.sTraceDispatch",
+          "expression": "System.getenv(\"MACAPK_TRACE_SURFACE_DISPATCH\") != null"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "SURF-002"
+      ],
+      "test_ids": [
+        "SurfaceZOrderRequestTest"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Pure diagnostic trace; keep default OFF."
+    },
+    {
+      "id": "GATE-CACHE-001",
+      "name": "MACAPK_FWVIEW_DISK_CACHE",
+      "domain": "cache_aot_fwview",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read via macapkFwViewDiskCacheEnabled() on ResourceIndex framework view build.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/ResourceIndex.java",
+          "line": 1393,
+          "symbol": "ResourceIndex.macapkFwViewDiskCacheEnabled",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_FWVIEW_DISK_CACHE\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables disk replay)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_FWVIEW_DISK_CACHE_VERIFY",
+        "MACAPK_FW_RES_APK"
+      ],
+      "capability_ids": [
+        "RES-001",
+        "RES-004"
+      ],
+      "test_ids": [
+        "ResourceIndexCacheKeyTest"
+      ],
+      "owner": "resources_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Keep =0 bypass switch until CACHE-001 evaluates cache invalidation & corruption resilience."
+    },
+    {
+      "id": "GATE-CACHE-002",
+      "name": "MACAPK_FWVIEW_DISK_CACHE_VERIFY",
+      "domain": "cache_aot_fwview",
+      "kind": "diagnostic",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read in macapkBuildFwView() to write, replay, and compare every entry.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/ResourceIndex.java",
+          "line": 1413,
+          "symbol": "ResourceIndex.macapkBuildFwView",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_FWVIEW_DISK_CACHE_VERIFY\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_FWVIEW_DISK_CACHE"
+      ],
+      "capability_ids": [
+        "RES-001"
+      ],
+      "test_ids": [
+        "ResourceIndexCacheKeyTest"
+      ],
+      "owner": "resources_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Test-only verification mode; never enable in production."
+    },
+    {
+      "id": "GATE-CACHE-003",
+      "name": "MACAPK_LAZY_DEX",
+      "domain": "cache_aot_fwview",
+      "kind": "experimental",
+      "type": "boolean_01",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Read in apk_unpacker.cpp during unpack and cached lazily once per AppClassLoader in lazySource().",
+      "read_locations": [
+        {
+          "file": "runtime/src/apk_unpacker.cpp",
+          "line": 1437,
+          "symbol": "UnpackApk",
+          "expression": "std::getenv(\"MACAPK_LAZY_DEX\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/AppClassLoader.java",
+          "line": 696,
+          "symbol": "AppClassLoader.lazySource",
+          "expression": "on != null && !on.isEmpty() && !on.equals(\"0\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF when unset; automatic fallback only when eager classes.jar is absent)",
+        "launcher_control_panel": "unset -> 0 (OFF)",
+        "app_stub_dock": "unset -> 0 (ON fallback if classes.jar missing)",
+        "system_broker_spawn": "unset -> 0 (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_DEXFILE_DEFINE_IN_LOADER"
+      ],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "InnerClassAccessTest"
+      ],
+      "owner": "dex2jvm_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Evaluate cold-launch vs classload jitter in CACHE-001 before considering default flip."
+    },
+    {
+      "id": "GATE-CACHE-004",
+      "name": "MACAPK_DEXFILE_DEFINE_IN_LOADER",
+      "domain": "cache_aot_fwview",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final boolean DEFINE_IN_LOADER in dalvik.system.DexFile.<clinit>.",
+      "read_locations": [
+        {
+          "file": "runtime/java/dalvik/system/DexFile.java",
+          "line": 172,
+          "symbol": "DexFile.DEFINE_IN_LOADER",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_DEXFILE_DEFINE_IN_LOADER\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 restores legacy path)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_LAZY_DEX"
+      ],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "FG-CACHE-001_dexfile_define_in_loader"
+      ],
+      "owner": "dex2jvm_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retain =0 fallback while DexFile dynamic classloader paths are audited."
+    },
+    {
+      "id": "GATE-CACHE-005",
+      "name": "MACAPK_FW_XML_CACHE",
+      "domain": "cache_aot_fwview",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final boolean Resources.MACAPK_FW_XML_CACHE read once at Resources.<clinit>.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/content/res/Resources.java",
+          "line": 5428,
+          "symbol": "Resources.MACAPK_FW_XML_CACHE",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_FW_XML_CACHE\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 re-parses framework XML each read)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_FW_RES_APK"
+      ],
+      "capability_ids": [
+        "RES-001",
+        "RES-003"
+      ],
+      "test_ids": [
+        "FG-CACHE-002_fw_xml_cache",
+        "TypedArrayVisibilityTest"
+      ],
+      "owner": "resources_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retire =0 opt-out once CACHE-001 verifies XML parser state isolation."
+    },
+    {
+      "id": "GATE-CACHE-006",
+      "name": "MACAPK_FW_RES_APK",
+      "domain": "cache_aot_fwview",
+      "kind": "behavioral",
+      "type": "path",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Set by macapk-runtime main() (overwrite=0) to tools/framework-res.apk; read by Boot, ResourceIndex, AssetManager.",
+      "read_locations": [
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 2509,
+          "symbol": "main",
+          "expression": "setenv(\"MACAPK_FW_RES_APK\", fwres.string().c_str(), 0)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/Boot.java",
+          "line": 4733,
+          "symbol": "Boot.macapkPrefetchFrameworkTable",
+          "expression": "System.getenv(\"MACAPK_FW_RES_APK\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/ResourceIndex.java",
+          "line": 900,
+          "symbol": "ResourceIndex.macapkFrameworkApkFile",
+          "expression": "System.getenv(\"MACAPK_FW_RES_APK\")"
+        },
+        {
+          "file": "runtime/java/android/content/res/AssetManager.java",
+          "line": 215,
+          "symbol": "AssetManager.frameworkApkFile",
+          "expression": "System.getenv(\"MACAPK_FW_RES_APK\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "<bin_dir>/tools/framework-res.apk (API 36)",
+        "launcher_control_panel": "<bin_dir>/tools/framework-res.apk",
+        "app_stub_dock": "<bin_dir>/tools/framework-res.apk",
+        "system_broker_spawn": "<bin_dir>/tools/framework-res.apk"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "RES-004",
+        "RES-002"
+      ],
+      "test_ids": [
+        "UpstreamResourceAliasTest"
+      ],
+      "owner": "resources_team",
+      "applicable_versions": "API 36 (android-16.0.0_r2)",
+      "promotion_or_sunset_criteria": "Permanent path override; allows tests to pin alternate framework-res APK."
+    },
+    {
+      "id": "GATE-CACHE-007",
+      "name": "MACAPK_ANGLE_BLOB_CACHE",
+      "domain": "cache_aot_fwview",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "Read once per EGLDisplay in InstallBlobCache(EGLDisplay).",
+      "read_locations": [
+        {
+          "file": "runtime/src/angle_glue.cpp",
+          "line": 336,
+          "symbol": "InstallBlobCache",
+          "expression": "std::getenv(\"MACAPK_ANGLE_BLOB_CACHE\") == \"0\" disables"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_ANGLE_BACKEND"
+      ],
+      "capability_ids": [
+        "SURF-004"
+      ],
+      "test_ids": [
+        "egl_iosurface_probe"
+      ],
+      "owner": "graphics_surface_team",
+      "applicable_versions": "ANGLE Metal/Vulkan (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retain =0 escape hatch for shader-cache corruption diagnosis."
+    },
+    {
+      "id": "GATE-CACHE-008",
+      "name": "MACAPK_CANARY_CACHE",
+      "domain": "cache_aot_fwview",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read per ARM64 translator canary plan lookup in arm64_native.cpp.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/arm64_native.cpp",
+          "line": 11928,
+          "symbol": "arm64_canary_cache",
+          "expression": "std::getenv(\"MACAPK_CANARY_CACHE\") != \"0\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "NAT-001",
+        "NAT-003"
+      ],
+      "test_ids": [
+        "guest_jit_canary_test"
+      ],
+      "owner": "native_abi_team",
+      "applicable_versions": "ARM64 guest translator",
+      "promotion_or_sunset_criteria": "Retain =0 bypass for translator plan invalidation debugging."
+    },
+    {
+      "id": "GATE-CACHE-009",
+      "name": "MACAPK_X18_CACHE",
+      "domain": "cache_aot_fwview",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read per ARM64 x18 rewrite plan lookup in arm64_native.cpp.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/arm64_native.cpp",
+          "line": 8478,
+          "symbol": "arm64_x18_cache",
+          "expression": "!(std::getenv(\"MACAPK_X18_CACHE\") && std::getenv(\"MACAPK_X18_CACHE\")[0] == '0')"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_X18_EXEC_ONLY"
+      ],
+      "capability_ids": [
+        "NAT-001"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "ARM64 guest translator",
+      "promotion_or_sunset_criteria": "Retain =0 bypass paired with MACAPK_X18_CALL_ARGS bisect."
+    },
+    {
+      "id": "GATE-CACHE-010",
+      "name": "MACAPK_FIRSTLAUNCH_DECODE_CACHE",
+      "domain": "cache_aot_fwview",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read in arm32_lifter.cpp dc_acquire() during ARM32 translation.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/arm32_lifter.cpp",
+          "line": 898,
+          "symbol": "dc_acquire",
+          "expression": "std::getenv(\"MACAPK_FIRSTLAUNCH_DECODE_CACHE\") != \"0\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_FORCE_ABI"
+      ],
+      "capability_ids": [
+        "NAT-003"
+      ],
+      "test_ids": [
+        "GuestReturnAliasTest"
+      ],
+      "owner": "native_abi_team",
+      "applicable_versions": "ARM32 guest lifter",
+      "promotion_or_sunset_criteria": "Retain =0 escape hatch for ARM32 lifter decode cache regression bisect."
+    },
+    {
+      "id": "GATE-SYS-001",
+      "name": "MACAPK_PROCESS_SPLIT",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "Read via SystemClient.splitOff() and latched once in SystemClient.splitConfigured() (sSplitConfigured); also forwarded by SystemServer.launch().",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/SystemClient.java",
+          "line": 120,
+          "symbol": "SystemClient.splitOff",
+          "expression": "\"0\".equals(System.getenv(\"MACAPK_PROCESS_SPLIT\"))"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 409,
+          "symbol": "SystemServer.launch",
+          "expression": "System.getenv(\"MACAPK_PROCESS_SPLIT\") forwarded to child env"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 collapses package to single process)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "forwarded if set, else unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_BROKER",
+        "MACAPK_PROCESS_NAME"
+      ],
+      "capability_ids": [
+        "IPC-003"
+      ],
+      "test_ids": [
+        "ProcessBrokerRoutingTest",
+        "ProcessBrokerRoutingTest_optout",
+        "FG-SYS-004_process_split"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Keep =0 opt-out for single-process isolation bisect until IPC-001 multi-process contract completes."
+    },
+    {
+      "id": "GATE-SYS-002",
+      "name": "MACAPK_BROKER",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read via SystemClient.enabled() and latched into sSplitConfigured on splitConfigured(); forced to 1 on SystemServer-spawned service hosts.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/SystemClient.java",
+          "line": 92,
+          "symbol": "SystemClient.enabled",
+          "expression": "System.getenv(\"MACAPK_BROKER\") == \"1\" or auto when GMS/multi-process"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemClient.java",
+          "line": 183,
+          "symbol": "SystemClient.systemName",
+          "expression": "System.getenv(\"MACAPK_BROKER\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 400,
+          "symbol": "SystemServer.launch",
+          "expression": "env.put(\"MACAPK_BROKER\", \"1\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (auto: ON if use-google-gms exists or multi-process manifest & split on)",
+        "launcher_control_panel": "unset (auto)",
+        "app_stub_dock": "unset (auto)",
+        "system_broker_spawn": "1 (forced on spawned service hosts)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_PROCESS_SPLIT",
+        "MACAPK_SYSTEM_NAME"
+      ],
+      "capability_ids": [
+        "IPC-003"
+      ],
+      "test_ids": [
+        "BrokerServiceStartupTest",
+        "ProcessBrokerRoutingTest",
+        "ProcessBrokerRoutingTest_optout"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Permanent diagnostic/auto-routing override."
+    },
+    {
+      "id": "GATE-SYS-003",
+      "name": "MACAPK_SERVICE_HOST",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Set to 1 by SystemServer.launch() for spawned service hosts; read at JVM startup (jvm_loader.cpp), Cocoa init (cocoa_bridge.mm), stub, and SystemClient.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 399,
+          "symbol": "SystemServer.launch",
+          "expression": "env.put(\"MACAPK_SERVICE_HOST\", \"1\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemClient.java",
+          "line": 114,
+          "symbol": "SystemClient.isServiceHost",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_SERVICE_HOST\"))"
+        },
+        {
+          "file": "runtime/src/jvm_loader.cpp",
+          "line": 658,
+          "symbol": "CreateJvm",
+          "expression": "std::getenv(\"MACAPK_SERVICE_HOST\") == \"1\" adds -XX:TieredStopAtLevel=1"
+        },
+        {
+          "file": "runtime/src/cocoa_bridge.mm",
+          "line": 89,
+          "symbol": "IsServiceHost",
+          "expression": "std::getenv(\"MACAPK_SERVICE_HOST\")"
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 1244,
+          "symbol": "AppStubMain.main",
+          "expression": "ProcessInfo.processInfo.environment[\"MACAPK_SERVICE_HOST\"] == nil"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (0; foreground app)",
+        "launcher_control_panel": "unset (0)",
+        "app_stub_dock": "unset (0)",
+        "system_broker_spawn": "1 (forced on spawned service hosts)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SERVICE_HOST_JIT",
+        "MACAPK_BROKER"
+      ],
+      "capability_ids": [
+        "IPC-003",
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "RemoteServiceProcessTest"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Internal process-role contract set by SystemServer; keep headless C1-JIT & hidden-window semantics."
+    },
+    {
+      "id": "GATE-SYS-004",
+      "name": "MACAPK_PROCESS_NAME",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "string",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Set by SystemServer.launch() when split() is active; read once during Boot process naming.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 408,
+          "symbol": "SystemServer.launch",
+          "expression": "if (split()) env.put(\"MACAPK_PROCESS_NAME\", proc)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/Boot.java",
+          "line": 1439,
+          "symbol": "Boot.run",
+          "expression": "chooseProcessName(manifest, System.getenv(\"MACAPK_PROCESS_NAME\"))"
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 930,
+          "symbol": "AppStubMain.main",
+          "expression": "ProcessInfo.processInfo.environment[\"MACAPK_PROCESS_NAME\"]"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (uses manifest defaultProcessName or packageName)",
+        "launcher_control_panel": "unset",
+        "app_stub_dock": "unset",
+        "system_broker_spawn": "<proc> when split(), else removed"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_PROCESS_SPLIT"
+      ],
+      "capability_ids": [
+        "IPC-003",
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "ProcessBrokerRoutingTest"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Internal AMS startProcessLocked process-name contract."
+    },
+    {
+      "id": "GATE-SYS-005",
+      "name": "MACAPK_SECONDARY_PROCESS",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Set to 1 by SystemServer.launch() when proc != mainProcess; checked at AppStubMain startup.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 413,
+          "symbol": "SystemServer.launch",
+          "expression": "if (!proc.equals(mainProcessOf(pr))) env.put(\"MACAPK_SECONDARY_PROCESS\", \"1\")"
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 863,
+          "symbol": "AppStubMain.main",
+          "expression": "ProcessInfo.processInfo.environment[\"MACAPK_SECONDARY_PROCESS\"] == \"1\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (0)",
+        "launcher_control_panel": "unset (0)",
+        "app_stub_dock": "unset (0)",
+        "system_broker_spawn": "1 when proc != mainProcessOf(pr), else unset"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_PROCESS_SPLIT",
+        "MACAPK_PROCESS_NAME"
+      ],
+      "capability_ids": [
+        "IPC-003"
+      ],
+      "test_ids": [
+        "RemoteServiceProcessTest"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Internal stub deduplication guard for multi-process bundles."
+    },
+    {
+      "id": "GATE-SYS-006",
+      "name": "MACAPK_SYSTEM_NAME",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "string",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Read at SystemServer.main() and SystemClient.systemName(); set by SystemBrokerMain.c for --app-processes and forwarded by SystemServer.launch().",
+      "read_locations": [
+        {
+          "file": "launcher/SystemBrokerMain.c",
+          "line": 32,
+          "symbol": "main",
+          "expression": "setenv(\"MACAPK_SYSTEM_NAME\", \"org.macapk.processes\", 1) for --app-processes"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 1272,
+          "symbol": "SystemServer.main",
+          "expression": "System.getenv(\"MACAPK_SYSTEM_NAME\") (default org.macapk.system)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 401,
+          "symbol": "SystemServer.launch",
+          "expression": "env.put(\"MACAPK_SYSTEM_NAME\", sName)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemClient.java",
+          "line": 179,
+          "symbol": "SystemClient.systemName",
+          "expression": "System.getenv(\"MACAPK_SYSTEM_NAME\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "org.macapk.system (or org.macapk.processes for non-GMS multi-process)",
+        "launcher_control_panel": "org.macapk.system / org.macapk.processes",
+        "app_stub_dock": "org.macapk.system / org.macapk.processes",
+        "system_broker_spawn": "org.macapk.processes (--app-processes) or org.macapk.system"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_BROKER"
+      ],
+      "capability_ids": [
+        "IPC-003"
+      ],
+      "test_ids": [
+        "ProcessBrokerRoutingTest",
+        "ProcessBrokerLaunchAgentTest"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "macOS Mach bootstrap (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Permanent Mach rendezvous endpoint selector."
+    },
+    {
+      "id": "GATE-SYS-007",
+      "name": "MACAPK_BROKER_APP_PROCESSES_ONLY",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Set to 1 by macapk-system --app-processes; checked in SystemServer.addInstalledPackages().",
+      "read_locations": [
+        {
+          "file": "launcher/SystemBrokerMain.c",
+          "line": 33,
+          "symbol": "main",
+          "expression": "setenv(\"MACAPK_BROKER_APP_PROCESSES_ONLY\", \"1\", 1)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 348,
+          "symbol": "SystemServer.addInstalledPackages",
+          "expression": "\"1\".equals(System.getenv(\"MACAPK_BROKER_APP_PROCESSES_ONLY\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (0)",
+        "launcher_control_panel": "unset (0)",
+        "app_stub_dock": "unset (0)",
+        "system_broker_spawn": "1 when --app-processes, else unset (0)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SYSTEM_NAME"
+      ],
+      "capability_ids": [
+        "IPC-003"
+      ],
+      "test_ids": [
+        "ProcessBrokerLaunchAgentTest"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Permanent boundary isolating non-GMS multi-process apps from GMS system apps."
+    },
+    {
+      "id": "GATE-SYS-008",
+      "name": "MACAPK_BROKER_BOOT_SYSTEM",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Set to 0 by macapk-system --app-processes; checked once in SystemServer.bootSystemServices().",
+      "read_locations": [
+        {
+          "file": "launcher/SystemBrokerMain.c",
+          "line": 34,
+          "symbol": "main",
+          "expression": "setenv(\"MACAPK_BROKER_BOOT_SYSTEM\", \"0\", 1)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 908,
+          "symbol": "SystemServer.bootSystemServices",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_BROKER_BOOT_SYSTEM\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset)",
+        "launcher_control_panel": "unset",
+        "app_stub_dock": "unset",
+        "system_broker_spawn": "0 when --app-processes, else 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_BROKER_APP_PROCESSES_ONLY"
+      ],
+      "capability_ids": [
+        "IPC-003"
+      ],
+      "test_ids": [
+        "BrokerServiceStartupTest"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Permanent opt-out for process-only broker and offline broker tests."
+    },
+    {
+      "id": "GATE-SYS-009",
+      "name": "MACAPK_BROKER_IDLE_EXIT",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "boolean_01",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Read once in SystemServer.main() via BrokerIdle.enabled(product).",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/BrokerIdle.java",
+          "line": 26,
+          "symbol": "BrokerIdle.enabled",
+          "expression": "System.getenv(\"MACAPK_BROKER_IDLE_EXIT\") == \"1\" else product"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (ON for product mode, OFF when MACAPK_BROKER_APKS is set)",
+        "launcher_control_panel": "unset",
+        "app_stub_dock": "unset",
+        "system_broker_spawn": "product -> 1 (ON); MACAPK_BROKER_APKS -> 0 (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "IPC-003"
+      ],
+      "test_ids": [
+        "BrokerServiceStartupTest"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Keep =0/1 override for idle-exit testing and 24/7 debug sessions."
+    },
+    {
+      "id": "GATE-SYS-010",
+      "name": "MACAPK_BROKER_TRIGGER_CHECKIN",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Checked when GMS attaches to SystemServer in sendBootBroadcasts().",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 790,
+          "symbol": "SystemServer.sendBootBroadcasts",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_BROKER_TRIGGER_CHECKIN\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "IPC-003"
+      ],
+      "test_ids": [],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "GMS checkin (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Temporary nudge; retire once nts scheduler executes scheduled GMS tasks natively."
+    },
+    {
+      "id": "GATE-SYS-011",
+      "name": "MACAPK_AWAIT_SYSTEM_READY",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "path",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Set by AppStubMain.swift for Play when MACAPK_PLAY_OVERLAP != 0; polled once in Boot.awaitSystemReady() before Application.onCreate.",
+      "read_locations": [
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 1440,
+          "symbol": "AppStubMain.waitForSystemBroker",
+          "expression": "setenv(\"MACAPK_AWAIT_SYSTEM_READY\", StaleBackground.readyFile.path, 1)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/Boot.java",
+          "line": 881,
+          "symbol": "Boot.awaitSystemReady",
+          "expression": "System.getenv(\"MACAPK_AWAIT_SYSTEM_READY\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (no wait)",
+        "launcher_control_panel": "unset (Play stub sets on open)",
+        "app_stub_dock": "readyFile.path for Play when MACAPK_PLAY_OVERLAP != 0",
+        "system_broker_spawn": "unset"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_BROKER_BOOT_SYSTEM"
+      ],
+      "capability_ids": [
+        "IPC-003",
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "BrokerServiceStartupTest"
+      ],
+      "owner": "ipc_broker_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Internal readiness synchronization between stub/broker/Boot."
+    },
+    {
+      "id": "GATE-SYS-012",
+      "name": "MACAPK_SVC_BIND_ASYNC",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java public static final boolean ServiceRegistry.BIND_ASYNC read once at class init.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/app/ServiceRegistry.java",
+          "line": 202,
+          "symbol": "ServiceRegistry.BIND_ASYNC",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_SVC_BIND_ASYNC\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 restores inline bind)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002",
+        "IPC-002"
+      ],
+      "test_ids": [
+        "FG-SYS-001_service_registry_gates",
+        "RemoteBindCompletionTest"
+      ],
+      "owner": "lifecycle_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retire =0 fallback once IPC-001/SERVICE lifecycle contracts cover Hilt/media3 bind ordering."
+    },
+    {
+      "id": "GATE-SYS-013",
+      "name": "MACAPK_SVC_STOP_ASYNC",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final boolean ServiceRegistry.STOP_ASYNC read once at class init.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/app/ServiceRegistry.java",
+          "line": 105,
+          "symbol": "ServiceRegistry.STOP_ASYNC",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_SVC_STOP_ASYNC\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 restores synchronous onDestroy)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "FG-SYS-001_service_registry_gates"
+      ],
+      "owner": "lifecycle_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retire =0 fallback after Service STOP_SERVICE ordering contract tests land."
+    },
+    {
+      "id": "GATE-SYS-014",
+      "name": "MACAPK_SVC_REENTRY_DEFER",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final boolean ServiceRegistry.REENTRY_DEFER read once at class init.",
+      "read_locations": [
+        {
+          "file": "runtime/java/android/app/ServiceRegistry.java",
+          "line": 189,
+          "symbol": "ServiceRegistry.REENTRY_DEFER",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_SVC_REENTRY_DEFER\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 restores inline re-entry)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "FG-SYS-001_service_registry_gates"
+      ],
+      "owner": "lifecycle_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retire =0 fallback after Service re-entry contract tests land."
+    },
+    {
+      "id": "GATE-SYS-015",
+      "name": "MACAPK_LOG_LEVEL",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "diagnostic",
+      "type": "integer",
+      "read_timing": "init_static",
+      "read_timing_detail": "Read once in NativeLog.<clinit> (default 0), android.util.Log.<clinit> (default INFO=4), and native_methods.cpp macapk_log_min_level() (static const int, default 0).",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/NativeLog.java",
+          "line": 35,
+          "symbol": "NativeLog.readMinLevel",
+          "expression": "Integer.parseInt(System.getenv(\"MACAPK_LOG_LEVEL\")) else 0"
+        },
+        {
+          "file": "runtime/java/android/util/Log.java",
+          "line": 111,
+          "symbol": "Log.readMinLevel",
+          "expression": "Integer.parseInt(System.getenv(\"MACAPK_LOG_LEVEL\")) else INFO(4)"
+        },
+        {
+          "file": "runtime/src/native_methods.cpp",
+          "line": 79,
+          "symbol": "macapk_log_min_level",
+          "expression": "std::atoi(std::getenv(\"MACAPK_LOG_LEVEL\")) else 0"
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4565,
+          "symbol": "LauncherModel.launch",
+          "expression": "env[\"MACAPK_LOG_LEVEL\"] = \"4\" when !verboseLogging"
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 1108,
+          "symbol": "AppStubMain.main",
+          "expression": "setenv(\"MACAPK_LOG_LEVEL\", \"4\", 1) when nil"
+        },
+        {
+          "file": "launcher/SystemBrokerMain.c",
+          "line": 59,
+          "symbol": "main",
+          "expression": "setenv(\"MACAPK_LOG_LEVEL\", \"7\", 1)"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/SystemServer.java",
+          "line": 395,
+          "symbol": "SystemServer.launch",
+          "expression": "env.remove(\"MACAPK_LOG_LEVEL\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (NativeLog/native floor 0 = emit all; android.util.Log.isLoggable floor 4 = INFO)",
+        "launcher_control_panel": "4 (when !verboseLogging; unset when verboseLogging; overridable)",
+        "app_stub_dock": "4 (when nil; overridable by row.env)",
+        "system_broker_spawn": "7 in broker itself; stripped before child spawn (stub sets 4, direct runtime leaves unset)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_QUIET_CLASSLOAD"
+      ],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "FG-LOG-001_unset_defaults",
+        "FG-LOG-002_level_4_info",
+        "FG-LOG-003_level_7_silent",
+        "FG-LOG-004_level_2_verbose",
+        "FG-LOG-005_invalid_fallback"
+      ],
+      "owner": "runtime_core_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Diagnostic severity filter; align comments and SystemServer dev-spawn defaults in GATE-002."
+    },
+    {
+      "id": "GATE-SYS-016",
+      "name": "MACAPK_QUIET_CLASSLOAD",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "diagnostic",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final AppClassLoader.QUIET_CLASSLOAD read once at class init.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/AppClassLoader.java",
+          "line": 94,
+          "symbol": "AppClassLoader.QUIET_CLASSLOAD",
+          "expression": "!NativeLog.isLoggable(INFO) || \"1\".equals(System.getenv(\"MACAPK_QUIET_CLASSLOAD\"))"
+        },
+        {
+          "file": "launcher/MacApkLauncherApp.swift",
+          "line": 4583,
+          "symbol": "LauncherModel.launch",
+          "expression": "env[\"MACAPK_QUIET_CLASSLOAD\"] = \"1\" when !verboseLogging"
+        },
+        {
+          "file": "launcher/AppStubMain.swift",
+          "line": 1111,
+          "symbol": "AppStubMain.main",
+          "expression": "setenv(\"MACAPK_QUIET_CLASSLOAD\", \"1\", 1) when nil"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (unless MACAPK_LOG_LEVEL >= 5)",
+        "launcher_control_panel": "1 (when !verboseLogging)",
+        "app_stub_dock": "1 (when nil)",
+        "system_broker_spawn": "1 via installed stub; 0 via MACAPK_BROKER_RUNTIME"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_LOG_LEVEL"
+      ],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "runtime_core_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Diagnostic call-site suppression; evaluate defaulting to quiet=1 in runtime or aligning dev spawns in GATE-002."
+    },
+    {
+      "id": "GATE-SYS-017",
+      "name": "MACAPK_JDK",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "behavioral",
+      "type": "enum",
+      "read_timing": "build_time",
+      "read_timing_detail": "Build-time JDK selector (21 default | 25) read by build scripts; jvm_loader.cpp reads at init only to warn on mismatch.",
+      "read_locations": [
+        {
+          "file": "runtime/scripts/build.sh",
+          "line": 46,
+          "symbol": "build.sh",
+          "expression": "MACAPK_JDK selects JDK 21 or 25"
+        },
+        {
+          "file": "runtime/src/jvm_loader.cpp",
+          "line": 273,
+          "symbol": "ApplyJdkSelectionAndAotCache",
+          "expression": "std::getenv(\"MACAPK_JDK\")"
+        },
+        {
+          "file": "scripts/build_dist.sh",
+          "line": 54,
+          "symbol": "build_dist.sh",
+          "expression": "macapk_jdk_home / macapk_jdk_selected"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "21 (built-in linked JDK; MACAPK_JDK unset)",
+        "launcher_control_panel": "unset (uses bundled JDK)",
+        "app_stub_dock": "unset (uses bundled JDK)",
+        "system_broker_spawn": "unset (uses bundled JDK)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "build_infra_team",
+      "applicable_versions": "JDK 21 | JDK 25",
+      "promotion_or_sunset_criteria": "Build-time selector; do not switch default JDK without separate upgrade decision."
+    },
+    {
+      "id": "GATE-SYS-018",
+      "name": "MACAPK_JVM_OPTS",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "diagnostic",
+      "type": "string_list",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Read once in jvm_loader.cpp before JNI_CreateJavaVM; appended after MACAPK_SERVICE_HOST_JIT options.",
+      "read_locations": [
+        {
+          "file": "runtime/src/jvm_loader.cpp",
+          "line": 668,
+          "symbol": "CreateJvm",
+          "expression": "std::getenv(\"MACAPK_JVM_OPTS\") space-split into JavaVMOption[]"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (no extra options)",
+        "launcher_control_panel": "unset (overridable via Settings/Get Info)",
+        "app_stub_dock": "unset (overridable via row.env)",
+        "system_broker_spawn": "unset"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SERVICE_HOST_JIT"
+      ],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "runtime_core_team",
+      "applicable_versions": "HotSpot JDK 21 / 25",
+      "promotion_or_sunset_criteria": "Permanent debugging/GC tuning escape hatch; GC policy changes go through GC-001."
+    },
+    {
+      "id": "GATE-SYS-019",
+      "name": "MACAPK_SERVICE_HOST_JIT",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "enum",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Read once in jvm_loader.cpp before JNI_CreateJavaVM when MACAPK_SERVICE_HOST=1.",
+      "read_locations": [
+        {
+          "file": "runtime/src/jvm_loader.cpp",
+          "line": 659,
+          "symbol": "CreateJvm",
+          "expression": "std::getenv(\"MACAPK_SERVICE_HOST_JIT\") != \"full\" -> -XX:TieredStopAtLevel=1"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (full JIT for foreground; C1-only when MACAPK_SERVICE_HOST=1)",
+        "launcher_control_panel": "unset",
+        "app_stub_dock": "unset",
+        "system_broker_spawn": "C1-only (-XX:TieredStopAtLevel=1) unless =full"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SERVICE_HOST",
+        "MACAPK_JVM_OPTS"
+      ],
+      "capability_ids": [
+        "IPC-003",
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "runtime_core_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Keep =full override for service-host CPU/JIT profiling in PERF-001/GC-001."
+    },
+    {
+      "id": "GATE-SYS-020",
+      "name": "MACAPK_BOOTSPEED_CLOCK",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "diagnostic",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final Boot.BOOTSPEED_CLOCK and C++ main.cpp boot clock helper.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/Boot.java",
+          "line": 130,
+          "symbol": "Boot.BOOTSPEED_CLOCK",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_BOOTSPEED_CLOCK\"))"
+        },
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 268,
+          "symbol": "BootClock",
+          "expression": "std::getenv(\"MACAPK_BOOTSPEED_CLOCK\") != \"0\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 silences boot clock)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "runtime_core_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Observational only; keep =0 opt-out."
+    },
+    {
+      "id": "GATE-SYS-021",
+      "name": "MACAPK_BOOTSPEED_ICON",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final Boot.BOOTSPEED_ICON read once at Boot.<clinit>.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/Boot.java",
+          "line": 178,
+          "symbol": "Boot.BOOTSPEED_ICON",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_BOOTSPEED_ICON\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 re-renders icon every launch)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "RES-002",
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Retain =0 fallback for icon cache invalidation bisect."
+    },
+    {
+      "id": "GATE-SYS-022",
+      "name": "MACAPK_BOOTSPEED_JARREAD",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final AppClassLoader.BOOTSPEED_JARREAD read once at class init.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/AppClassLoader.java",
+          "line": 332,
+          "symbol": "AppClassLoader.BOOTSPEED_JARREAD",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_BOOTSPEED_JARREAD\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Retire =0 fallback after CACHE-001 evaluates warm classloader startup."
+    },
+    {
+      "id": "GATE-SYS-023",
+      "name": "MACAPK_BOOTSPEED_OVERLAP",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final Boot.BOOTSPEED_OVERLAP read once at Boot.<clinit>.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/Boot.java",
+          "line": 165,
+          "symbol": "Boot.BOOTSPEED_OVERLAP",
+          "expression": "!\"0\".equals(System.getenv(\"MACAPK_BOOTSPEED_OVERLAP\"))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 serializes ResourceIndex after AWT init)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_AWT_MAIN_INIT"
+      ],
+      "capability_ids": [
+        "LIFE-002",
+        "RES-001"
+      ],
+      "test_ids": [],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Retain =0 fallback while AWT/AppKit pre-init thread allowlist is enforced."
+    },
+    {
+      "id": "GATE-SYS-024",
+      "name": "MACAPK_GMS_CHILD_FIRST",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final AppClassLoader.GMS_CHILD_FIRST read once at class init (shared with Boot.installAutoInitProviders).",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/loader/AppClassLoader.java",
+          "line": 130,
+          "symbol": "AppClassLoader.GMS_CHILD_FIRST",
+          "expression": "!(\"0\".equals(...) || \"false\".equalsIgnoreCase(...))"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0/false restores parent-first shadows)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "loader_sdk_team",
+      "applicable_versions": "API 29..36 (Mac.apk 1.0.2379)",
+      "promotion_or_sunset_criteria": "Retain =0/false bisect switch for GMS/Firebase/Play-Core classloader shadowing."
+    },
+    {
+      "id": "GATE-SYS-025",
+      "name": "MACAPK_ARENA_WX",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "experimental",
+      "type": "enum",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "Read once in bionic_shim.cpp guest arena protection init (0 = RW off, strict = fault without heal).",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 1005,
+          "symbol": "arena_wx_mode",
+          "expression": "std::getenv(\"MACAPK_ARENA_WX\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "0 (OFF; arena stays RW unless set)",
+        "launcher_control_panel": "unset (OFF)",
+        "app_stub_dock": "unset (OFF)",
+        "system_broker_spawn": "unset (OFF)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_JIT_WX_GUARD"
+      ],
+      "capability_ids": [
+        "NAT-002"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "Apple Silicon macOS Hardened Runtime",
+      "promotion_or_sunset_criteria": "Evaluate W^X overhead and compatibility in SEC-001/GC-001 before changing default."
+    },
+    {
+      "id": "GATE-SYS-026",
+      "name": "MACAPK_ARENA_PREFAULT",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read in arm64_native.cpp and bionic_shim.cpp during libunity guest arena setup.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/arm64_native.cpp",
+          "line": 6361,
+          "symbol": "arm64_arena_prefault",
+          "expression": "std::getenv(\"MACAPK_ARENA_PREFAULT\")"
+        },
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 57792,
+          "symbol": "bionic_arena_prefault",
+          "expression": "std::getenv(\"MACAPK_ARENA_PREFAULT\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON for libunity; =0 force-disables)",
+        "launcher_control_panel": "unset -> auto",
+        "app_stub_dock": "unset -> auto",
+        "system_broker_spawn": "unset -> auto"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "NAT-002"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "ARM64 guest translator",
+      "promotion_or_sunset_criteria": "Retain =0/1 override for guest memory/fault bisect."
+    },
+    {
+      "id": "GATE-SYS-027",
+      "name": "MACAPK_JIT_SERIALIZE",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "C++ static const bool inside bionic_shim.cpp.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 58972,
+          "symbol": "jit_serialize_enabled",
+          "expression": "!(std::getenv(\"MACAPK_JIT_SERIALIZE\") && e[0] == '0')"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_JIT_RWX_TO_RW",
+        "MACAPK_JIT_WX_GUARD"
+      ],
+      "capability_ids": [
+        "NAT-002"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "Apple Silicon macOS (MAP_JIT)",
+      "promotion_or_sunset_criteria": "Retain =0 bisect gate for guest JIT W^X serialization."
+    },
+    {
+      "id": "GATE-SYS-028",
+      "name": "MACAPK_JIT_RWX_TO_RW",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "first_call_cached",
+      "read_timing_detail": "C++ static const bool inside bionic_shim.cpp.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 59108,
+          "symbol": "jit_rwx_to_rw_disabled",
+          "expression": "std::getenv(\"MACAPK_JIT_RWX_TO_RW\") && e[0] == '0'"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_JIT_SERIALIZE"
+      ],
+      "capability_ids": [
+        "NAT-002"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "Apple Silicon macOS (MAP_JIT)",
+      "promotion_or_sunset_criteria": "Retain =0 bisect gate for guest RWX->RW mapping."
+    },
+    {
+      "id": "GATE-SYS-029",
+      "name": "MACAPK_JIT_WX_GUARD",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Read once during jit_wx_guard init in runtime/src/jit_wx_guard.cpp.",
+      "read_locations": [
+        {
+          "file": "runtime/src/jit_wx_guard.cpp",
+          "line": 135,
+          "symbol": "InitJitWxGuard",
+          "expression": "!EnvIs(\"MACAPK_JIT_WX_GUARD\", \"0\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "NAT-002"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "Apple Silicon macOS pthread_jit_write_protect",
+      "promotion_or_sunset_criteria": "Critical safety guard; keep =0 only for diagnostic isolation."
+    },
+    {
+      "id": "GATE-SYS-030",
+      "name": "MACAPK_SVC_BRK",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read in arm64_native.cpp svc->BRK rewrite pass and bionic_shim.cpp trap handler.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/arm64_native.cpp",
+          "line": 11360,
+          "symbol": "arm64_svc_brk_enabled",
+          "expression": "std::getenv(\"MACAPK_SVC_BRK\") != \"0\""
+        },
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 14874,
+          "symbol": "bionic_svc_brk_handler",
+          "expression": "const char* e = std::getenv(\"MACAPK_SVC_BRK\"); !e || e[0] != '0'"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 disables)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SVC_BRK_EXEC_ONLY"
+      ],
+      "capability_ids": [
+        "NAT-001",
+        "NAT-002"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "ARM64 guest translator",
+      "promotion_or_sunset_criteria": "Retain =0 bisect switch for inline Linux svc #0 trapping."
+    },
+    {
+      "id": "GATE-SYS-031",
+      "name": "MACAPK_SVC_BRK_EXEC_ONLY",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read in arm64_native.cpp to restrict svc->BRK rewrites to executable ELF sections.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/arm64_native.cpp",
+          "line": 11181,
+          "symbol": "arm64_svc_brk_exec_only",
+          "expression": "std::getenv(\"MACAPK_SVC_BRK_EXEC_ONLY\") != \"0\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 rewrites entire PF_X segment)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_SVC_BRK"
+      ],
+      "capability_ids": [
+        "NAT-001"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "ARM64 guest translator",
+      "promotion_or_sunset_criteria": "Retain =0 bisect switch for ELF section-table fallback."
+    },
+    {
+      "id": "GATE-SYS-032",
+      "name": "MACAPK_X18_EXEC_ONLY",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "runtime_per_call",
+      "read_timing_detail": "Read in arm64_native.cpp to restrict x18 rewrites to executable ELF sections.",
+      "read_locations": [
+        {
+          "file": "runtime/translator/src/arm64_native.cpp",
+          "line": 11211,
+          "symbol": "arm64_x18_exec_only",
+          "expression": "std::getenv(\"MACAPK_X18_EXEC_ONLY\") != \"0\""
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 rewrites entire PF_X segment)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [
+        "MACAPK_X18_CACHE"
+      ],
+      "capability_ids": [
+        "NAT-001"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "ARM64 guest translator",
+      "promotion_or_sunset_criteria": "Retain =0 bisect switch for ELF section-table fallback."
+    },
+    {
+      "id": "GATE-SYS-033",
+      "name": "MACAPK_PAIRIP_GATE_OFF",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_presence",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Checked in main.cpp, Boot.java, arm64_native.cpp, and bionic_shim.cpp; disables structural pairip protection gates when set.",
+      "read_locations": [
+        {
+          "file": "runtime/src/main.cpp",
+          "line": 2443,
+          "symbol": "main",
+          "expression": "!std::getenv(\"MACAPK_PAIRIP_GATE_OFF\")"
+        },
+        {
+          "file": "runtime/java/com/macapk/loader/Boot.java",
+          "line": 2254,
+          "symbol": "Boot.pairipInit",
+          "expression": "System.getenv(\"MACAPK_PAIRIP_GATE_OFF\") == null"
+        },
+        {
+          "file": "runtime/translator/src/arm64_native.cpp",
+          "line": 4612,
+          "symbol": "Image::apply_pairip_gate",
+          "expression": "std::getenv(\"MACAPK_PAIRIP_GATE_OFF\") != nullptr"
+        },
+        {
+          "file": "runtime/translator/src/bionic_shim.cpp",
+          "line": 63829,
+          "symbol": "pairip_gate_check",
+          "expression": "!std::getenv(\"MACAPK_PAIRIP_GATE_OFF\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (pairip gate ON)",
+        "launcher_control_panel": "unset (pairip gate ON)",
+        "app_stub_dock": "unset (pairip gate ON)",
+        "system_broker_spawn": "unset (pairip gate ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "NAT-001",
+        "NAT-002"
+      ],
+      "test_ids": [],
+      "owner": "native_abi_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Kill switch for pairip structural mitigation; keep for regression bisect."
+    },
+    {
+      "id": "GATE-DEX-001",
+      "name": "DEX2JVM_INNER_CLASS_PUBLIC",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "compat_opt_out",
+      "type": "boolean_01",
+      "read_timing": "init_static",
+      "read_timing_detail": "Java static final boolean DexConverter.INNER_CLASS_PUBLIC read once at converter JVM startup; propagated by MacApkDexConverter.java:405.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/dex/DexConverter.java",
+          "line": 1103,
+          "symbol": "DexConverter.INNER_CLASS_PUBLIC",
+          "expression": "!\"0\".equals(System.getenv(\"DEX2JVM_INNER_CLASS_PUBLIC\"))"
+        },
+        {
+          "file": "runtime/java/dalvik/system/MacApkDexConverter.java",
+          "line": 405,
+          "symbol": "MacApkDexConverter.appendEnvFingerprint",
+          "expression": "k.startsWith(\"DEX2JVM_\") && !k.equals(\"DEX2JVM_THREADS\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "1 (ON when unset; =0 preserves raw class_def access_flags)",
+        "launcher_control_panel": "unset -> 1 (ON)",
+        "app_stub_dock": "unset -> 1 (ON)",
+        "system_broker_spawn": "unset -> 1 (ON)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [
+        "InnerClassAccessTest",
+        "FG-DEX-001_inner_class_public"
+      ],
+      "owner": "dex2jvm_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Retire =0 fallback after end-to-end DEX->classfile Proxy.newProxyInstance() fixture (Handbook 8.11) lands in CI."
+    },
+    {
+      "id": "GATE-DEX-002",
+      "name": "DEX2JVM_THREADS",
+      "domain": "gc_jvm_broker_ipc_dex2jvm",
+      "kind": "diagnostic",
+      "type": "integer",
+      "read_timing": "init_launch",
+      "read_timing_detail": "Read once in Options parsing in converter JVM; deliberately excluded from MacApkDexConverter cache key.",
+      "read_locations": [
+        {
+          "file": "runtime/java/com/macapk/dex/Options.java",
+          "line": 89,
+          "symbol": "Options.parse",
+          "expression": "env \"DEX2JVM_THREADS\" / \"THREADS\""
+        },
+        {
+          "file": "runtime/java/dalvik/system/MacApkDexConverter.java",
+          "line": 405,
+          "symbol": "MacApkDexConverter.appendEnvFingerprint",
+          "expression": "!k.equals(\"DEX2JVM_THREADS\")"
+        }
+      ],
+      "defaults_by_entry": {
+        "runtime": "unset (auto CPU count)",
+        "launcher_control_panel": "unset (auto)",
+        "app_stub_dock": "unset (auto)",
+        "system_broker_spawn": "unset (auto)"
+      },
+      "entry_consistent": true,
+      "mismatch_ref": null,
+      "dependencies": [],
+      "capability_ids": [
+        "LIFE-002"
+      ],
+      "test_ids": [],
+      "owner": "dex2jvm_team",
+      "applicable_versions": "Mac.apk 1.0.2379",
+      "promotion_or_sunset_criteria": "Permanent worker-thread determinism/concurrency tuning knob."
+    }
+  ]
+}

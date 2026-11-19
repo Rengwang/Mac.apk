@@ -54,6 +54,7 @@
 #include <atomic>
 #include <capstone/capstone.h>  // generic x18 platform-register rewriter
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <utility>
 #include <cstdio>
@@ -6803,7 +6804,20 @@ void Image::apply_v8_flag_override() {
         set_flags = reinterpret_cast<set_flags_t>(
             lookup("_ZN2v82V818SetFlagsFromStringEPKcm"));
     }
-    if (!set_flags) return;   // not a V8-embedding image -> nothing to do
+    // Older V8/J2V8 releases take an int length, not size_t. They still
+    // require the same W^X policy; absence of the size_t overload does not
+    // mean that this image has no V8. Keep the function types distinct.
+    typedef void (*set_flags_int_t)(const char*, int);
+    set_flags_int_t set_flags_int = nullptr;
+    if (!set_flags) {
+        set_flags_int = reinterpret_cast<set_flags_int_t>(
+            lookup("_ZN2v88internal8FlagList18SetFlagsFromStringEPKci"));
+        if (!set_flags_int) {
+            set_flags_int = reinterpret_cast<set_flags_int_t>(
+                lookup("_ZN2v82V818SetFlagsFromStringEPKci"));
+        }
+    }
+    if (!set_flags && !set_flags_int) return;
 
     // Only fire once per process (the first V8-embedding image wins; there is one
     // V8 per process).
@@ -6838,8 +6852,18 @@ void Image::apply_v8_flag_override() {
 
     std::fprintf(stderr,
         "[v8-flags] %s: exports V8 SetFlagsFromString; applying \"%s\" "
-        "(setter=%p)\n", dbg_name_, flags, (void*)set_flags);
-    set_flags(flags, std::strlen(flags));
+        "(setter=%p)\n", dbg_name_, flags,
+        set_flags ? (void*)set_flags : (void*)set_flags_int);
+    if (set_flags) {
+        set_flags(flags, std::strlen(flags));
+    } else {
+        const size_t length = std::strlen(flags);
+        if (length > static_cast<size_t>(INT_MAX)) {
+            std::fprintf(stderr, "[v8-flags] flag string exceeds int length\n");
+            return;
+        }
+        set_flags_int(flags, static_cast<int>(length));
+    }
     std::fprintf(stderr, "[v8-flags] %s: applied\n", dbg_name_);
 }
 
@@ -7060,10 +7084,21 @@ static uint64_t macapk_dw_read(const uint8_t*& p, uint8_t enc,
 // libunwind's cache miss for any non-guest PC still falls back to dyld.
 // Escape hatch: MACAPK_NO_EH_REGISTER=1. Deregistered in ~Image.
 // See docs/arm64-cross-frame-eh-unwind_2026-06-21.md.
+static bool macapk_is_unwind_symbol(const char* name) {
+    if (!name) return false;
+    return std::strcmp(name, "_Unwind_RaiseException") == 0
+        || std::strcmp(name, "_Unwind_Resume") == 0
+        || std::strcmp(name, "__cxa_throw") == 0
+        || std::strcmp(name, "__gxx_personality_v0") == 0
+        || std::strcmp(name, "__cxa_begin_catch") == 0;
+}
+
 void Image::register_eh_frames() {
     if (std::getenv("MACAPK_NO_EH_REGISTER")) return;
     macapk_frame_fn reg = macapk_register_frame_fn();
     if (!reg) return;
+    const char* skipEnv = std::getenv("MACAPK_SKIP_NOEXCEPT_EH_FRAME");
+    const bool allowSkipNoexcept = !(skipEnv && std::strcmp(skipEnv, "0") == 0);
     for (const auto& ph : phdrs_) {
         if (ph.p_type != 0x6474e550u) continue;  // PT_GNU_EH_FRAME
         const uint8_t* ehf = base_ + ph.p_vaddr;
@@ -7076,6 +7111,57 @@ void Image::register_eh_frames() {
         (void)macapk_dw_read(p, ehptr_enc, ehf);            // eh_frame_ptr (skip)
         uint64_t fde_count = macapk_dw_read(p, fdecnt_enc, ehf);
         if (fde_count == 0 || fde_count > (1u << 24)) break;
+        if (allowSkipNoexcept && fde_count > 1024) {
+            bool hasUnwindImport = false;
+            bool checked = false;
+            if (symtab_ && strtab_ && strtab_size_ > 0) {
+                size_t symcount = 0;
+                if (gnu_hash_) symcount = gnu_hash_symbol_count();
+                else if (sysv_hash_) symcount = sysv_hash_[1];
+                if (symcount > 0) {
+                    checked = true;
+                    for (size_t i = 0; i < symcount; ++i) {
+                        const auto& sym = symtab_[i];
+                        if (sym.st_shndx != 0) continue;
+                        if (sym.st_name < strtab_size_
+                                && macapk_is_unwind_symbol(strtab_ + sym.st_name)) {
+                            hasUnwindImport = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hasUnwindImport && rela_ && rela_count_ > 0) {
+                    checked = true;
+                    for (size_t i = 0; i < rela_count_; ++i) {
+                        uint32_t si = static_cast<uint32_t>(reloc_sym(rela_[i].r_info));
+                        const auto& sym = symtab_[si];
+                        if (sym.st_shndx == 0 && sym.st_name < strtab_size_
+                                && macapk_is_unwind_symbol(strtab_ + sym.st_name)) {
+                            hasUnwindImport = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hasUnwindImport && pltrel_ && pltrel_count_ > 0) {
+                    checked = true;
+                    for (size_t i = 0; i < pltrel_count_; ++i) {
+                        uint32_t si = static_cast<uint32_t>(reloc_sym(pltrel_[i].r_info));
+                        const auto& sym = symtab_[si];
+                        if (sym.st_shndx == 0 && sym.st_name < strtab_size_
+                                && macapk_is_unwind_symbol(strtab_ + sym.st_name)) {
+                            hasUnwindImport = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (checked && !hasUnwindImport) {
+                std::fprintf(stderr,
+                    "[arm64-native] %s: skipped %llu .eh_frame FDE(s) (no unwind/exception imports)\n",
+                    dbg_name_, (unsigned long long)fde_count);
+                break;
+            }
+        }
         const uint64_t img_lo = reinterpret_cast<uint64_t>(base_);
         const uint64_t img_hi = img_lo + mapped_size_;
         size_t registered = 0;

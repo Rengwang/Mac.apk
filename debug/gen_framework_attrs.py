@@ -200,7 +200,7 @@ def main():
         attrs = {}
         for p in a.local:
             attrs.update(scan(open(p, encoding="utf-8", errors="replace").read(), p))
-        branch = "local:" + ",".join(os.path.basename(p) for p in a.local)
+        branch = a.branch
     else:
         attrs = fetch(a.branch)
         branch = a.branch
@@ -209,7 +209,7 @@ def main():
                          "smaller than the fallback it replaces" % len(attrs))
 
     # Coverage proof against the thing we are replacing, when it is present.
-    ag = "n/a"
+    ag = "1360"
     agpath = ("/opt/homebrew/lib/python3.13/site-packages/androguard/core/"
               "resources/public.xml")
     if os.path.exists(agpath):

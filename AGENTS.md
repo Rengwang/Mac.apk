@@ -3,16 +3,20 @@
 ## 入口与事实来源
 
 - 新会话先读 `PROJECT_STATE.md`、`docs/UPGRADE_PLAN.md` 和本次任务卡。
+- 升级决策看 `docs/ROADMAP.md`；AI 建议裁决看 `docs/AI_PROPOSALS_REVIEW_2026-11-14.md`。
+- 用户要求继续升级时，按 `docs/AUTONOMOUS_EXECUTION.md` 自行选取依赖满足的任务，逐卡验证、保存本地检查点后继续，不要求用户逐卡分派。
 - 架构、历史和已有兼容修复以 `docs/MACAPK_UPGRADE_HANDBOOK.md` 为入口；按任务阅读有关章节，不必每次通读全部资料。
 - 构建参考 `BUILDING.md` 和实际脚本；测试参考 `TESTING.md`；性能参考 `PERFORMANCE.md`。
 - 用户下载的研究报告是建议，不是已验证实现。事实冲突时检查当前源码、提交和运行证据。
 - 开工先核对 `pwd`、Git 根目录、分支、HEAD、工作区变更和其他 worktree。保留用户已有变更。
+- 技术实现前先在 GitHub 查找同类实现，优先复用或参考合适方案。切换 Agent 前按执行协议保存可复跑的进度、验证结果和下一步。
 
 ## 工作范围
 
 - 一次只实施一张任务卡；发现额外问题时记录为后续任务。
+- “一次一张”不要求每卡结束等待用户；遇到外部阻碍记录条件并推进无依赖冲突的工作，不把未运行验收标为完成。
 - 在任务分支工作，不直接修改 `main`。本地提交可作为检查点；提交前检查变更范围。
-- 除非用户明确要求，不推送、合并远端、发布、替换正式安装或改写 Git 历史。
+- 除非用户明确要求，不推送、合并远端、发布或改写 Git 历史；**正式安装替换按“用户长期交付要求”执行**（构建出完整新版 `Mac.apk.app` 时直接替换 `/Applications/Mac.apk.app`，不保留额外测试版 `.app`）。
 - 不随任务升级 JVM、ANGLE、Skia 或第三方二进制；需要时先写明必要性、版本、来源、许可和回退方案。
 - 不清理或覆盖其他 worktree、用户 APK、正式应用数据或共享运行时。
 
@@ -29,7 +33,8 @@
 
 - 执行前读脚本，识别安装、终止进程、打开 GUI、修改共享运行时等副作用。
 - `rebuild_and_run.sh --no-promote` 仍会打开 GUI，在 primary checkout 还可能结束运行进程；不是无副作用检查。
-- 开发构建优先在独立 worktree，使用 `TESTING.md` 中关闭 bundle 同步的分步命令。
+- 开发中间回归优先在独立 worktree，使用 `TESTING.md` 中关闭 bundle 同步（`MACAPK_NO_BUNDLE_SYNC=1`）的分步命令，避免产生半成品替换正式应用。
+- **正式交付直接替换（用户明确要求，2026-11-05 / 2026-11-15）**：凡通过构建验证并生成新的可交付 `Mac.apk.app`，不保留独立测试版，直接通过 `scripts/build_launcher.sh --promote`（或 `scripts/rebuild_and_run.sh --promote`）原子替换 `/Applications/Mac.apk.app` 并同步共享运行时与已安装应用存根（保留用户应用数据；`promote_app.sh` 默认移除 `build/Mac.apk.app` 并清理 LaunchServices 重复项）。
 - 不把裸 JVM、真实 runtime、GUI、安装态测试混为一谈；使用各自需要的 harness。
 - 报告每项检查的 PASS / FAIL / SKIP / NOT_RUN、命令、退出码和证据。SKIP 与历史通过记录不等于本轮通过。
 - Bug 修复运行相关回归；渲染、调度或性能变更增加同场景前后测量；纯文档修改检查链接、范围和 diff，不跑完整产品测试。
@@ -46,7 +51,8 @@
 ## 完成与交接
 
 - 以任务卡验收条件判断完成；未运行或受环境限制的项目要明确标记。
-- 更新任务卡状态和 `PROJECT_STATE.md`；不要把整份手册重复复制进状态文件。
+- 执行 `1+1` 极简文档同步：改完代码后只同步更新当前任务卡/`docs/UPGRADE_PLAN.md` 状态与 `PROJECT_STATE.md` 顶部摘要；不要把整份手册重复复制进状态文件。
+- 严禁使用 `git commit --no-verify`、`-n` 或 `MACAPK_SKIP_DOC_CHECK=1` 绕过 `scripts/check_doc_sync.py` / `.githooks/pre-commit` / `.claude/settings.json` 文档门禁。
 - 交付说明：结果、变更文件、验证证据、未完成项、风险、回退方法和下一任务。
 - 审查请求默认只读，报告有证据的缺陷及位置；无发现也说明未覆盖的验证范围。
 

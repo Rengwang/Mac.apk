@@ -264,7 +264,7 @@ struct Stream {
     // = true; }", media/libaudioclient/AudioTrackShared.cpp). Render thread
     // writes; any thread reads.
     std::atomic<uint32_t> underruns{0};
-    bool underrunning = false;   // render thread only
+    std::atomic<bool> underrunning{false};   // render thread writes, clock reader inspects
 
     // MODE_CLIP voice state.
     const float* clip_pcm = nullptr; // borrowed from a Clip (never freed)
@@ -342,6 +342,25 @@ struct Stream {
     // in the same timebase System.nanoTime() reports on this JVM -- matching
     // AudioTimestamp.nanoTime's documented TIMEBASE_MONOTONIC contract.
     std::atomic<uint64_t> last_render_nanos{0};
+
+    // Wait-free single-writer seqlock snapshot for consistent
+    // (played_frames, last_render_nanos, wall_ns, quantum, rate_hz) reads.
+    // Written ONLY by render_stream; invalidated by bumping clk_reset_epoch.
+    std::atomic<uint64_t> clk_seq{0};
+    uint64_t snap_epoch = 0;
+    uint64_t snap_frames = 0;
+    uint64_t snap_render_ns = 0;
+    uint64_t snap_wall_ns = 0;
+    uint64_t snap_quantum = 0;
+    double   snap_rate_hz = 0.0;
+    std::atomic<uint64_t> clk_reset_epoch{1};
+    std::atomic<uint64_t> max_reported_head{0};
+    std::atomic<bool>     hold_interp{false};
+
+    // Render-thread-only micro-fade state to eliminate audible clicks/pops on underrun/resume.
+    float    last_sample[2]{0.0f, 0.0f};
+    bool     fade_in_needed = false;
+    std::atomic<bool> reset_fade{false};
 
     // Render-thread scratch (interleaved). Sized to the largest frameCount
     // we expect; grown on demand from the render block is NOT allowed
@@ -587,29 +606,96 @@ static OSStatus render_stream(Stream* s, BOOL* isSilence,
     // would make getPlaybackHeadPosition/getTimestamp drift by exactly the
     // rate factor -- silently, and in the direction media3's position logic
     // would then mis-seek.
-    if (s->smode == MODE_RING && ch > 0 && srcFrames > 0) {
-        s->played_frames.fetch_add(srcFrames, std::memory_order_relaxed);
-        if (ts && (ts->mFlags & kAudioTimeStampHostTimeValid)) {
-            uint64_t ns = AudioConvertHostTimeToNanos(ts->mHostTime);
-            s->last_render_nanos.store(ns, std::memory_order_relaxed);
+    if (s->smode == MODE_RING && s->reset_fade.exchange(false, std::memory_order_acquire)) {
+        s->last_sample[0] = 0.0f;
+        s->last_sample[1] = 0.0f;
+        s->fade_in_needed = false;
+    }
+
+    if (s->smode == MODE_RING && ch > 0) {
+        uint32_t gotFrames = got / (uint32_t)ch;
+        if (gotFrames > 0) {
+            if (s->fade_in_needed) {
+                uint32_t ramp = std::min<uint32_t>(32u, gotFrames);
+                for (uint32_t f = 0; f < ramp; ++f) {
+                    float scale = (float)(f + 1) / (float)ramp;
+                    for (int c = 0; c < ch; ++c) {
+                        s->scratch[f * (uint32_t)ch + (uint32_t)c] *= scale;
+                    }
+                }
+                s->fade_in_needed = false;
+            }
+            uint32_t lastIdx = (gotFrames - 1u) * (uint32_t)ch;
+            s->last_sample[0] = s->scratch[lastIdx];
+            s->last_sample[1] = (ch > 1) ? s->scratch[lastIdx + 1u] : s->scratch[lastIdx];
         }
+    }
+
+    if (s->smode == MODE_RING && ch > 0 && srcFrames > 0) {
+        uint64_t epoch = s->clk_reset_epoch.load(std::memory_order_acquire);
+        uint64_t total = s->played_frames.fetch_add(srcFrames, std::memory_order_relaxed) + srcFrames;
+        uint64_t now_ns = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime());
+        int cur_sr = s->playback_sr.load(std::memory_order_relaxed);
+        double eff_rate = (double)(cur_sr > 0 ? cur_sr : s->sample_rate)
+                        * (double)s->pb_pitch.load(std::memory_order_relaxed)
+                        * (double)s->pb_speed.load(std::memory_order_relaxed);
+        if (!(eff_rate > 0.0)) eff_rate = (double)s->sample_rate;
+        uint64_t q_dur_ns = (uint64_t)((double)srcFrames * 1.0e9 / eff_rate);
+        uint64_t rns = (ts && (ts->mFlags & kAudioTimeStampHostTimeValid))
+            ? (AudioConvertHostTimeToNanos(ts->mHostTime) + q_dur_ns)
+            : now_ns;
+        s->last_render_nanos.store(rns, std::memory_order_relaxed);
+        s->hold_interp.store(false, std::memory_order_release);
+        uint64_t seq = s->clk_seq.load(std::memory_order_relaxed);
+        s->clk_seq.store(seq + 1, std::memory_order_release);
+        s->snap_epoch = epoch;
+        s->snap_frames = total;
+        s->snap_render_ns = rns;
+        s->snap_wall_ns = now_ns;
+        s->snap_quantum = srcFrames;
+        s->snap_rate_hz = eff_rate;
+        s->clk_seq.store(seq + 2, std::memory_order_release);
     }
     // Underrun episodes, for getUnderrunCount: a PLAYING track that has
     // already played something and now cannot fill the cycle. Before its
     // first frame it has not started on Android either (the start threshold).
     if (s->smode == MODE_RING && active) {
         if (got < want) {
-            if (!s->underrunning && s->played_frames.load(std::memory_order_relaxed) > 0) {
+            if (!s->underrunning.load(std::memory_order_relaxed)
+                    && s->played_frames.load(std::memory_order_relaxed) > 0) {
                 s->underruns.fetch_add(1, std::memory_order_relaxed);
                 g_underrun_episodes.fetch_add(1, std::memory_order_relaxed);
-                s->underrunning = true;
+                s->underrunning.store(true, std::memory_order_relaxed);
             }
         } else {
-            s->underrunning = false;
+            s->underrunning.store(false, std::memory_order_relaxed);
         }
     }
-    // Zero the tail (underrun) so we never emit garbage.
-    for (uint32_t i = got; i < want && i < s->scratch_elems; ++i) s->scratch[i] = 0.0f;
+    // Micro-fade out cleanly from last_sample on underrun/pause before zeroing tail.
+    uint32_t zeroFrom = got;
+    if (s->smode == MODE_RING && ch > 0 && got < want
+            && (s->last_sample[0] != 0.0f || s->last_sample[1] != 0.0f)) {
+        uint32_t gotFrames = got / (uint32_t)ch;
+        uint32_t missFrames = (want - got) / (uint32_t)ch;
+        uint32_t fadeFrames = std::min<uint32_t>(32u, missFrames);
+        for (uint32_t f = 0; f < fadeFrames; ++f) {
+            float g = 1.0f - (float)(f + 1) / (float)fadeFrames;
+            for (int c = 0; c < ch; ++c) {
+                uint32_t idx = (gotFrames + f) * (uint32_t)ch + (uint32_t)c;
+                if (idx < want && idx < s->scratch_elems) {
+                    s->scratch[idx] = s->last_sample[c < 2 ? c : 1] * g;
+                }
+            }
+        }
+        zeroFrom = got + fadeFrames * (uint32_t)ch;
+        s->last_sample[0] = 0.0f;
+        s->last_sample[1] = 0.0f;
+        s->fade_in_needed = true;
+    } else if (s->smode == MODE_RING && got < want && active) {
+        s->fade_in_needed = true;
+    }
+    // Zero the remaining tail (underrun) so we never emit garbage.
+    for (uint32_t i = zeroFrom; i < want && i < s->scratch_elems; ++i) s->scratch[i] = 0.0f;
 
     // Write scratch (interleaved) into the output buffer list. Handle both
     // interleaved (1 buffer) and deinterleaved (ch buffers) layouts.
@@ -755,6 +841,8 @@ static void attach_source_node(Stream* s) {
     }
 }
 
+static void observe_output_engine_changes();
+
 // ---------------------------------------------------------------------------
 // Lazy engine bring-up. Caller holds g_mtx.
 // ---------------------------------------------------------------------------
@@ -832,6 +920,7 @@ static void ensure_engine_locked() {
             g_engine.mainMixerNode.outputVolume = 0.0f;
             std::fprintf(stderr, "[audio] output muted (MACAPK_AUDIO_TEST_MUTE=1, test hook)\n");
         }
+        if (g_engine_started) observe_output_engine_changes();
         if (!g_engine_started) {
             std::fprintf(stderr, "[audio] AVAudioEngine start FAILED: %s\n",
                          forced_fail ? "forced by MACAPK_AUDIO_TEST_NO_OUTPUT=1 (test hook)"
@@ -843,6 +932,123 @@ static void ensure_engine_locked() {
                 of.sampleRate, (unsigned)of.channelCount);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Keeping the output engine running.
+//
+// macOS STOPS an AVAudioEngine by itself whenever the audio configuration
+// changes (the default output device changes, its format or sample rate
+// changes) and posts AVAudioEngineConfigurationChangeNotification; the engine
+// stays stopped until it is started again (AVAudioEngine.h). This engine is
+// created once per process, so before this every stream went silent for the
+// rest of the process: measured 2026-11-13 on Signal 8.35.2, where connecting
+// headphones during a call left every AudioTrack.write returning 0 ("AudioTrack
+// .write played invalid number of bytes: 0") while the other side's audio kept
+// arriving.
+//
+// So when the notification arrives, or a stream is created and finds the
+// engine stopped, the mixer is reconnected to the output node at the new
+// device's format (the old connection carries the old device's) and the engine
+// is started again. Source nodes stay attached; the mixer converts each
+// stream's rate to the device's. A device switch can post several
+// notifications while it settles, so a restart that fails is retried a few
+// times, a second apart. Every failure grants a fresh set of retries; at most
+// one retry is scheduled at a time.
+// ---------------------------------------------------------------------------
+static int  g_restart_retries_left = 0;     // guarded by g_mtx
+static bool g_restart_retry_pending = false; // guarded by g_mtx: a retry is scheduled
+static const int kOutputRetries = 5;
+
+// Reconnect and start the stopped engine. Caller holds g_mtx. Returns true when
+// it is running afterwards; logs why not otherwise.
+static bool restart_output_engine_locked(const char* why) {
+    @autoreleasepool {
+        AVAudioOutputNode* out = g_engine.outputNode;
+        AVAudioFormat* hw = [out outputFormatForBus:0];
+        if (!hw || hw.channelCount == 0 || hw.sampleRate <= 0.0) {
+            std::fprintf(stderr, "[audio] output stopped (%s) and no usable output device "
+                         "to restart on\n", why);
+            return false;
+        }
+        AVAudioMixerNode* mixer = g_engine.mainMixerNode;
+        AVAudioFormat* now = [mixer outputFormatForBus:0];
+        if (now.sampleRate != hw.sampleRate || now.channelCount != hw.channelCount) {
+            AVAudioFormat* fmt = [[AVAudioFormat alloc]
+                initStandardFormatWithSampleRate:hw.sampleRate channels:hw.channelCount];
+            @try {
+                EngineConnect(g_engine, mixer, out, fmt);
+            } @catch (NSException* ex) {
+                std::fprintf(stderr, "[audio] output reconnect failed (%s): %s\n", why,
+                             ex.reason ? ex.reason.UTF8String : "(no reason)");
+            }
+            [fmt release];
+        }
+        [g_engine prepare];
+        NSError* err = nil;
+        if (![g_engine startAndReturnError:&err]) {
+            std::fprintf(stderr, "[audio] output restart FAILED (%s), %.0f Hz %u ch: %s\n",
+                         why, hw.sampleRate, (unsigned)hw.channelCount,
+                         err ? err.localizedDescription.UTF8String : "(unknown)");
+            return false;
+        }
+        std::fprintf(stderr, "[audio] output restarted (%s): %.0f Hz %u ch\n",
+                     why, hw.sampleRate, (unsigned)hw.channelCount);
+        return true;
+    }
+}
+
+static void retry_output_engine_later();
+
+// Caller holds g_mtx.
+static void restart_output_engine_if_stopped_locked(const char* why) {
+    if (!g_engine || !g_engine_started || g_engine.isRunning) return;
+    if (restart_output_engine_locked(why)) {
+        g_restart_retries_left = 0;
+    } else {
+        g_restart_retries_left = kOutputRetries;
+        retry_output_engine_later();
+    }
+}
+
+// Caller holds g_mtx. Schedules one retry unless one is already pending.
+static void retry_output_engine_later() {
+    if (g_restart_retry_pending) return;
+    g_restart_retry_pending = true;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_restart_retry_pending = false;
+        // The engine runs again: end the run so a later failure starts a fresh one.
+        if (g_restart_retries_left <= 0 || g_engine.isRunning) {
+            g_restart_retries_left = 0;
+            return;
+        }
+        g_restart_retries_left--;
+        if (restart_output_engine_locked("retry after a failed restart")) {
+            g_restart_retries_left = 0;
+        } else if (g_restart_retries_left > 0) {
+            retry_output_engine_later();
+        } else {
+            std::fprintf(stderr, "[audio] output still not running after %d retries; "
+                         "the next stream created tries again\n", kOutputRetries);
+        }
+    });
+}
+
+static void observe_output_engine_changes() {
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:g_engine
+                     queue:nil
+                usingBlock:^(NSNotification*) {
+        // Off the posting thread: the restart takes g_mtx and talks to
+        // CoreAudio, neither of which belongs on a notification callback.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            std::lock_guard<std::mutex> lk(g_mtx);
+            restart_output_engine_if_stopped_locked("audio configuration changed");
+        });
+    }];
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1254,7 @@ extern "C" int64_t macapk_audio_stream_create(int sample_rate, int channels,
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         ensure_engine_locked();
+        restart_output_engine_if_stopped_locked("an audio stream was created");
     }
 
     attach_source_node(s);
@@ -1223,12 +1430,19 @@ extern "C" void macapk_audio_stream_play(int64_t h) {
 }
 extern "C" void macapk_audio_stream_pause(int64_t h) {
     Stream* s = stream_of(h);
-    if (s) s->play_state.store(PLAYSTATE_PAUSED, std::memory_order_relaxed);
+    if (!s) return;
+    s->hold_interp.store(true, std::memory_order_release);
+    s->play_state.store(PLAYSTATE_PAUSED, std::memory_order_relaxed);
 }
 extern "C" void macapk_audio_stream_stop(int64_t h) {
     Stream* s = stream_of(h);
     if (!s) return;
     s->play_state.store(PLAYSTATE_STOPPED, std::memory_order_relaxed);
+    s->hold_interp.store(false, std::memory_order_release);
+    s->reset_fade.store(true, std::memory_order_release);
+    s->clk_reset_epoch.fetch_add(1, std::memory_order_acq_rel);
+    s->max_reported_head.store(0, std::memory_order_release);
+    s->last_render_nanos.store(0, std::memory_order_relaxed);
     // AudioTrack.getPlaybackHeadPosition() javadoc: "reset to zero by
     // flush(), reloadStaticData(), and stop()". Cross-thread relaxed store
     // (this runs on the app thread, not the render thread) -- same pattern
@@ -1250,6 +1464,11 @@ extern "C" void macapk_audio_stream_flush(int64_t h) {
     // drops pending samples).
     uint64_t w = s->ring.wpos.load(std::memory_order_acquire);
     s->ring.rpos.store(w, std::memory_order_release);
+    s->hold_interp.store(false, std::memory_order_release);
+    s->reset_fade.store(true, std::memory_order_release);
+    s->clk_reset_epoch.fetch_add(1, std::memory_order_acq_rel);
+    s->max_reported_head.store(0, std::memory_order_release);
+    s->last_render_nanos.store(0, std::memory_order_relaxed);
     // See macapk_audio_stream_stop: flush() is also in AOSP's reset-to-zero
     // list for getPlaybackHeadPosition(), and the fractional resampler phase
     // goes with it (a stale phase would interpolate from a cursor that no
@@ -1267,31 +1486,103 @@ extern "C" int macapk_audio_stream_play_state(int64_t h) {
     Stream* s = stream_of(h);
     return s ? s->play_state.load(std::memory_order_relaxed) : PLAYSTATE_STOPPED;
 }
+
+static bool clock_interp_on() {
+    static const bool on = [] {
+        const char* g = std::getenv("MACAPK_AUDIO_CLOCK_INTERP");
+        return !(g && g[0] == '0');
+    }();
+    return on;
+}
+
+static bool read_clock_snap(const Stream* s, uint64_t expected_epoch,
+                            uint64_t* out_frames, uint64_t* out_rns,
+                            uint64_t* out_wall_ns, uint64_t* out_quantum,
+                            double* out_rate) {
+    for (int tries = 0; tries < 16; ++tries) {
+        uint64_t seq1 = s->clk_seq.load(std::memory_order_acquire);
+        if (seq1 == 0 || (seq1 & 1u) != 0) continue;
+        uint64_t ep = s->snap_epoch;
+        uint64_t fr = s->snap_frames;
+        uint64_t rn = s->snap_render_ns;
+        uint64_t wn = s->snap_wall_ns;
+        uint64_t qn = s->snap_quantum;
+        double   rt = s->snap_rate_hz;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (s->clk_seq.load(std::memory_order_relaxed) == seq1) {
+            if (ep != expected_epoch || s->clk_reset_epoch.load(std::memory_order_acquire) != expected_epoch) {
+                return false;
+            }
+            *out_frames = fr;
+            *out_rns = rn;
+            *out_wall_ns = wn;
+            *out_quantum = qn;
+            *out_rate = rt;
+            return true;
+        }
+    }
+    return false;
+}
+
 // AudioTrack.getPlaybackHeadPosition(): full 64-bit played_frames (see the
-// Stream field comment). The Java layer performs AOSP's documented 32-bit
-// wrap via an int cast, so this returns unwrapped precision.
+// Stream field comment), smoothly sub-quantum interpolated between CoreAudio
+// render callbacks via mach_absolute_time() and strictly monotonic per epoch.
 extern "C" int64_t macapk_audio_stream_head_position(int64_t h) {
     Stream* s = stream_of(h);
-    return s ? (int64_t)s->played_frames.load(std::memory_order_relaxed) : 0;
+    if (!s) return 0;
+    uint64_t e0 = s->clk_reset_epoch.load(std::memory_order_acquire);
+    uint64_t raw = s->played_frames.load(std::memory_order_relaxed);
+    if (!clock_interp_on()) return (int64_t)raw;
+    uint64_t frames = 0, rns = 0, wall_ns = 0, quantum = 0;
+    double rate_hz = 0.0;
+    if (!read_clock_snap(s, e0, &frames, &rns, &wall_ns, &quantum, &rate_hz) || frames == 0) {
+        return 0;
+    }
+    uint64_t base = (frames >= quantum) ? (frames - quantum) : 0;
+    uint64_t pos = base;
+    if (s->play_state.load(std::memory_order_relaxed) == PLAYSTATE_PLAYING
+            && !s->released.load(std::memory_order_relaxed)
+            && !s->underrunning.load(std::memory_order_relaxed)
+            && !s->hold_interp.load(std::memory_order_acquire)
+            && quantum > 0 && rate_hz > 0.0) {
+        uint64_t now_ns = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime());
+        uint64_t delta = (now_ns > wall_ns)
+            ? (uint64_t)((double)(now_ns - wall_ns) * rate_hz / 1.0e9) : 0;
+        if (delta > quantum) delta = quantum;
+        pos = base + delta;
+    }
+    uint64_t prev = s->max_reported_head.load(std::memory_order_acquire);
+    while (pos > prev) {
+        if (s->clk_reset_epoch.load(std::memory_order_acquire) != e0) return 0;
+        if (s->max_reported_head.compare_exchange_weak(
+                prev, pos, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return (int64_t)pos;
+        }
+    }
+    if (s->clk_reset_epoch.load(std::memory_order_acquire) != e0) return 0;
+    return (int64_t)prev;
 }
+
 // AudioTrack.getTimestamp(): fills *out_frames (unwrapped played_frames) and
-// *out_nanos (System.nanoTime()-timebase host time of that same render
-// callback -- see Stream::last_render_nanos). Returns false, leaving both
-// outputs untouched, exactly when AOSP's native_get_timestamp would answer
-// ERROR_WOULD_BLOCK for a STOPPED/FLUSHED/not-yet-started track: no real
-// frame has reached the render callback since the last reset. played_frames
-// only resets on stop()/flush(), so a PAUSED track that already played real
-// audio keeps reporting its last (frozen) pair -- AOSP's WOULD_BLOCK list
-// names STOPPED and FLUSHED only, not PAUSED.
+// *out_nanos (System.nanoTime()-timebase host time phase-aligned with *out_frames).
 extern "C" bool macapk_audio_stream_get_timestamp(int64_t h, int64_t* out_frames,
                                                     int64_t* out_nanos) {
     Stream* s = stream_of(h);
     if (!s) return false;
-    uint64_t frames = s->played_frames.load(std::memory_order_relaxed);
-    if (frames == 0) return false;
+    uint64_t e0 = s->clk_reset_epoch.load(std::memory_order_acquire);
+    uint64_t frames = 0, rns = 0, wall_ns = 0, quantum = 0;
+    double rate_hz = 0.0;
+    if (!read_clock_snap(s, e0, &frames, &rns, &wall_ns, &quantum, &rate_hz)
+            || frames == 0 || rns == 0) {
+        return false;
+    }
     *out_frames = (int64_t)frames;
-    *out_nanos  = (int64_t)s->last_render_nanos.load(std::memory_order_relaxed);
+    *out_nanos  = (int64_t)rns;
     return true;
+}
+
+extern "C" uint64_t macapk_audio_total_underruns() {
+    return g_underrun_episodes.load(std::memory_order_relaxed);
 }
 // AudioTrack.getBufferCapacityInFrames() / AAudioStream_getBufferCapacityInFrames:
 // the track's frameCount (AOSP AudioTrack::frameCount()).

@@ -53,6 +53,11 @@ public final class Parcel {
     public static Parcel obtain(IBinder binder) { return obtain(); }
 
     public void recycle() {
+        if (!objects.isEmpty()) {
+            for (int i = 0, n = objects.size(); i < n; i++) {
+                MacApkBinderTransport.releaseUnconsumed(objects.get(i));
+            }
+        }
         objects.clear();
         objectOffsetCount = 0;
         creatorCache = null;
@@ -404,6 +409,14 @@ public final class Parcel {
     public final void writeStrongBinder(IBinder b) { writeObjectRef(b); }
     public final IBinder readStrongBinder() {
         Object o = readObjectRef(); return (o instanceof IBinder) ? (IBinder) o : null;
+    }
+    /** Framework-internal: attach/consume a single-use Mach send right (e.g.
+     *  IOSurfaceCreateMachPort) in this Parcel's object table. */
+    public final void macapkWriteMachPort(int port) {
+        writeObjectRef(MacApkBinderTransport.wrapMachPort(port));
+    }
+    public final int macapkTakeMachPort() {
+        return MacApkBinderTransport.takeMachPort(readObjectRef());
     }
     // AOSP: writeStrongBinder(val == null ? null : val.asBinder()). This is how
     // every AIDL-generated Proxy marshals a callback/listener parameter.

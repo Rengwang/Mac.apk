@@ -151,18 +151,28 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurface.h>
 #import <Foundation/Foundation.h>
+#include <mach/mach.h>
+#include <dlfcn.h>
+#include <sys/sysctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
 #include <jni.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <deque>
-#include <chrono>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -942,7 +952,7 @@ void OutputCallback(void* refcon, void* sourceFrameRefCon, OSStatus status,
         // Container safety cap: prevent runaway queue growth if consumer is dead/stalled,
         // avoiding VTDecoderXPCService / kernel_task wired Mach memory exhaustion.
         // Emergency cap only; normal backpressure in dequeueInputBuffer() prevents reaching this.
-        constexpr size_t kMaxOutQ = 16;
+        constexpr size_t kMaxOutQ = 36;
         while (d->outQ.size() >= kMaxOutQ) {
             VtDecoder::OutFrame old = d->outQ.front();
             d->outQ.pop_front();
@@ -958,15 +968,15 @@ void OutputCallback(void* refcon, void* sourceFrameRefCon, OSStatus status,
             }
         }
         d->outQ.push_back({pb, ptsUs, 0});
-        d->cvInFlight.notify_one();
+        d->cvInFlight.notify_all();
     } else if (status != noErr) {
         static std::atomic<int> s_errCount{0};
         if (s_errCount.fetch_add(1, std::memory_order_relaxed) < 10) {
             std::fprintf(stderr, "[video-toolbox] decode callback error %d\n", (int)status);
         }
-        if (d) d->cvInFlight.notify_one();
+        if (d) d->cvInFlight.notify_all();
     } else {
-        if (d) d->cvInFlight.notify_one();
+        if (d) d->cvInFlight.notify_all();
     }
     // else: noErr but stale generation (flushed mid-flight), or a dropped
     // frame (imageBuffer null) -- nothing to enqueue either way.
@@ -1019,6 +1029,136 @@ VTDecompressionSessionRef CreateSessionInternal(CMVideoFormatDescriptionRef fmt,
 struct ProbeResult { bool supported = false; bool hw = false; };
 std::mutex g_probeMu;
 std::map<CMVideoCodecType, ProbeResult> g_probeCache;
+bool g_probeDiskLoaded = false;
+
+std::string VtProbeOsVersion() {
+    char buf[128] = {};
+    size_t sz = sizeof(buf) - 1;
+    if (sysctlbyname("kern.osversion", buf, &sz, nullptr, 0) != 0 || sz == 0) {
+        return "unknown";
+    }
+    std::string out(buf);
+    while (!out.empty() && (out.back() == '\0' || out.back() == '\n'
+                            || out.back() == '\r' || out.back() == ' ')) {
+        out.pop_back();
+    }
+    return out.empty() ? std::string("unknown") : out;
+}
+
+bool VtProbeEnsureDirRecursive(const std::string& dir) {
+    if (dir.empty()) return false;
+    struct stat st{};
+    if (stat(dir.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
+    size_t slash = dir.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        if (!VtProbeEnsureDirRecursive(dir.substr(0, slash))) return false;
+    }
+    if (mkdir(dir.c_str(), 0755) == 0 || errno == EEXIST) {
+        return stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    }
+    return false;
+}
+
+std::string VtProbePrimaryPath(std::string* outDir) {
+    const char* home = std::getenv("HOME");
+    if (!home || !home[0]) return {};
+    std::string dir = std::string(home) + "/Library/Caches/Mac.apk";
+    if (outDir) *outDir = dir;
+    return dir + "/vtprobe_v1.cache";
+}
+
+std::string VtProbeFallbackPath() {
+    return std::string("/tmp/macapk_vtprobe_v1_") + std::to_string((unsigned long)getuid()) + ".cache";
+}
+
+bool ReadVtProbeFile(const std::string& path, const std::string& osver,
+                     std::map<CMVideoCodecType, ProbeResult>* out) {
+    if (path.empty()) return false;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return false;
+    char line[512];
+    bool any = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        size_t len = std::strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        char* p1 = std::strchr(line, '\t');
+        if (!p1) continue;
+        *p1 = '\0';
+        if (std::strcmp(line, "v1") != 0) continue;
+        char* ver = p1 + 1;
+        char* p2 = std::strchr(ver, '\t');
+        if (!p2) continue;
+        *p2 = '\0';
+        if (osver != ver) continue;
+        char* fccHex = p2 + 1;
+        char* p3 = std::strchr(fccHex, '\t');
+        if (!p3) continue;
+        *p3 = '\0';
+        if (!fccHex[0]) continue;
+        char* endHex = nullptr;
+        unsigned long rawFcc = std::strtoul(fccHex, &endHex, 16);
+        if (endHex == fccHex || *endHex != '\0' || rawFcc == 0) continue;
+        char* flagsStr = p3 + 1;
+        char* comma = std::strchr(flagsStr, ',');
+        if (!comma) continue;
+        *comma = '\0';
+        int sup = std::atoi(flagsStr);
+        int hw = std::atoi(comma + 1);
+        ProbeResult pr;
+        pr.supported = (sup != 0);
+        pr.hw = (hw != 0);
+        (*out)[static_cast<CMVideoCodecType>(rawFcc)] = pr;
+        any = true;
+    }
+    std::fclose(f);
+    return any;
+}
+
+void LoadVtProbeFromDisk(const std::string& osver,
+                         std::map<CMVideoCodecType, ProbeResult>* cache) {
+    std::string primary = VtProbePrimaryPath(nullptr);
+    if (!ReadVtProbeFile(primary, osver, cache)) {
+        ReadVtProbeFile(VtProbeFallbackPath(), osver, cache);
+    }
+}
+
+bool WriteVtProbeFileAtomic(const std::string& path, const std::string& osver,
+                            const std::map<CMVideoCodecType, ProbeResult>& cache) {
+    std::string tmp = path + ".tmp." + std::to_string((long long)getpid());
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (!f) return false;
+    for (const auto& kv : cache) {
+        std::fprintf(f, "v1\t%s\t%08x\t%d,%d\n",
+                     osver.c_str(),
+                     static_cast<unsigned int>(kv.first),
+                     kv.second.supported ? 1 : 0,
+                     kv.second.hw ? 1 : 0);
+    }
+    bool writeOk = (std::ferror(f) == 0);
+    if (std::fclose(f) != 0) writeOk = false;
+    if (!writeOk || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+void SaveVtProbeToDisk(const std::string& osver,
+                       const std::map<CMVideoCodecType, ProbeResult>& cache) {
+    std::string dir;
+    std::string primary = VtProbePrimaryPath(&dir);
+    if (!primary.empty() && VtProbeEnsureDirRecursive(dir)) {
+        std::map<CMVideoCodecType, ProbeResult> merged;
+        ReadVtProbeFile(primary, osver, &merged);
+        for (const auto& kv : cache) merged[kv.first] = kv.second;
+        if (WriteVtProbeFileAtomic(primary, osver, merged)) return;
+    }
+    std::string fallback = VtProbeFallbackPath();
+    std::map<CMVideoCodecType, ProbeResult> merged;
+    ReadVtProbeFile(fallback, osver, &merged);
+    for (const auto& kv : cache) merged[kv.first] = kv.second;
+    WriteVtProbeFileAtomic(fallback, osver, merged);
+}
 
 // Real, spec-compliant AVC/HEVC parameter sets for the capability probe --
 // EXTRACTED, not hand-derived: ffmpeg 8.1.2 (libx264/libx265) encoded a
@@ -1151,12 +1291,566 @@ ProbeResult ProbeFourccLocked(CMVideoCodecType fourcc) {
 }
 
 ProbeResult ProbeFourcc(CMVideoCodecType fourcc) {
+    const char* diskEnv = std::getenv("MACAPK_VTPROBE_DISK_CACHE");
+    const bool useDisk = !(diskEnv && std::strcmp(diskEnv, "0") == 0);
     std::lock_guard<std::mutex> lk(g_probeMu);
+    std::string osver;
+    if (useDisk && !g_probeDiskLoaded) {
+        osver = VtProbeOsVersion();
+        LoadVtProbeFromDisk(osver, &g_probeCache);
+        g_probeDiskLoaded = true;
+        if (!g_probeCache.empty()) {
+            std::fprintf(stderr,
+                "[video-toolbox] vtprobe: loaded %zu cached codec probes (osv=%s)\n",
+                g_probeCache.size(), osver.c_str());
+        }
+    }
     auto it = g_probeCache.find(fourcc);
     if (it != g_probeCache.end()) return it->second;
     ProbeResult r = ProbeFourccLocked(fourcc);
     g_probeCache[fourcc] = r;
+    if (useDisk) {
+        if (osver.empty()) osver = VtProbeOsVersion();
+        SaveVtProbeToDisk(osver, g_probeCache);
+    }
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// VideoToolbox Encoder (H.264 / HEVC)
+// ---------------------------------------------------------------------------
+
+constexpr int kEncFlagKeyFrame    = 1; // MediaCodec.BUFFER_FLAG_KEY_FRAME
+constexpr int kEncFlagCodecConfig = 2; // MediaCodec.BUFFER_FLAG_CODEC_CONFIG
+
+constexpr int kColorFmt32BGRA8888           = 15;
+constexpr int kColorFmt32ARGB8888           = 16;
+constexpr int kColorFmtYUV420Planar         = 19;
+constexpr int kColorFmtYUV420PackedPlanar   = 20;
+constexpr int kColorFmtYUV420SemiPlanar     = 21;
+constexpr int kColorFmtYUV420PackedSemiPlanar = 39;
+constexpr int kColorFmt32ABGR8888           = 0x7f00a000;
+constexpr int kColorFmtRGBAFlexible         = 0x7f36a888;
+constexpr int kColorFmtYUV420Flexible       = 0x7f420888;
+
+const MimeEntry kEncMimeTable[] = {
+    { "video/avc",  kCMVideoCodecType_H264 },
+    { "video/hevc", kCMVideoCodecType_HEVC },
+};
+
+bool EncMimeToFourcc(const std::string& mime, CMVideoCodecType* out) {
+    for (const auto& e : kEncMimeTable) {
+        if (mime == e.mime) { *out = e.fourcc; return true; }
+    }
+    return false;
+}
+
+std::mutex g_encProbeMu;
+std::map<CMVideoCodecType, ProbeResult> g_encProbeCache;
+
+ProbeResult ProbeEncodeFourccLocked(CMVideoCodecType fourcc) {
+    ProbeResult r;
+    @autoreleasepool {
+        NSDictionary* spec = @{
+            (id)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        };
+        VTCompressionSessionRef sess = nullptr;
+        OSStatus s = VTCompressionSessionCreate(
+            kCFAllocatorDefault, 128, 128, fourcc,
+            (__bridge CFDictionaryRef)spec,
+            nullptr, kCFAllocatorDefault, nullptr, nullptr, &sess);
+        if (s != noErr || !sess) {
+            s = VTCompressionSessionCreate(
+                kCFAllocatorDefault, 128, 128, fourcc,
+                nullptr, nullptr, kCFAllocatorDefault, nullptr, nullptr, &sess);
+        }
+        if (s == noErr && sess) {
+            r.supported = true;
+            CFBooleanRef hwFlag = nullptr;
+            if (VTSessionCopyProperty(
+                    sess, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                    kCFAllocatorDefault, &hwFlag) == noErr && hwFlag) {
+                r.hw = CFBooleanGetValue(hwFlag);
+                CFRelease(hwFlag);
+            }
+            VTCompressionSessionInvalidate(sess);
+            CFRelease(sess);
+        }
+    }
+    char fcc[5]; FourccToChars(fourcc, fcc);
+    std::fprintf(stderr, "[video-toolbox] encode probe %s: supported=%s hw=%s\n",
+                 fcc, r.supported ? "yes" : "no", r.hw ? "yes" : "no");
+    return r;
+}
+
+ProbeResult ProbeEncodeFourcc(CMVideoCodecType fourcc) {
+    std::lock_guard<std::mutex> lk(g_encProbeMu);
+    auto it = g_encProbeCache.find(fourcc);
+    if (it != g_encProbeCache.end()) return it->second;
+    ProbeResult r = ProbeEncodeFourccLocked(fourcc);
+    g_encProbeCache[fourcc] = r;
+    return r;
+}
+
+struct VtEncoder;
+
+struct EncFrameCtx {
+    int generation;
+    int64_t origPtsUs;
+};
+
+struct VtEncoder {
+    VTCompressionSessionRef session = nullptr;
+    CMVideoCodecType codecType = 0;
+    int width = 0;
+    int height = 0;
+    float fps = 30.0f;
+    bool usingHardware = false;
+
+    std::mutex mu;
+    struct OutPacket {
+        std::vector<uint8_t> data;
+        int64_t ptsUs;
+        int flags;
+    };
+    std::deque<OutPacket> outQ;
+    std::vector<uint8_t> csd0; // Annex-B: SPS for AVC; VPS+SPS+PPS for HEVC
+    std::vector<uint8_t> csd1; // Annex-B: PPS for AVC; empty for HEVC
+    bool csdSent = false;
+    bool eosEmitted = false;
+    int64_t lastInternalPtsUs = INT64_MIN;
+    int64_t lastOrigPtsUs = 0;
+    int nalLenSize = 4;
+
+    std::atomic<int> generation{0};
+    std::atomic<int> inFlight{0};
+    std::atomic<bool> forceKeyFrame{false};
+    std::atomic<bool> closing{false};
+    std::condition_variable cvInFlight;
+
+    std::mutex cbMu;
+    JavaVM* jvm = nullptr;
+    jobject javaTarget = nullptr; // jweak
+    jmethodID onOutputMethod = nullptr;
+};
+
+void NotifyJavaOutput(VtEncoder* e) {
+    if (!e || e->closing.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> clk(e->cbMu);
+    if (e->closing.load(std::memory_order_acquire)
+            || !e->jvm || !e->javaTarget || !e->onOutputMethod) {
+        return;
+    }
+    JNIEnv* env = nullptr;
+    bool didAttach = false;
+    jint gr = e->jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (gr == JNI_EDETACHED) {
+        if (e->jvm->AttachCurrentThreadAsDaemon((void**)&env, nullptr) == JNI_OK) {
+            didAttach = true;
+        } else {
+            env = nullptr;
+        }
+    }
+    if (env) {
+        jobject target = env->NewLocalRef(e->javaTarget);
+        if (target && !env->IsSameObject(target, nullptr)) {
+            env->CallVoidMethod(target, e->onOutputMethod);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        if (target) env->DeleteLocalRef(target);
+        if (didAttach) {
+            e->jvm->DetachCurrentThread();
+        }
+    }
+}
+
+inline void AppendStartCode(std::vector<uint8_t>& dst, const uint8_t* ptr, size_t len) {
+    if (!ptr || len == 0) return;
+    dst.push_back(0x00);
+    dst.push_back(0x00);
+    dst.push_back(0x00);
+    dst.push_back(0x01);
+    dst.insert(dst.end(), ptr, ptr + len);
+}
+
+bool ExtractEncoderParamSets(VtEncoder* e, CMFormatDescriptionRef fdesc,
+                             std::vector<uint8_t>* outCsd0,
+                             std::vector<uint8_t>* outCsd1) {
+    if (!e || !fdesc) return false;
+    outCsd0->clear();
+    outCsd1->clear();
+    if (e->codecType == kCMVideoCodecType_H264) {
+        size_t psCount = 0;
+        int nalHdrLen = 4;
+        if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                fdesc, 0, nullptr, nullptr, &psCount, &nalHdrLen) != noErr || psCount == 0) {
+            return false;
+        }
+        if (nalHdrLen >= 1 && nalHdrLen <= 4) e->nalLenSize = nalHdrLen;
+        for (size_t i = 0; i < psCount; i++) {
+            const uint8_t* ptr = nullptr;
+            size_t len = 0;
+            if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    fdesc, i, &ptr, &len, nullptr, nullptr) == noErr && ptr && len > 0) {
+                int ntype = ptr[0] & 0x1F;
+                if (ntype == 8) AppendStartCode(*outCsd1, ptr, len);
+                else AppendStartCode(*outCsd0, ptr, len);
+            }
+        }
+        return !outCsd0->empty();
+    }
+    if (e->codecType == kCMVideoCodecType_HEVC) {
+        size_t psCount = 0;
+        int nalHdrLen = 4;
+        if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                fdesc, 0, nullptr, nullptr, &psCount, &nalHdrLen) != noErr || psCount == 0) {
+            return false;
+        }
+        if (nalHdrLen >= 1 && nalHdrLen <= 4) e->nalLenSize = nalHdrLen;
+        for (size_t i = 0; i < psCount; i++) {
+            const uint8_t* ptr = nullptr;
+            size_t len = 0;
+            if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    fdesc, i, &ptr, &len, nullptr, nullptr) == noErr && ptr && len > 0) {
+                AppendStartCode(*outCsd0, ptr, len);
+            }
+        }
+        return !outCsd0->empty();
+    }
+    return false;
+}
+
+std::vector<uint8_t> AvccBufferToAnnexB(CMBlockBufferRef bb, int nalLenSize) {
+    std::vector<uint8_t> out;
+    if (!bb) return out;
+    size_t totalLen = CMBlockBufferGetDataLength(bb);
+    if (totalLen == 0) return out;
+    std::vector<uint8_t> raw(totalLen);
+    if (CMBlockBufferCopyDataBytes(bb, 0, totalLen, raw.data()) != kCMBlockBufferNoErr) {
+        return out;
+    }
+    int prefix = (nalLenSize >= 1 && nalLenSize <= 4) ? nalLenSize : 4;
+    size_t off = 0;
+    out.reserve(totalLen + 16);
+    while (off + (size_t)prefix <= totalLen) {
+        uint32_t nlen = 0;
+        for (int i = 0; i < prefix; i++) nlen = (nlen << 8) | raw[off + i];
+        off += (size_t)prefix;
+        if (nlen == 0 || nlen > totalLen - off) break;
+        AppendStartCode(out, raw.data() + off, nlen);
+        off += nlen;
+    }
+    if (out.empty()) {
+        out = std::move(raw);
+    }
+    return out;
+}
+
+void EncOutputCallback(void* outputCallbackRefCon, void* sourceFrameRefCon,
+                       OSStatus status, VTEncodeInfoFlags /*infoFlags*/,
+                       CMSampleBufferRef sampleBuffer) {
+    std::unique_ptr<EncFrameCtx> fctx((EncFrameCtx*)sourceFrameRefCon);
+    VtEncoder* e = (VtEncoder*)outputCallbackRefCon;
+    if (!e) return;
+
+    int prev = e->inFlight.fetch_sub(1, std::memory_order_relaxed);
+    if (prev <= 0) e->inFlight.store(0, std::memory_order_relaxed);
+
+    if (status != noErr || !sampleBuffer || !CMSampleBufferDataIsReady(sampleBuffer)) {
+        if (status != noErr) {
+            static std::atomic<int> s_encErrCount{0};
+            if (s_encErrCount.fetch_add(1, std::memory_order_relaxed) < 10) {
+                std::fprintf(stderr, "[video-toolbox] encode callback error %d\n", (int)status);
+            }
+        }
+        e->cvInFlight.notify_all();
+        return;
+    }
+
+    if (e->closing.load(std::memory_order_acquire)
+            || (fctx && fctx->generation != e->generation.load(std::memory_order_relaxed))) {
+        e->cvInFlight.notify_all();
+        return;
+    }
+
+    bool isKeyFrame = true;
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+    if (attachments && CFArrayGetCount(attachments) > 0) {
+        CFDictionaryRef dict = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+        if (dict) {
+            CFBooleanRef notSync = nullptr;
+            if (CFDictionaryGetValueIfPresent(dict, kCMSampleAttachmentKey_NotSync,
+                                              (const void**)&notSync)
+                    && notSync && CFBooleanGetValue(notSync)) {
+                isKeyFrame = false;
+            }
+        }
+    }
+
+    int64_t framePtsUs = 0;
+    if (fctx) {
+        framePtsUs = fctx->origPtsUs;
+    } else {
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        framePtsUs = CMTIME_IS_VALID(pts) ? (int64_t)llround(CMTimeGetSeconds(pts) * 1.0e6) : 0;
+    }
+
+    std::vector<uint8_t> newCsd0, newCsd1;
+    CMFormatDescriptionRef fdesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+    bool haveParams = fdesc ? ExtractEncoderParamSets(e, fdesc, &newCsd0, &newCsd1) : false;
+
+    std::vector<uint8_t> vclAnnexB = AvccBufferToAnnexB(
+        CMSampleBufferGetDataBuffer(sampleBuffer), e->nalLenSize);
+
+    bool produced = false;
+    {
+        std::lock_guard<std::mutex> lk(e->mu);
+        if (haveParams && (!e->csdSent || newCsd0 != e->csd0 || newCsd1 != e->csd1)) {
+            e->csd0 = std::move(newCsd0);
+            e->csd1 = std::move(newCsd1);
+            e->csdSent = true;
+            std::vector<uint8_t> combined = e->csd0;
+            combined.insert(combined.end(), e->csd1.begin(), e->csd1.end());
+            e->outQ.push_back({ std::move(combined), framePtsUs, kEncFlagCodecConfig });
+            produced = true;
+        }
+        if (!vclAnnexB.empty()) {
+            e->outQ.push_back({ std::move(vclAnnexB), framePtsUs,
+                                isKeyFrame ? kEncFlagKeyFrame : 0 });
+            produced = true;
+        }
+        e->cvInFlight.notify_all();
+    }
+    if (produced) {
+        NotifyJavaOutput(e);
+    }
+}
+
+void AttachYuvColorSpace(CVPixelBufferRef pb, int width, int height) {
+    CFStringRef matrix = (width >= 1280 || height >= 720)
+        ? kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        : kCVImageBufferYCbCrMatrix_ITU_R_601_4;
+    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrix, kCVAttachmentMode_ShouldPropagate);
+}
+
+CVPixelBufferRef BuildPixelBufferFromBytes(int width, int height, int colorFormat,
+                                           int stride, int sliceHeight,
+                                           const uint8_t* src, size_t srcLen) {
+    if (!src || srcLen == 0 || width <= 0 || height <= 0) return nullptr;
+
+    OSType cvFmt = 0;
+    bool isPlanarYuv = false;
+    bool isSemiPlanarYuv = false;
+    bool isRgbaSwapToBgra = false;
+
+    switch (colorFormat) {
+        case kColorFmtYUV420Planar:
+        case kColorFmtYUV420PackedPlanar:
+        case kColorFmtYUV420Flexible:
+            cvFmt = kCVPixelFormatType_420YpCbCr8Planar;
+            isPlanarYuv = true;
+            break;
+        case kColorFmtYUV420SemiPlanar:
+        case kColorFmtYUV420PackedSemiPlanar:
+            cvFmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+            isSemiPlanarYuv = true;
+            break;
+        case kColorFmt32BGRA8888:
+            cvFmt = kCVPixelFormatType_32BGRA;
+            break;
+        case kColorFmt32ARGB8888:
+            cvFmt = kCVPixelFormatType_32ARGB;
+            break;
+        case kColorFmt32ABGR8888:
+        case kColorFmtRGBAFlexible:
+            cvFmt = kCVPixelFormatType_32BGRA;
+            isRgbaSwapToBgra = true;
+            break;
+        default:
+            // Fallback heuristic if caller left colorFormat=0/default
+            cvFmt = kCVPixelFormatType_420YpCbCr8Planar;
+            isPlanarYuv = true;
+            break;
+    }
+
+    CVPixelBufferRef pb = nullptr;
+    @autoreleasepool {
+        NSDictionary* attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+        CVReturn r = CVPixelBufferCreate(
+            kCFAllocatorDefault, (size_t)width, (size_t)height,
+            cvFmt, (__bridge CFDictionaryRef)attrs, &pb);
+        if (r != kCVReturnSuccess || !pb) return nullptr;
+    }
+
+    CVPixelBufferLockBaseAddress(pb, 0);
+    if (isPlanarYuv) {
+        size_t yStride = (stride >= width) ? (size_t)stride : (size_t)width;
+        size_t sliceH = (sliceHeight >= height) ? (size_t)sliceHeight : (size_t)height;
+        size_t cw = (size_t)(width + 1) / 2;
+        size_t ch = (size_t)(height + 1) / 2;
+        size_t uvStride = (yStride + 1) / 2;
+        size_t uvSliceH = (sliceH + 1) / 2;
+
+        uint8_t* dstY = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        size_t dstYStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        for (int y = 0; y < height; y++) {
+            size_t off = (size_t)y * yStride;
+            if (off >= srcLen) break;
+            size_t cp = std::min((size_t)width, srcLen - off);
+            std::memcpy(dstY + (size_t)y * dstYStride, src + off, cp);
+        }
+
+        size_t uBase = yStride * sliceH;
+        uint8_t* dstU = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        size_t dstUStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+        for (size_t y = 0; y < ch; y++) {
+            size_t off = uBase + y * uvStride;
+            if (off >= srcLen) break;
+            size_t cp = std::min(cw, srcLen - off);
+            std::memcpy(dstU + y * dstUStride, src + off, cp);
+        }
+
+        size_t vBase = uBase + uvStride * uvSliceH;
+        uint8_t* dstV = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pb, 2);
+        size_t dstVStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 2);
+        for (size_t y = 0; y < ch; y++) {
+            size_t off = vBase + y * uvStride;
+            if (off >= srcLen) break;
+            size_t cp = std::min(cw, srcLen - off);
+            std::memcpy(dstV + y * dstVStride, src + off, cp);
+        }
+        AttachYuvColorSpace(pb, width, height);
+    } else if (isSemiPlanarYuv) {
+        size_t yStride = (stride >= width) ? (size_t)stride : (size_t)width;
+        size_t sliceH = (sliceHeight >= height) ? (size_t)sliceHeight : (size_t)height;
+        size_t ch = (size_t)(height + 1) / 2;
+        size_t uvRowBytes = ((size_t)(width + 1) / 2) * 2;
+        size_t uvSrcStride = std::max(uvRowBytes, yStride);
+
+        uint8_t* dstY = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        size_t dstYStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        for (int y = 0; y < height; y++) {
+            size_t off = (size_t)y * yStride;
+            if (off >= srcLen) break;
+            size_t cp = std::min((size_t)width, srcLen - off);
+            std::memcpy(dstY + (size_t)y * dstYStride, src + off, cp);
+        }
+
+        size_t uvBase = yStride * sliceH;
+        uint8_t* dstUV = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        size_t dstUVStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+        for (size_t y = 0; y < ch; y++) {
+            size_t off = uvBase + y * uvSrcStride;
+            if (off >= srcLen) break;
+            size_t cp = std::min(uvRowBytes, srcLen - off);
+            std::memcpy(dstUV + y * dstUVStride, src + off, cp);
+        }
+        AttachYuvColorSpace(pb, width, height);
+    } else {
+        size_t rowBytes = (size_t)width * 4;
+        size_t srcStride = (stride >= width * 4)
+            ? (size_t)stride
+            : (stride >= width ? (size_t)stride * 4 : rowBytes);
+        uint8_t* dst = (uint8_t*)CVPixelBufferGetBaseAddress(pb);
+        size_t dstStride = CVPixelBufferGetBytesPerRow(pb);
+        for (int y = 0; y < height; y++) {
+            size_t off = (size_t)y * srcStride;
+            if (off + rowBytes > srcLen) break;
+            const uint8_t* sRow = src + off;
+            uint8_t* dRow = dst + (size_t)y * dstStride;
+            if (isRgbaSwapToBgra) {
+                for (int x = 0; x < width; x++) {
+                    dRow[x * 4 + 0] = sRow[x * 4 + 2];
+                    dRow[x * 4 + 1] = sRow[x * 4 + 1];
+                    dRow[x * 4 + 2] = sRow[x * 4 + 0];
+                    dRow[x * 4 + 3] = sRow[x * 4 + 3];
+                }
+            } else {
+                std::memcpy(dRow, sRow, rowBytes);
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;
+}
+
+CVPixelBufferRef BuildPixelBufferFromArgb(int width, int height, const uint32_t* argb, size_t numPixels) {
+    if (!argb || width <= 0 || height <= 0) return nullptr;
+    CVPixelBufferRef pb = nullptr;
+    @autoreleasepool {
+        NSDictionary* attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+        CVReturn r = CVPixelBufferCreate(
+            kCFAllocatorDefault, (size_t)width, (size_t)height,
+            kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &pb);
+        if (r != kCVReturnSuccess || !pb) return nullptr;
+    }
+    CVPixelBufferLockBaseAddress(pb, 0);
+    uint8_t* dst = (uint8_t*)CVPixelBufferGetBaseAddress(pb);
+    size_t dstStride = CVPixelBufferGetBytesPerRow(pb);
+    size_t copyRows = std::min((size_t)height, numPixels / (size_t)width);
+    size_t rowBytes = (size_t)width * 4;
+    for (size_t y = 0; y < copyRows; y++) {
+        // Java 0xAARRGGBB in little-endian memory is [B, G, R, A] = kCVPixelFormatType_32BGRA.
+        std::memcpy(dst + y * dstStride, argb + y * (size_t)width, rowBytes);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;
+}
+
+int EncodePixelBuffer(VtEncoder* e, CVPixelBufferRef pb, int64_t ptsUs) {
+    if (!e || !e->session || !pb) return -1;
+    {
+        std::unique_lock<std::mutex> lk(e->mu);
+        constexpr int kMaxEncInFlight = 8;
+        if (e->inFlight.load(std::memory_order_relaxed) >= kMaxEncInFlight) {
+            e->cvInFlight.wait_for(lk, std::chrono::milliseconds(100), [&] {
+                return e->inFlight.load(std::memory_order_relaxed) < kMaxEncInFlight
+                    || e->closing.load(std::memory_order_acquire);
+            });
+        }
+        if (e->closing.load(std::memory_order_acquire)) return -2;
+    }
+
+    int64_t internalPtsUs;
+    {
+        std::lock_guard<std::mutex> lk(e->mu);
+        if (e->lastInternalPtsUs == INT64_MIN) {
+            internalPtsUs = (ptsUs >= 0) ? ptsUs : 0;
+        } else {
+            internalPtsUs = (ptsUs > e->lastInternalPtsUs) ? ptsUs : (e->lastInternalPtsUs + 1);
+        }
+        e->lastInternalPtsUs = internalPtsUs;
+        e->lastOrigPtsUs = ptsUs;
+    }
+
+    CMTime pts = CMTimeMake(internalPtsUs, 1000000);
+    CMTime dur = e->fps > 0.0f
+        ? CMTimeMake((int64_t)llround(1.0e6 / (double)e->fps), 1000000)
+        : kCMTimeInvalid;
+
+    CFDictionaryRef frameProps = nullptr;
+    if (e->forceKeyFrame.exchange(false, std::memory_order_acq_rel)) {
+        const void* keys[] = { kVTEncodeFrameOptionKey_ForceKeyFrame };
+        const void* vals[] = { kCFBooleanTrue };
+        frameProps = CFDictionaryCreate(
+            kCFAllocatorDefault, keys, vals, 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    }
+
+    EncFrameCtx* ctx = new EncFrameCtx{ e->generation.load(std::memory_order_relaxed), ptsUs };
+    VTEncodeInfoFlags flagsOut = 0;
+    e->inFlight.fetch_add(1, std::memory_order_relaxed);
+    OSStatus es = VTCompressionSessionEncodeFrame(
+        e->session, pb, pts, dur, frameProps, ctx, &flagsOut);
+    if (frameProps) CFRelease(frameProps);
+    if (es != noErr) {
+        int prev = e->inFlight.fetch_sub(1, std::memory_order_relaxed);
+        if (prev <= 0) e->inFlight.store(0, std::memory_order_relaxed);
+        delete ctx;
+        std::fprintf(stderr, "[video-toolbox] VTCompressionSessionEncodeFrame failed %d\n", (int)es);
+        return -3;
+    }
+    return 0;
 }
 
 }  // namespace
@@ -1247,8 +1941,8 @@ int macapk_vtb_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int 
     if (au && auLen > 0) {
         {
             std::unique_lock<std::mutex> lk(d->mu);
-            constexpr int kMaxInFlight = 4;
-            constexpr size_t kMaxQ = 6;
+            constexpr int kMaxInFlight = 16;
+            constexpr size_t kMaxQ = 20;
             if (d->inFlight.load(std::memory_order_relaxed) >= kMaxInFlight || d->outQ.size() >= kMaxQ) {
                 d->cvInFlight.wait_for(lk, std::chrono::milliseconds(50), [&] {
                     return d->inFlight.load(std::memory_order_relaxed) < kMaxInFlight && d->outQ.size() < kMaxQ;
@@ -1289,14 +1983,19 @@ int macapk_vtb_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int 
         }
         DecodeCtx* ctx = new DecodeCtx{ d, d->generation.load(std::memory_order_relaxed) };
         VTDecodeInfoFlags infoOut = 0;
+        static const bool sTemporal = []() {
+            const char* e = std::getenv("MACAPK_VTB_TEMPORAL_PROCESSING");
+            return e && std::strcmp(e, "1") == 0;
+        }();
+        VTDecodeFrameFlags decodeFlags = kVTDecodeFrame_EnableAsynchronousDecompression;
+        if (sTemporal) decodeFlags |= kVTDecodeFrame_EnableTemporalProcessing;
         d->inFlight.fetch_add(1, std::memory_order_relaxed);
         OSStatus ds = VTDecompressionSessionDecodeFrame(
-            d->session, sbuf,
-            kVTDecodeFrame_EnableAsynchronousDecompression | kVTDecodeFrame_EnableTemporalProcessing,
-            ctx, &infoOut);
+            d->session, sbuf, decodeFlags, ctx, &infoOut);
         CFRelease(sbuf);
         if (ds != noErr) {
             d->inFlight.fetch_sub(1, std::memory_order_relaxed);
+            d->cvInFlight.notify_all();
             std::fprintf(stderr, "[video-toolbox] VTDecompressionSessionDecodeFrame failed %d\n", (int)ds);
             delete ctx;
             return -5;
@@ -1323,7 +2022,30 @@ int macapk_vtb_poll(void* h, void** outPixbuf, int64_t* outPtsUs, int* outFlags)
     if (d->outQ.empty()) return 0;
     VtDecoder::OutFrame f = d->outQ.front();
     d->outQ.pop_front();
-    d->cvInFlight.notify_one();
+    d->cvInFlight.notify_all();
+    s_vtb_polled.fetch_add(1, std::memory_order_relaxed);
+    if (outPixbuf) *outPixbuf = f.pb;
+    if (outPtsUs)  *outPtsUs  = f.ptsUs;
+    if (outFlags)  *outFlags  = f.flags;
+    return 1;
+}
+
+// Waits briefly on d->cvInFlight when outQ is empty and decode work is in flight,
+// then pops the oldest ready frame. Returns 1 if popped, 0 if empty/timeout, -1 on error.
+int macapk_vtb_wait_poll(void* h, void** outPixbuf, int64_t* outPtsUs, int* outFlags, int64_t timeoutUs) {
+    VtDecoder* d = (VtDecoder*)h;
+    if (!d) return -1;
+    std::unique_lock<std::mutex> lk(d->mu);
+    if (d->outQ.empty() && timeoutUs != 0 && d->inFlight.load(std::memory_order_relaxed) > 0) {
+        int64_t waitUs = (timeoutUs < 0) ? 2000 : std::min<int64_t>(timeoutUs, 2000);
+        d->cvInFlight.wait_for(lk, std::chrono::microseconds(waitUs), [&] {
+            return !d->outQ.empty() || d->inFlight.load(std::memory_order_relaxed) <= 0;
+        });
+    }
+    if (d->outQ.empty()) return 0;
+    VtDecoder::OutFrame f = d->outQ.front();
+    d->outQ.pop_front();
+    d->cvInFlight.notify_all();
     s_vtb_polled.fetch_add(1, std::memory_order_relaxed);
     if (outPixbuf) *outPixbuf = f.pb;
     if (outPtsUs)  *outPtsUs  = f.ptsUs;
@@ -1527,6 +2249,303 @@ void macapk_vtb_selftest_tick(const char* mimeC, const char* path) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VideoToolbox Encoder C ABI
+// ---------------------------------------------------------------------------
+
+int macapk_vtb_enc_probe_mime(const char* mimeC, int* outHw) {
+    std::string mime = mimeC ? mimeC : "";
+    CMVideoCodecType fourcc = 0;
+    if (!EncMimeToFourcc(mime, &fourcc)) {
+        if (outHw) *outHw = 0;
+        return 0;
+    }
+    ProbeResult r = ProbeEncodeFourcc(fourcc);
+    if (outHw) *outHw = r.hw ? 1 : 0;
+    return r.supported ? 1 : 0;
+}
+
+void* macapk_vtb_enc_open(const char* mimeC, int width, int height,
+                          int bitrate, float frameRate, float iFrameIntervalSec,
+                          int profile, int bitrateMode,
+                          JavaVM* jvm, jobject callbackTarget, jmethodID onOutputMethod) {
+    if (width <= 0 || height <= 0) {
+        std::fprintf(stderr, "[video-toolbox] enc_open: invalid dimensions %dx%d\n", width, height);
+        return nullptr;
+    }
+    std::string mime = mimeC ? mimeC : "";
+    CMVideoCodecType fourcc = 0;
+    if (!EncMimeToFourcc(mime, &fourcc)) {
+        std::fprintf(stderr, "[video-toolbox] enc_open: unsupported mime '%s'\n", mime.c_str());
+        return nullptr;
+    }
+
+    VtEncoder* e = new VtEncoder();
+    e->codecType = fourcc;
+    e->width = width;
+    e->height = height;
+    e->fps = (frameRate > 0.0f) ? frameRate : 30.0f;
+    e->jvm = jvm;
+    e->javaTarget = callbackTarget;
+    e->onOutputMethod = onOutputMethod;
+
+    VTCompressionSessionRef session = nullptr;
+    bool hw = false;
+    @autoreleasepool {
+        NSDictionary* spec = @{
+            (id)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        };
+        NSDictionary* srcAttrs = @{
+            (id)kCVPixelBufferWidthKey: @(width),
+            (id)kCVPixelBufferHeightKey: @(height),
+            (id)kCVPixelBufferPixelFormatTypeKey: @[
+                @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                @(kCVPixelFormatType_420YpCbCr8Planar),
+                @(kCVPixelFormatType_32BGRA),
+                @(kCVPixelFormatType_32ARGB),
+            ],
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        OSStatus s = VTCompressionSessionCreate(
+            kCFAllocatorDefault, width, height, fourcc,
+            (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)srcAttrs,
+            kCFAllocatorDefault, EncOutputCallback, e, &session);
+        if (s != noErr || !session) {
+            s = VTCompressionSessionCreate(
+                kCFAllocatorDefault, width, height, fourcc,
+                nullptr, (__bridge CFDictionaryRef)srcAttrs,
+                kCFAllocatorDefault, EncOutputCallback, e, &session);
+        }
+        if (s != noErr || !session) {
+            char fcc[5]; FourccToChars(fourcc, fcc);
+            std::fprintf(stderr,
+                "[video-toolbox] enc_open: VTCompressionSessionCreate(%s, %dx%d) failed %d\n",
+                fcc, width, height, (int)s);
+            delete e;
+            return nullptr;
+        }
+
+        CFBooleanRef hwFlag = nullptr;
+        if (VTSessionCopyProperty(
+                session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                kCFAllocatorDefault, &hwFlag) == noErr && hwFlag) {
+            hw = CFBooleanGetValue(hwFlag);
+            CFRelease(hwFlag);
+        }
+
+        auto setIntProp = [&](CFStringRef key, int val) {
+            CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &val);
+            if (num) {
+                VTSessionSetProperty(session, key, num);
+                CFRelease(num);
+            }
+        };
+        auto setFloatProp = [&](CFStringRef key, float val) {
+            CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &val);
+            if (num) {
+                VTSessionSetProperty(session, key, num);
+                CFRelease(num);
+            }
+        };
+
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+        setFloatProp(kVTCompressionPropertyKey_ExpectedFrameRate, e->fps);
+
+        int effBitrate = bitrate > 0
+            ? bitrate
+            : std::max(500000, (int)std::min<int64_t>(20000000LL, (int64_t)width * (int64_t)height * 4LL));
+        setIntProp(kVTCompressionPropertyKey_AverageBitRate, effBitrate);
+        if (bitrateMode == 2 && effBitrate > 0) {
+            int bytesPerSec = std::max(1024, effBitrate / 8);
+            double oneSec = 1.0;
+            CFNumberRef bytesNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bytesPerSec);
+            CFNumberRef durNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &oneSec);
+            if (bytesNum && durNum) {
+                const void* vals[2] = { bytesNum, durNum };
+                CFArrayRef arr = CFArrayCreate(kCFAllocatorDefault, vals, 2, &kCFTypeArrayCallBacks);
+                if (arr) {
+                    VTSessionSetProperty(session, kVTCompressionPropertyKey_DataRateLimits, arr);
+                    CFRelease(arr);
+                }
+            }
+            if (bytesNum) CFRelease(bytesNum);
+            if (durNum) CFRelease(durNum);
+        }
+
+        if (iFrameIntervalSec == 0.0f) {
+            setIntProp(kVTCompressionPropertyKey_MaxKeyFrameInterval, 1);
+        } else if (iFrameIntervalSec > 0.0f) {
+            int gop = std::max(1, (int)llround((double)iFrameIntervalSec * (double)e->fps));
+            setIntProp(kVTCompressionPropertyKey_MaxKeyFrameInterval, gop);
+            setFloatProp(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, iFrameIntervalSec);
+        }
+
+        CFStringRef profLevel = nullptr;
+        if (fourcc == kCMVideoCodecType_H264) {
+            if (profile == 1 || profile == 65536) {
+                profLevel = kVTProfileLevel_H264_Baseline_AutoLevel;
+            } else if (profile == 2) {
+                profLevel = kVTProfileLevel_H264_Main_AutoLevel;
+            } else {
+                profLevel = kVTProfileLevel_H264_High_AutoLevel;
+            }
+        } else if (fourcc == kCMVideoCodecType_HEVC) {
+            profLevel = (profile == 2)
+                ? kVTProfileLevel_HEVC_Main10_AutoLevel
+                : kVTProfileLevel_HEVC_Main_AutoLevel;
+        }
+        if (profLevel) {
+            VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel, profLevel);
+        }
+
+        OSStatus ps = VTCompressionSessionPrepareToEncodeFrames(session);
+        if (ps != noErr) {
+            std::fprintf(stderr, "[video-toolbox] VTCompressionSessionPrepareToEncodeFrames warning %d\n", (int)ps);
+        }
+    }
+
+    e->session = session;
+    e->usingHardware = hw;
+    std::fprintf(stderr, "[video-toolbox] enc_open: mime=%s %dx%d fps=%.1f hw=%s\n",
+                 mime.c_str(), width, height, e->fps, hw ? "YES" : "no");
+    return e;
+}
+
+int macapk_vtb_enc_eos(void* h) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e || !e->session) return -1;
+    OSStatus s = VTCompressionSessionCompleteFrames(e->session, kCMTimeInvalid);
+    bool emitted = false;
+    {
+        std::lock_guard<std::mutex> lk(e->mu);
+        if (!e->eosEmitted) {
+            e->eosEmitted = true;
+            e->outQ.push_back({ {}, e->lastOrigPtsUs, kFlagEndOfStream });
+            emitted = true;
+        }
+        e->cvInFlight.notify_all();
+    }
+    if (emitted) NotifyJavaOutput(e);
+    return (s == noErr) ? 0 : -1;
+}
+
+int macapk_vtb_enc_encode_buf(void* h, const uint8_t* data, size_t len,
+                              int colorFormat, int stride, int sliceHeight,
+                              int64_t ptsUs, int eos) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e || !e->session) return -1;
+    int rc = 0;
+    if (data && len > 0) {
+        CVPixelBufferRef pb = BuildPixelBufferFromBytes(
+            e->width, e->height, colorFormat, stride, sliceHeight, data, len);
+        if (!pb) return -2;
+        rc = EncodePixelBuffer(e, pb, ptsUs);
+        CVPixelBufferRelease(pb);
+        if (rc != 0) return rc;
+    }
+    if (eos) {
+        int erc = macapk_vtb_enc_eos(h);
+        if (erc != 0 && rc == 0) rc = erc;
+    }
+    return rc;
+}
+
+int macapk_vtb_enc_encode_argb(void* h, const uint32_t* argb, size_t numPixels, int64_t ptsUs) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e || !e->session || !argb) return -1;
+    CVPixelBufferRef pb = BuildPixelBufferFromArgb(e->width, e->height, argb, numPixels);
+    if (!pb) return -2;
+    int rc = EncodePixelBuffer(e, pb, ptsUs);
+    CVPixelBufferRelease(pb);
+    return rc;
+}
+
+int macapk_vtb_enc_poll(void* h, std::vector<uint8_t>* outData, int64_t* outPtsUs, int* outFlags) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e) return -1;
+    std::lock_guard<std::mutex> lk(e->mu);
+    if (e->outQ.empty()) return 0;
+    VtEncoder::OutPacket pkt = std::move(e->outQ.front());
+    e->outQ.pop_front();
+    if (outData) *outData = std::move(pkt.data);
+    if (outPtsUs) *outPtsUs = pkt.ptsUs;
+    if (outFlags) *outFlags = pkt.flags;
+    return 1;
+}
+
+int macapk_vtb_enc_get_csd0(void* h, std::vector<uint8_t>* out) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e || !out) return 0;
+    std::lock_guard<std::mutex> lk(e->mu);
+    *out = e->csd0;
+    return out->empty() ? 0 : 1;
+}
+
+int macapk_vtb_enc_get_csd1(void* h, std::vector<uint8_t>* out) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e || !out) return 0;
+    std::lock_guard<std::mutex> lk(e->mu);
+    *out = e->csd1;
+    return out->empty() ? 0 : 1;
+}
+
+void macapk_vtb_enc_request_kf(void* h) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e) return;
+    e->forceKeyFrame.store(true, std::memory_order_release);
+}
+
+void macapk_vtb_enc_flush(void* h) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e) return;
+    e->generation.fetch_add(1, std::memory_order_relaxed);
+    if (e->session) {
+        VTCompressionSessionCompleteFrames(e->session, kCMTimeInvalid);
+    }
+    std::lock_guard<std::mutex> lk(e->mu);
+    e->outQ.clear();
+    e->eosEmitted = false;
+    e->csdSent = false;
+    e->csd0.clear();
+    e->csd1.clear();
+    e->lastInternalPtsUs = INT64_MIN;
+    e->lastOrigPtsUs = 0;
+    e->inFlight.store(0, std::memory_order_relaxed);
+    e->forceKeyFrame.store(true, std::memory_order_release);
+    e->cvInFlight.notify_all();
+}
+
+void macapk_vtb_enc_close(void* h, JNIEnv* env) {
+    VtEncoder* e = (VtEncoder*)h;
+    if (!e) return;
+    e->closing.store(true, std::memory_order_release);
+    e->cvInFlight.notify_all();
+    if (e->session) {
+        VTCompressionSessionCompleteFrames(e->session, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(e->session);
+        CFRelease(e->session);
+        e->session = nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> clk(e->cbMu);
+        if (e->javaTarget) {
+            if (env) {
+                env->DeleteWeakGlobalRef(e->javaTarget);
+            } else if (e->jvm) {
+                JNIEnv* curEnv = nullptr;
+                if (e->jvm->GetEnv((void**)&curEnv, JNI_VERSION_1_6) == JNI_OK && curEnv) {
+                    curEnv->DeleteWeakGlobalRef(e->javaTarget);
+                }
+            }
+            e->javaTarget = nullptr;
+        }
+        e->onOutputMethod = nullptr;
+        e->jvm = nullptr;
+    }
+    delete e;
+}
+
 }  // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -1568,26 +2587,197 @@ jboolean Java_com_macapk_loader_NativeMedia_nativeVideoIsHardware(JNIEnv* env, j
 // [maxWidth, maxHeight, maxMacroblocks, nPairs, profile0, level0, ...] in
 // Android CodecProfileLevel constants, or null when no per-profile probe
 // exists for `mime` (MediaCodecList then keeps the profile-less entry).
+static std::string VtcapsOsVersion() {
+    char buf[128] = {};
+    size_t sz = sizeof(buf) - 1;
+    if (sysctlbyname("kern.osversion", buf, &sz, nullptr, 0) != 0 || sz == 0) {
+        return "unknown";
+    }
+    std::string out(buf);
+    while (!out.empty() && (out.back() == '\0' || out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) {
+        out.pop_back();
+    }
+    return out.empty() ? std::string("unknown") : out;
+}
+
+static bool EnsureDirRecursive(const std::string& dir) {
+    if (dir.empty()) return false;
+    struct stat st{};
+    if (stat(dir.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
+    size_t slash = dir.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        if (!EnsureDirRecursive(dir.substr(0, slash))) return false;
+    }
+    if (mkdir(dir.c_str(), 0755) == 0 || errno == EEXIST) {
+        return stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    }
+    return false;
+}
+
+static std::string VtcapsPrimaryPath(std::string* outDir) {
+    const char* home = std::getenv("HOME");
+    if (!home || !home[0]) return {};
+    std::string dir = std::string(home) + "/Library/Caches/Mac.apk";
+    if (outDir) *outDir = dir;
+    return dir + "/vtcaps_v1.cache";
+}
+
+static std::string VtcapsFallbackPath() {
+    return std::string("/tmp/macapk_vtcaps_v1_") + std::to_string((unsigned long)getuid()) + ".cache";
+}
+
+static bool ReadVtcapsFile(const std::string& path, const std::string& osver,
+                           std::map<std::string, std::vector<int>>* out) {
+    if (path.empty()) return false;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return false;
+    char line[4096];
+    bool any = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        size_t len = std::strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        char* p1 = std::strchr(line, '\t');
+        if (!p1) continue;
+        *p1 = '\0';
+        if (std::strcmp(line, "v1") != 0) continue;
+        char* ver = p1 + 1;
+        char* p2 = std::strchr(ver, '\t');
+        if (!p2) continue;
+        *p2 = '\0';
+        if (osver != ver) continue;
+        char* mimeStr = p2 + 1;
+        char* p3 = std::strchr(mimeStr, '\t');
+        if (!p3) continue;
+        *p3 = '\0';
+        if (!mimeStr[0]) continue;
+        std::vector<int> vals;
+        char* cur = p3 + 1;
+        bool ok = true;
+        while (*cur) {
+            char* end = nullptr;
+            long v = std::strtol(cur, &end, 10);
+            if (end == cur) { ok = false; break; }
+            vals.push_back((int)v);
+            if (*end == ',') cur = end + 1;
+            else if (*end == '\0') break;
+            else { ok = false; break; }
+        }
+        if (ok && (int)vals.size() >= 4) {
+            (*out)[mimeStr] = std::move(vals);
+            any = true;
+        }
+    }
+    std::fclose(f);
+    return any;
+}
+
+static void LoadVtcapsFromDisk(const std::string& osver, std::map<std::string, std::vector<int>>* cache) {
+    std::string primary = VtcapsPrimaryPath(nullptr);
+    if (!ReadVtcapsFile(primary, osver, cache)) {
+        ReadVtcapsFile(VtcapsFallbackPath(), osver, cache);
+    }
+}
+
+static bool WriteVtcapsFileAtomic(const std::string& path, const std::string& osver,
+                                  const std::map<std::string, std::vector<int>>& cache) {
+    std::string tmp = path + ".tmp." + std::to_string((long long)getpid());
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (!f) return false;
+    for (const auto& kv : cache) {
+        if ((int)kv.second.size() < 4) continue;
+        std::fprintf(f, "v1\t%s\t%s\t", osver.c_str(), kv.first.c_str());
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            std::fprintf(f, "%s%d", (i == 0 ? "" : ","), kv.second[i]);
+        }
+        std::fputc('\n', f);
+    }
+    bool writeOk = (std::ferror(f) == 0);
+    if (std::fclose(f) != 0) writeOk = false;
+    if (!writeOk || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static void SaveVtcapsToDisk(const std::string& osver, const std::map<std::string, std::vector<int>>& cache) {
+    std::string dir;
+    std::string primary = VtcapsPrimaryPath(&dir);
+    if (!primary.empty() && EnsureDirRecursive(dir)) {
+        std::map<std::string, std::vector<int>> merged = cache;
+        ReadVtcapsFile(primary, osver, &merged);
+        for (const auto& kv : cache) {
+            if ((int)kv.second.size() >= 4) merged[kv.first] = kv.second;
+        }
+        if (WriteVtcapsFileAtomic(primary, osver, merged)) return;
+    }
+    std::string fallback = VtcapsFallbackPath();
+    std::map<std::string, std::vector<int>> merged = cache;
+    ReadVtcapsFile(fallback, osver, &merged);
+    for (const auto& kv : cache) {
+        if ((int)kv.second.size() >= 4) merged[kv.first] = kv.second;
+    }
+    WriteVtcapsFileAtomic(fallback, osver, merged);
+}
+
 // MediaCodecList caches the registry for the process, so this runs once per
 // mime; the one-line summary is the evidence of what the host answered.
 jintArray Java_com_macapk_loader_NativeMedia_nativeVideoCapabilities(JNIEnv* env, jclass, jstring jmime) {
     if (!jmime) return nullptr;
     const char* mime = env->GetStringUTFChars(jmime, nullptr);
     if (!mime) return nullptr;   // OOM: a pending OutOfMemoryError, nothing to release
-    int buf[256];
-    auto t0 = std::chrono::steady_clock::now();
-    int n = macapk_vtcaps_probe(mime, buf, 256);
-    long ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - t0).count();
-    if (n >= 4) {
-        std::fprintf(stderr,
-            "[video-toolbox] capabilities %s: max=%dx%d mbs=%d profile/level pairs=%d (decode-probed, %ld ms)\n",
-            mime, buf[0], buf[1], buf[2], buf[3], ms);
-    }
+    std::string key(mime);
     env->ReleaseStringUTFChars(jmime, mime);
-    if (n < 4) return nullptr;
-    jintArray arr = env->NewIntArray(n);
-    if (arr) env->SetIntArrayRegion(arr, 0, n, buf);
+
+    static std::mutex s_capsMu;
+    static std::map<std::string, std::vector<int>> s_capsCache;
+    static bool s_diskLoaded = false;
+    const char* diskEnv = std::getenv("MACAPK_VTCAPS_DISK_CACHE");
+    const bool useDisk = !(diskEnv && std::strcmp(diskEnv, "0") == 0);
+    const std::string osver = useDisk ? VtcapsOsVersion() : std::string();
+
+    std::vector<int> cached;
+    {
+        std::lock_guard<std::mutex> lk(s_capsMu);
+        if (useDisk && !s_diskLoaded) {
+            LoadVtcapsFromDisk(osver, &s_capsCache);
+            s_diskLoaded = true;
+        }
+        auto it = s_capsCache.find(key);
+        if (it != s_capsCache.end()) {
+            cached = it->second;
+            if ((int)cached.size() >= 4 && useDisk) {
+                static std::map<std::string, bool> s_loggedHit;
+                if (!s_loggedHit[key]) {
+                    s_loggedHit[key] = true;
+                    std::fprintf(stderr,
+                        "[video-toolbox] capabilities %s: max=%dx%d mbs=%d profile/level pairs=%d (cached, osv=%s)\n",
+                        key.c_str(), cached[0], cached[1], cached[2], cached[3], osver.c_str());
+                }
+            }
+        }
+    }
+    if (cached.empty()) {
+        int buf[256];
+        auto t0 = std::chrono::steady_clock::now();
+        int n = macapk_vtcaps_probe(key.c_str(), buf, 256);
+        long ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        if (n >= 4) {
+            std::fprintf(stderr,
+                "[video-toolbox] capabilities %s: max=%dx%d mbs=%d profile/level pairs=%d (decode-probed, %ld ms)\n",
+                key.c_str(), buf[0], buf[1], buf[2], buf[3], ms);
+            cached.assign(buf, buf + n);
+        }
+        std::lock_guard<std::mutex> lk(s_capsMu);
+        s_capsCache[key] = cached;
+        if (useDisk && (int)cached.size() >= 4) {
+            SaveVtcapsToDisk(osver, s_capsCache);
+        }
+    }
+    if ((int)cached.size() < 4) return nullptr;
+    jintArray arr = env->NewIntArray((jsize)cached.size());
+    if (arr) env->SetIntArrayRegion(arr, 0, (jsize)cached.size(), cached.data());
     return arr;
 }
 
@@ -1641,6 +2831,18 @@ jlongArray Java_com_macapk_loader_NativeMedia_nativeVidPoll(JNIEnv* env, jclass,
     return arr;
 }
 
+jlongArray Java_com_macapk_loader_NativeMedia_nativeVidWaitPoll(JNIEnv* env, jclass, jlong h, jlong timeoutUs) {
+    void* pb = nullptr;
+    int64_t pts = 0;
+    int flags = 0;
+    int got = macapk_vtb_wait_poll((void*)(uintptr_t)h, &pb, &pts, &flags, (int64_t)timeoutUs);
+    if (got <= 0) return nullptr;
+    jlongArray arr = env->NewLongArray(3);
+    jlong vals[3] = { (jlong)(uintptr_t)pb, (jlong)pts, (jlong)flags };
+    env->SetLongArrayRegion(arr, 0, 3, vals);
+    return arr;
+}
+
 jint Java_com_macapk_loader_NativeMedia_nativeVidQueueDepth(JNIEnv*, jclass, jlong h) {
     return (jint)macapk_vtb_queue_depth((void*)(uintptr_t)h);
 }
@@ -1650,11 +2852,84 @@ void Java_com_macapk_loader_NativeMedia_nativeVidRender(JNIEnv*, jclass, jlong p
     macapk_vtb_render_frame((void*)(uintptr_t)pixbuf, width, height);
 }
 
+static void PresentVideoFrameToSurfaceDispatch(void* pixbuf, int width, int height,
+                                                jobject target, int64_t presentationTimeNs,
+                                                bool hasExplicitTs) {
+    if (hasExplicitTs) {
+        using PresentAtTimeFn = void (*)(void*, int, int, jobject, int64_t, bool);
+        static PresentAtTimeFn s_fn = reinterpret_cast<PresentAtTimeFn>(
+            dlsym(RTLD_DEFAULT, "CocoaPresentVideoFrameToSurfaceAtTime"));
+        if (s_fn) {
+            s_fn(pixbuf, width, height, target, presentationTimeNs, true);
+            return;
+        }
+    }
+    CocoaPresentVideoFrameToSurface(pixbuf, width, height, target);
+}
+
 void Java_com_macapk_loader_NativeMedia_nativeVidRenderToSurface(JNIEnv*, jclass, jlong pixbuf,
                                                                 jint width, jint height, jobject target) {
     if (!pixbuf) return;
     s_vtb_rendered.fetch_add(1, std::memory_order_relaxed);
-    CocoaPresentVideoFrameToSurface((void*)(uintptr_t)pixbuf, width, height, target);
+    PresentVideoFrameToSurfaceDispatch((void*)(uintptr_t)pixbuf, width, height, target, 0, false);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidRenderToSurface__JIILandroid_graphics_SurfaceTexture_2(
+        JNIEnv* env, jclass cls, jlong pixbuf, jint width, jint height, jobject target) {
+    Java_com_macapk_loader_NativeMedia_nativeVidRenderToSurface(env, cls, pixbuf, width, height, target);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidRenderToSurface__JIILandroid_graphics_SurfaceTexture_2J(
+        JNIEnv*, jclass, jlong pixbuf, jint width, jint height, jobject target, jlong presentationTimeNs) {
+    if (!pixbuf) return;
+    s_vtb_rendered.fetch_add(1, std::memory_order_relaxed);
+    PresentVideoFrameToSurfaceDispatch(
+        (void*)(uintptr_t)pixbuf, width, height, target, static_cast<int64_t>(presentationTimeNs), true);
+}
+
+jint Java_com_macapk_loader_NativeMedia_nativeVidExportIOSurfacePort(JNIEnv*, jclass, jlong pixbuf) {
+    if (!pixbuf) return 0;
+    CVPixelBufferRef pb = reinterpret_cast<CVPixelBufferRef>(static_cast<uintptr_t>(pixbuf));
+    IOSurfaceRef io = CVPixelBufferGetIOSurface(pb);
+    if (!io) return 0;
+    mach_port_t port = IOSurfaceCreateMachPort(io);
+    return (jint)port;
+}
+
+static void PresentIOSurfacePortImpl(jint machPort, jint width, jint height,
+                                     jobject target, int64_t presentationTimeNs,
+                                     bool hasExplicitTs) {
+    mach_port_t port = static_cast<mach_port_t>(machPort);
+    if (port == MACH_PORT_NULL) return;
+    IOSurfaceRef io = IOSurfaceLookupFromMachPort(port);
+    mach_port_deallocate(mach_task_self(), port);
+    if (!io) return;
+    CVPixelBufferRef pb = nullptr;
+    @autoreleasepool {
+        NSDictionary* attrs = @{ (id)kCVPixelBufferMetalCompatibilityKey: @YES };
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, io,
+                                         (__bridge CFDictionaryRef)attrs, &pb);
+    }
+    CFRelease(io);
+    if (!pb) return;
+    s_vtb_rendered.fetch_add(1, std::memory_order_relaxed);
+    PresentVideoFrameToSurfaceDispatch((void*)pb, width, height, target, presentationTimeNs, hasExplicitTs);
+    CFRelease(pb);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidPresentIOSurfacePort(JNIEnv*, jclass, jint machPort,
+                                                                     jint width, jint height, jobject target) {
+    PresentIOSurfacePortImpl(machPort, width, height, target, 0, false);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidPresentIOSurfacePort__IIILandroid_graphics_SurfaceTexture_2(
+        JNIEnv*, jclass, jint machPort, jint width, jint height, jobject target) {
+    PresentIOSurfacePortImpl(machPort, width, height, target, 0, false);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidPresentIOSurfacePort__IIILandroid_graphics_SurfaceTexture_2J(
+        JNIEnv*, jclass, jint machPort, jint width, jint height, jobject target, jlong presentationTimeNs) {
+    PresentIOSurfacePortImpl(machPort, width, height, target, static_cast<int64_t>(presentationTimeNs), true);
 }
 
 void Java_com_macapk_loader_NativeMedia_nativeVidReleaseFrame(JNIEnv*, jclass, jlong pixbuf) {
@@ -1688,6 +2963,152 @@ void Java_com_macapk_loader_NativeMedia_nativeVidClose(JNIEnv*, jclass, jlong h)
     macapk_vtb_close((void*)(uintptr_t)h);
 }
 
+jobjectArray Java_com_macapk_loader_NativeMedia_nativeVideoEncodeSupportedMimes(JNIEnv* env, jclass) {
+    std::vector<std::string> mimes;
+    for (const auto& e : kEncMimeTable) {
+        if (ProbeEncodeFourcc(e.fourcc).supported) mimes.push_back(e.mime);
+    }
+    jclass strCls = env->FindClass("java/lang/String");
+    jobjectArray arr = env->NewObjectArray((jsize)mimes.size(), strCls, nullptr);
+    for (size_t i = 0; i < mimes.size(); i++) {
+        jstring s = env->NewStringUTF(mimes[i].c_str());
+        env->SetObjectArrayElement(arr, (jsize)i, s);
+        env->DeleteLocalRef(s);
+    }
+    env->DeleteLocalRef(strCls);
+    return arr;
+}
+
+jboolean Java_com_macapk_loader_NativeMedia_nativeVideoEncodeIsHardware(JNIEnv* env, jclass, jstring jmime) {
+    if (!jmime) return JNI_FALSE;
+    const char* mime = env->GetStringUTFChars(jmime, nullptr);
+    int hw = 0;
+    macapk_vtb_enc_probe_mime(mime, &hw);
+    env->ReleaseStringUTFChars(jmime, mime);
+    return hw ? JNI_TRUE : JNI_FALSE;
+}
+
+jlong Java_com_macapk_loader_NativeMedia_nativeVidEncOpen(JNIEnv* env, jclass, jstring jmime,
+                                                            jint width, jint height,
+                                                            jint bitrate, jfloat frameRate,
+                                                            jfloat iFrameIntervalSec,
+                                                            jint profile, jint bitrateMode,
+                                                            jobject callbackTarget) {
+    if (!jmime) return 0;
+    const char* mime = env->GetStringUTFChars(jmime, nullptr);
+    if (!mime) return 0;
+    JavaVM* jvm = nullptr;
+    env->GetJavaVM(&jvm);
+    jobject weakTarget = nullptr;
+    jmethodID onOutputMethod = nullptr;
+    if (callbackTarget) {
+        jclass cls = env->GetObjectClass(callbackTarget);
+        if (cls) {
+            onOutputMethod = env->GetMethodID(cls, "macapkOnNativeOutput", "()V");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                onOutputMethod = nullptr;
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (onOutputMethod) {
+            weakTarget = env->NewWeakGlobalRef(callbackTarget);
+        }
+    }
+    void* h = macapk_vtb_enc_open(mime, width, height, bitrate, frameRate, iFrameIntervalSec,
+                                  profile, bitrateMode, jvm, weakTarget, onOutputMethod);
+    if (!h && weakTarget) {
+        env->DeleteWeakGlobalRef(weakTarget);
+    }
+    env->ReleaseStringUTFChars(jmime, mime);
+    return (jlong)(uintptr_t)h;
+}
+
+jint Java_com_macapk_loader_NativeMedia_nativeVidEncEncodeBuffer(JNIEnv* env, jclass, jlong h,
+                                                                    jobject jdirect, jbyteArray jbytes,
+                                                                    jint offset, jint size,
+                                                                    jint colorFormat, jint stride, jint sliceHeight,
+                                                                    jlong ptsUs, jboolean eos) {
+    if (!h) return -1;
+    if (jdirect && size > 0) {
+        uint8_t* ptr = (uint8_t*)env->GetDirectBufferAddress(jdirect);
+        jlong cap = env->GetDirectBufferCapacity(jdirect);
+        if (!ptr || offset < 0 || size < 0 || (jlong)offset + (jlong)size > cap) return -2;
+        return macapk_vtb_enc_encode_buf((void*)(uintptr_t)h, ptr + offset, (size_t)size,
+                                         colorFormat, stride, sliceHeight, (int64_t)ptsUs, eos ? 1 : 0);
+    }
+    std::vector<uint8_t> tmp;
+    if (jbytes && size > 0) {
+        jsize arrLen = env->GetArrayLength(jbytes);
+        if (offset < 0 || size < 0 || (int64_t)offset + (int64_t)size > (int64_t)arrLen) return -2;
+        tmp.resize((size_t)size);
+        env->GetByteArrayRegion(jbytes, offset, size, (jbyte*)tmp.data());
+    }
+    return macapk_vtb_enc_encode_buf((void*)(uintptr_t)h,
+                                     tmp.empty() ? nullptr : tmp.data(), tmp.size(),
+                                     colorFormat, stride, sliceHeight, (int64_t)ptsUs, eos ? 1 : 0);
+}
+
+jint Java_com_macapk_loader_NativeMedia_nativeVidEncEncodeArgb(JNIEnv* env, jclass, jlong h,
+                                                                  jintArray jargb, jint width, jint height,
+                                                                  jlong ptsUs) {
+    if (!h || !jargb || width <= 0 || height <= 0) return -1;
+    jsize len = env->GetArrayLength(jargb);
+    if (len <= 0) return -2;
+    std::vector<uint32_t> tmp((size_t)len);
+    env->GetIntArrayRegion(jargb, 0, len, (jint*)tmp.data());
+    return macapk_vtb_enc_encode_argb((void*)(uintptr_t)h, tmp.data(), (size_t)len, (int64_t)ptsUs);
+}
+
+jint Java_com_macapk_loader_NativeMedia_nativeVidEncEndOfStream(JNIEnv*, jclass, jlong h) {
+    return macapk_vtb_enc_eos((void*)(uintptr_t)h);
+}
+
+jbyteArray Java_com_macapk_loader_NativeMedia_nativeVidEncPoll(JNIEnv* env, jclass, jlong h, jlongArray jmeta) {
+    std::vector<uint8_t> data;
+    int64_t ptsUs = 0;
+    int flags = 0;
+    int got = macapk_vtb_enc_poll((void*)(uintptr_t)h, &data, &ptsUs, &flags);
+    if (got <= 0) return nullptr;
+    if (jmeta && env->GetArrayLength(jmeta) >= 2) {
+        jlong meta[2] = { (jlong)ptsUs, (jlong)flags };
+        env->SetLongArrayRegion(jmeta, 0, 2, meta);
+    }
+    jbyteArray arr = env->NewByteArray((jsize)data.size());
+    if (arr && !data.empty()) {
+        env->SetByteArrayRegion(arr, 0, (jsize)data.size(), (const jbyte*)data.data());
+    }
+    return arr;
+}
+
+jbyteArray Java_com_macapk_loader_NativeMedia_nativeVidEncCsd0(JNIEnv* env, jclass, jlong h) {
+    std::vector<uint8_t> c;
+    if (!macapk_vtb_enc_get_csd0((void*)(uintptr_t)h, &c) || c.empty()) return nullptr;
+    jbyteArray arr = env->NewByteArray((jsize)c.size());
+    if (arr) env->SetByteArrayRegion(arr, 0, (jsize)c.size(), (const jbyte*)c.data());
+    return arr;
+}
+
+jbyteArray Java_com_macapk_loader_NativeMedia_nativeVidEncCsd1(JNIEnv* env, jclass, jlong h) {
+    std::vector<uint8_t> c;
+    if (!macapk_vtb_enc_get_csd1((void*)(uintptr_t)h, &c) || c.empty()) return nullptr;
+    jbyteArray arr = env->NewByteArray((jsize)c.size());
+    if (arr) env->SetByteArrayRegion(arr, 0, (jsize)c.size(), (const jbyte*)c.data());
+    return arr;
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidEncRequestKeyFrame(JNIEnv*, jclass, jlong h) {
+    macapk_vtb_enc_request_kf((void*)(uintptr_t)h);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidEncFlush(JNIEnv*, jclass, jlong h) {
+    macapk_vtb_enc_flush((void*)(uintptr_t)h);
+}
+
+void Java_com_macapk_loader_NativeMedia_nativeVidEncClose(JNIEnv* env, jclass, jlong h) {
+    macapk_vtb_enc_close((void*)(uintptr_t)h, env);
+}
+
 }  // extern "C"
 
 namespace macapk { namespace video {
@@ -1705,12 +3126,22 @@ static const JNINativeMethod kNativeVideoMethods[] = {
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidDecode},
     {(char*)"nativeVidPoll",             (char*)"(J)[J",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidPoll},
+    {(char*)"nativeVidWaitPoll",         (char*)"(JJ)[J",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidWaitPoll},
     {(char*)"nativeVidQueueDepth",       (char*)"(J)I",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidQueueDepth},
     {(char*)"nativeVidRender",           (char*)"(JII)V",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidRender},
     {(char*)"nativeVidRenderToSurface",  (char*)"(JIILandroid/graphics/SurfaceTexture;)V",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidRenderToSurface},
+    {(char*)"nativeVidRenderToSurface",  (char*)"(JIILandroid/graphics/SurfaceTexture;J)V",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidRenderToSurface__JIILandroid_graphics_SurfaceTexture_2J},
+    {(char*)"nativeVidExportIOSurfacePort", (char*)"(J)I",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidExportIOSurfacePort},
+    {(char*)"nativeVidPresentIOSurfacePort", (char*)"(IIILandroid/graphics/SurfaceTexture;)V",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidPresentIOSurfacePort},
+    {(char*)"nativeVidPresentIOSurfacePort", (char*)"(IIILandroid/graphics/SurfaceTexture;J)V",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidPresentIOSurfacePort__IIILandroid_graphics_SurfaceTexture_2J},
     {(char*)"nativeVidReleaseFrame",     (char*)"(J)V",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidReleaseFrame},
     {(char*)"nativeVidFrameBgra",        (char*)"(J[B[I)I",
@@ -1719,6 +3150,30 @@ static const JNINativeMethod kNativeVideoMethods[] = {
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidFlush},
     {(char*)"nativeVidClose",            (char*)"(J)V",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidClose},
+    {(char*)"nativeVideoEncodeSupportedMimes", (char*)"()[Ljava/lang/String;",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVideoEncodeSupportedMimes},
+    {(char*)"nativeVideoEncodeIsHardware",     (char*)"(Ljava/lang/String;)Z",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVideoEncodeIsHardware},
+    {(char*)"nativeVidEncOpen",                (char*)"(Ljava/lang/String;IIIFFIILjava/lang/Object;)J",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncOpen},
+    {(char*)"nativeVidEncEncodeBuffer",        (char*)"(JLjava/nio/ByteBuffer;[BIIIIIJZ)I",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncEncodeBuffer},
+    {(char*)"nativeVidEncEncodeArgb",          (char*)"(J[IIIJ)I",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncEncodeArgb},
+    {(char*)"nativeVidEncEndOfStream",         (char*)"(J)I",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncEndOfStream},
+    {(char*)"nativeVidEncPoll",                (char*)"(J[J)[B",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncPoll},
+    {(char*)"nativeVidEncCsd0",                (char*)"(J)[B",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncCsd0},
+    {(char*)"nativeVidEncCsd1",                (char*)"(J)[B",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncCsd1},
+    {(char*)"nativeVidEncRequestKeyFrame",     (char*)"(J)V",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncRequestKeyFrame},
+    {(char*)"nativeVidEncFlush",               (char*)"(J)V",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncFlush},
+    {(char*)"nativeVidEncClose",               (char*)"(J)V",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidEncClose},
 };
 
 // Called from native_methods.cpp::RegisterAllNativeMethods at boot, right

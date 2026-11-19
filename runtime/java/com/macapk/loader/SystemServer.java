@@ -188,6 +188,14 @@ public final class SystemServer {
     /** Processes this broker spawned (service hosts), by pid. Everything else
      *  that attaches is an app the user opened: those keep the broker alive. */
     private final Map<Long, Process> spawned = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Package owning each broker-spawned pid, for per-package cleanup on app close. */
+    private final Map<Long, String> spawnedPackages = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Packages currently tearing down after their open primary process died. */
+    private final Map<String, Long> tearingDownPackages = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Spawned pids currently slated for teardown, retained so late TX_REGISTER still sees wasSpawned=true. */
+    private final java.util.Set<Long> tearingDownVictimPids = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicLong teardownGenSeq =
+            new java.util.concurrent.atomic.AtomicLong(0L);
     /** Last time an app the user opened was running (see BrokerIdle). */
     private volatile long lastClientMs = System.currentTimeMillis();
     /** An app the user opened has attached at least once. Until then the broker
@@ -293,10 +301,32 @@ public final class SystemServer {
         return ensureRunning(pr, proc);
     }
 
+    private static boolean isLaunchableUserApp(PackageRecord pr) {
+        return pr != null && pr.manifest != null
+                && pr.manifest.launchableActivity != null
+                && !MacApkPackageManager.platformSystemPackage(pr.pkg);
+    }
+
+    private static boolean shouldRefuseSamePackageMainRespawn(PackageRecord pr, String proc, String callerPkg) {
+        return callerPkg != null && callerPkg.equals(pr.pkg)
+                && isLaunchableUserApp(pr) && proc.equals(mainProcessOf(pr));
+    }
+
     AppRecord ensureRunning(PackageRecord pr, String proc) throws Exception {
+        return ensureRunning(pr, proc, null);
+    }
+
+    AppRecord ensureRunning(PackageRecord pr, String proc, String callerPkg) throws Exception {
+        if (tearingDownPackages.containsKey(pr.pkg)) {
+            throw new IllegalStateException(pr.pkg + " is tearing down");
+        }
         synchronized (this) {
             AppRecord r = running.get(proc);
             if (r != null && r.thread.isBinderAlive()) return r;
+            if (shouldRefuseSamePackageMainRespawn(pr, proc, callerPkg)) {
+                throw new IllegalStateException(
+                        "refusing to cold-spawn main process " + proc + " from same-package caller");
+            }
         }
         // A package's processes share its on-disk state, and the first start of
         // an app converts its DEX into a code cache the runtime does not lock. So
@@ -306,10 +336,17 @@ public final class SystemServer {
         // start in parallel. The lock is held to attach, not for the process's
         // lifetime.
         synchronized (startLock(pr.pkg)) {
+            if (tearingDownPackages.containsKey(pr.pkg)) {
+                throw new IllegalStateException(pr.pkg + " is tearing down");
+            }
             CompletableFuture<AppRecord> f;
             synchronized (this) {
                 AppRecord r = running.get(proc);
                 if (r != null && r.thread.isBinderAlive()) return r;
+                if (shouldRefuseSamePackageMainRespawn(pr, proc, callerPkg)) {
+                    throw new IllegalStateException(
+                            "refusing to cold-spawn main process " + proc + " from same-package caller");
+                }
                 f = starting.get(proc);
                 if (f == null) {
                     f = new CompletableFuture<>();
@@ -333,6 +370,32 @@ public final class SystemServer {
     /** Installed bundles by package (product mode, from the registry). */
     private final Map<String, String> bundles = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Resolve the installed bundle's internal copy of base.apk when available so
+     *  the background LaunchAgent does not touch TCC-protected folders such as
+     *  ~/Downloads on startup. Falls back to the registry apkPath otherwise. */
+    static String resolveInstalledApkPath(MacApkPackageManager.InstalledRegistry.Row r) {
+        if (r == null) return null;
+        if (r.bundlePath != null && !r.bundlePath.isEmpty()) {
+            File appDir = new File(r.bundlePath, "Contents/android/data/app");
+            File[] tiers = appDir.listFiles();
+            if (tiers != null) {
+                for (File tier : tiers) {
+                    if (!tier.isDirectory()) continue;
+                    File direct = new File(tier, "base.apk");
+                    if (direct.isFile()) return direct.getAbsolutePath();
+                    File[] pkgs = tier.listFiles();
+                    if (pkgs == null) continue;
+                    for (File pkgDir : pkgs) {
+                        if (!pkgDir.isDirectory()) continue;
+                        File apk = new File(pkgDir, "base.apk");
+                        if (apk.isFile()) return apk.getAbsolutePath();
+                    }
+                }
+            }
+        }
+        return (r.apkPath != null && new File(r.apkPath).isFile()) ? r.apkPath : null;
+    }
+
     /** Product mode: every installed app in the Mac.apk registry, by its own
      *  installed APK, each started through its own installed stub. The
      *  registry's reserved-Google filter is about what other apps'
@@ -341,17 +404,23 @@ public final class SystemServer {
      *  question, so it reads the raw rows. */
     void addInstalledPackages() {
         Map<String, MacApkPackageManager.InstalledRegistry.Row> best = new LinkedHashMap<>();
+        Map<String, String> resolvedApk = new LinkedHashMap<>();
         for (MacApkPackageManager.InstalledRegistry.Row r : MacApkPackageManager.InstalledRegistry.rows()) {
-            if (r.pkg == null || r.apkPath == null || !new File(r.apkPath).isFile()) continue;
+            if (r.pkg == null) continue;
+            String apk = resolveInstalledApkPath(r);
+            if (apk == null) continue;
             // The process-only broker must not expose/start Google/system apps
             // while the owner's separate Google-services switch is off.
             if ("1".equals(System.getenv("MACAPK_BROKER_APP_PROCESSES_ONLY"))
                     && MacApkPackageManager.platformSystemPackage(r.pkg)) continue;
             MacApkPackageManager.InstalledRegistry.Row cur = best.get(r.pkg);
-            if (cur == null || r.versionCode > cur.versionCode) best.put(r.pkg, r);
+            if (cur == null || r.versionCode > cur.versionCode) {
+                best.put(r.pkg, r);
+                resolvedApk.put(r.pkg, apk);
+            }
         }
         for (MacApkPackageManager.InstalledRegistry.Row r : best.values()) {
-            addPackage(r.apkPath);
+            addPackage(resolvedApk.get(r.pkg));
             if (r.bundlePath != null) bundles.put(r.pkg, r.bundlePath);
         }
     }
@@ -393,7 +462,8 @@ public final class SystemServer {
         // bare JVM runs with logging closed (MACAPK_LOG_LEVEL=7) and its own
         // package list, none of which applies to the process it starts.
         for (String k : new String[] { "MACAPK_LOG_LEVEL", "MACAPK_BROKER_APKS",
-                "MACAPK_BROKER_RUNTIME", "MACAPK_BROKER_ROOT", "MACAPK_BROKER_LOGDIR" }) {
+                "MACAPK_BROKER_RUNTIME", "MACAPK_BROKER_ROOT", "MACAPK_BROKER_LOGDIR",
+                "MACAPK_BROKER_READY_FILE" }) {
             env.remove(k);
         }
         env.put("MACAPK_SERVICE_HOST", "1");
@@ -413,7 +483,9 @@ public final class SystemServer {
         if (!proc.equals(mainProcessOf(pr))) env.put("MACAPK_SECONDARY_PROCESS", "1");
         String logDir = System.getenv("MACAPK_BROKER_LOGDIR");
         if (logDir != null && !logDir.isEmpty()) {
-            File lf = new File(logDir, (proc.equals(mainProcessOf(pr)) ? pr.pkg : fileSafe(proc)) + ".log");
+            File ld = new File(logDir);
+            ld.mkdirs();
+            File lf = new File(ld, (proc.equals(mainProcessOf(pr)) ? pr.pkg : fileSafe(proc)) + ".log");
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(lf));
         } else {
@@ -423,8 +495,11 @@ public final class SystemServer {
         Process p = pb.start();
         log("starting " + proc + " (pid " + p.pid() + ") as a service host");
         spawned.put(p.pid(), p);
+        spawnedPackages.put(p.pid(), pr.pkg);
         p.onExit().thenAccept(x -> {
             spawned.remove(p.pid());
+            spawnedPackages.remove(p.pid(), pr.pkg);
+            tearingDownVictimPids.remove(p.pid());
             synchronized (SystemServer.this) {
                 CompletableFuture<AppRecord> f = starting.remove(proc);
                 if (f != null) f.completeExceptionally(
@@ -433,16 +508,129 @@ public final class SystemServer {
         });
     }
 
+    private int openAppsForPackage(String pkg) {
+        int n = 0;
+        for (AppRecord r : running.values()) {
+            if (pkg.equals(r.pkg) && r.thread.isBinderAlive()
+                    && !spawned.containsKey((long) r.pid)
+                    && !tearingDownVictimPids.contains((long) r.pid)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private boolean belongsToPackage(String pkg, String proc) {
+        if (pkg == null || proc == null) return false;
+        if (proc.equals(pkg) || proc.startsWith(pkg + ":")) return true;
+        PackageRecord pr = packages.get(pkg);
+        return pr != null && proc.equals(mainProcessOf(pr));
+    }
+
+    private void collectSpawnedForPackage(String pkg, List<Process> victims, java.util.Set<Long> seenPids) {
+        for (Map.Entry<Long, String> e : spawnedPackages.entrySet()) {
+            if (!pkg.equals(e.getValue())) continue;
+            Long spid = e.getKey();
+            Process p = spawned.get(spid);
+            if (p == null) continue;
+            tearingDownVictimPids.add(spid);
+            if (seenPids.add(spid)) victims.add(p);
+        }
+    }
+
+    private static boolean isVictimPid(List<Process> victims, int pid) {
+        for (Process p : victims) {
+            if (p.pid() == (long) pid) return true;
+        }
+        return false;
+    }
+
+    private void teardownPackageSpawned(String pkg, long gen, List<Process> initialVictims) {
+        try {
+            List<Process> victims = new ArrayList<>(initialVictims);
+            java.util.Set<Long> seenPids = new java.util.HashSet<>();
+            for (Process p : initialVictims) seenPids.add(p.pid());
+            synchronized (startLock(pkg)) {
+                synchronized (SystemServer.this) {
+                    if (openAppsForPackage(pkg) == 0) {
+                        collectSpawnedForPackage(pkg, victims, seenPids);
+                        for (java.util.Iterator<Map.Entry<String, AppRecord>> it = running.entrySet().iterator();
+                             it.hasNext(); ) {
+                            AppRecord ar = it.next().getValue();
+                            if (pkg.equals(ar.pkg) && (!ar.thread.isBinderAlive()
+                                    || isVictimPid(victims, ar.pid))) {
+                                it.remove();
+                            }
+                        }
+                    }
+                }
+                if (!victims.isEmpty()) {
+                    log("app " + pkg + " closed; stopping " + victims.size() + " spawned process(es)");
+                    terminateProcessList(victims, 400L);
+                    for (Process p : victims) {
+                        if (!p.isAlive()) {
+                            long spid = p.pid();
+                            spawned.remove(spid, p);
+                            spawnedPackages.remove(spid, pkg);
+                            tearingDownVictimPids.remove(spid);
+                        }
+                    }
+                }
+            }
+        } finally {
+            tearingDownPackages.remove(pkg, gen);
+        }
+    }
+
     synchronized void register(String pkg, String proc, IBinder thread, int pid) {
+        final boolean wasSpawned = spawned.containsKey((long) pid) || tearingDownVictimPids.contains((long) pid);
+        if (wasSpawned && tearingDownPackages.containsKey(pkg)) {
+            CompletableFuture<AppRecord> pending = starting.remove(proc);
+            if (pending != null) pending.completeExceptionally(new IllegalStateException(pkg + " closed"));
+            Process victim = spawned.get((long) pid);
+            if (victim != null && victim.isAlive()) victim.destroyForcibly();
+            log(proc + " (pid " + pid + ") rejected attach during " + pkg + " teardown");
+            return;
+        }
+        if (!wasSpawned) tearingDownPackages.remove(pkg);
         AppRecord r = new AppRecord(pkg, proc, thread, pid);
         running.put(proc, r);
         try {
             thread.linkToDeath(() -> {
+                boolean teardownPkg = false;
+                long teardownGen = 0L;
+                List<Process> initialVictims = java.util.Collections.emptyList();
                 synchronized (SystemServer.this) {
                     if (running.get(proc) == r) running.remove(proc);
                     lastClientMs = System.currentTimeMillis();   // the grace runs from the last close
+                    if (!wasSpawned && !stopping && openAppsForPackage(pkg) == 0) {
+                        teardownPkg = true;
+                        teardownGen = teardownGenSeq.incrementAndGet();
+                        tearingDownPackages.put(pkg, teardownGen);
+                        for (java.util.Iterator<Map.Entry<String, CompletableFuture<AppRecord>>> it =
+                                     starting.entrySet().iterator(); it.hasNext(); ) {
+                            Map.Entry<String, CompletableFuture<AppRecord>> e = it.next();
+                            if (belongsToPackage(pkg, e.getKey())) {
+                                e.getValue().completeExceptionally(
+                                        new IllegalStateException(pkg + " closed"));
+                                it.remove();
+                            }
+                        }
+                        List<Process> collected = new ArrayList<>();
+                        collectSpawnedForPackage(pkg, collected, new java.util.HashSet<>());
+                        initialVictims = collected;
+                    }
                 }
                 log(proc + " (pid " + pid + ") died");
+                if (teardownPkg) {
+                    final long fGen = teardownGen;
+                    final List<Process> fVictims = initialVictims;
+                    Thread cleanup = new Thread(
+                            () -> teardownPackageSpawned(pkg, fGen, fVictims),
+                            "broker-teardown-" + fileSafe(pkg));
+                    cleanup.setDaemon(true);
+                    cleanup.start();
+                }
                 reviveSystemApp(proc);
             }, 0);
         } catch (RemoteException e) {
@@ -451,8 +639,8 @@ public final class SystemServer {
         }
         CompletableFuture<AppRecord> f = starting.remove(proc);
         if (f != null) f.complete(r);
-        if (!spawned.containsKey((long) pid)) { lastClientMs = System.currentTimeMillis(); sawOpenApp = true; }
-        log(proc + " attached (pid " + pid + ")" + (spawned.containsKey((long) pid) ? "" : " [open app]"));
+        if (!wasSpawned) { lastClientMs = System.currentTimeMillis(); sawOpenApp = true; }
+        log(proc + " attached (pid " + pid + ")" + (wasSpawned ? "" : " [open app]"));
         final AppRecord fr = r;
         new Thread(() -> sendBootBroadcasts(fr), "broker-boot").start();
     }
@@ -468,9 +656,13 @@ public final class SystemServer {
 
     /** The process serving component `cls` of `pkg`, started on demand. */
     AppRecord ensureServiceProcess(String pkg, String cls) throws Exception {
+        return ensureServiceProcess(pkg, cls, null);
+    }
+
+    AppRecord ensureServiceProcess(String pkg, String cls, String callerPkg) throws Exception {
         PackageRecord pr = packages.get(pkg);
         if (pr == null) throw new IllegalStateException("unknown package " + pkg);
-        return ensureRunning(pr, processOf(pr, cls));
+        return ensureRunning(pr, processOf(pr, cls), callerPkg);
     }
 
     /** Every live process of `pkg`. */
@@ -725,7 +917,7 @@ public final class SystemServer {
             synchronized (this) { app = running.get(proc); }
             if (app == null || !app.thread.isBinderAlive()) {
                 if (!mayStart || !owners.contains(proc)) continue;
-                try { app = ensureRunning(pr, proc); } catch (Throwable t) {
+                try { app = ensureRunning(pr, proc, fromSystem ? pkg : null); } catch (Throwable t) {
                     log("broadcast " + intent.getAction() + " -> " + proc + ": start FAILED " + t);
                     continue;
                 }
@@ -991,7 +1183,7 @@ public final class SystemServer {
             return null;
         }
         try {
-            AppRecord app = ensureRunning(pr, processOf(pr, e.name));
+            AppRecord app = ensureRunning(pr, processOf(pr, e.name), caller);
             Parcel d = Parcel.obtain(), r = Parcel.obtain();
             try {
                 d.writeInterfaceToken(THREAD_DESCRIPTOR);
@@ -1016,7 +1208,7 @@ public final class SystemServer {
         Manifest.ServiceEntry se = packages.get(target[0]).manifest.services.get(target[1]);
         if (!se.exported && !target[0].equals(caller)) return;
         try {
-            AppRecord app = ensureServiceProcess(target[0], target[1]);
+            AppRecord app = ensureServiceProcess(target[0], target[1], caller);
             Intent explicit = new Intent(intent);
             explicit.setComponent(new ComponentName(target[0], target[1]));
             Parcel d = Parcel.obtain(), r = Parcel.obtain();
@@ -1083,7 +1275,7 @@ public final class SystemServer {
                     // A job is the app's own (JobScheduler only schedules for the
                     // caller's uid): another package's service is refused.
                     if (pr != null && pr.pkg.equals(caller)) {
-                        AppRecord app = ensureServiceProcess(pr.pkg, svc.getClassName());
+                        AppRecord app = ensureServiceProcess(pr.pkg, svc.getClassName(), caller);
                         Parcel d = Parcel.obtain(), r = Parcel.obtain();
                         try {
                             d.writeInterfaceToken(THREAD_DESCRIPTOR);
@@ -1169,7 +1361,7 @@ public final class SystemServer {
             return;
         }
         try {
-            AppRecord app = ensureServiceProcess(target[0], target[1]);
+            AppRecord app = ensureServiceProcess(target[0], target[1], caller);
             Intent explicit = new Intent(intent);
             explicit.setComponent(new ComponentName(target[0], target[1]));
             Parcel d = Parcel.obtain(), r = Parcel.obtain();
@@ -1229,20 +1421,41 @@ public final class SystemServer {
         t.start();
     }
 
+    private static void terminateProcessList(List<Process> victims, long waitMs) {
+        for (Process p : victims) p.destroy();   // SIGTERM, as the runtime's own shutdown expects
+        long deadline = System.currentTimeMillis() + waitMs;
+        for (Process p : victims) {
+            try { p.waitFor(Math.max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if (p.isAlive()) { log("pid " + p.pid() + " ignored SIGTERM; killing"); p.destroyForcibly(); }
+        }
+        for (Process p : victims) {
+            if (p.isAlive()) {
+                try { p.waitFor(200L, TimeUnit.MILLISECONDS); }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+    }
+
+    private List<Process> terminateSpawned(long waitMs) {
+        List<Process> victims = new ArrayList<>(spawned.values());
+        terminateProcessList(victims, waitMs);
+        return victims;
+    }
+
     /** Stop the spawned processes and exit, unless an app opened meanwhile.
      *  @return true when the broker is exiting. */
     private boolean stopIdle() {
         log("idle: no open Android app for " + (BrokerIdle.graceMs() / 1000) + "s; stopping service processes");
         stopping = true;
         readyFile().delete();   // a stopped broker's readiness is nobody's
-        List<Process> victims = new ArrayList<>(spawned.values());
-        for (Process p : victims) p.destroy();   // SIGTERM, as the runtime's own shutdown expects
-        long deadline = System.currentTimeMillis() + 5_000;
-        for (Process p : victims) {
-            try { p.waitFor(Math.max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS); }
-            catch (InterruptedException e) { break; }
-            if (p.isAlive()) { log("pid " + p.pid() + " ignored SIGTERM; killing"); p.destroyForcibly(); }
-        }
+        List<Process> victims = terminateSpawned(5_000);
         booted.clear();      // a broker that starts again is a new boot: every
         bootKicked.clear();  // system app gets its boot broadcasts again
         synchronized (this) {
@@ -1285,6 +1498,13 @@ public final class SystemServer {
                 + ProcessHandle.current().pid() + ")");
         s.bootSystemServices();
         boolean product = apks == null || apks.isBlank();
+        if (!product) {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                s.stopping = true;
+                s.terminateSpawned(2_000);
+                readyFile().delete();
+            }, "broker-shutdown"));
+        }
         if (BrokerIdle.enabled(product)) {
             log("idle exit on: the broker stops " + (BrokerIdle.graceMs() / 1000) + "s after the last open app closes");
             s.watchIdle(BrokerIdle.graceMs());

@@ -1131,10 +1131,12 @@ public class GLSurfaceView extends SurfaceView
             || mEGLContextFactory != null
             || mEGLWindowSurfaceFactory != null;
     }
-    public void setDebugFlags(int flags) {}
-    public int  getDebugFlags() { return 0; }
-    public void setPreserveEGLContextOnPause(boolean preserve) {}
-    public boolean getPreserveEGLContextOnPause() { return false; }
+    private int mDebugFlags;
+    private boolean mPreserveEGLContextOnPause;
+    public void setDebugFlags(int flags) { mDebugFlags = flags; }
+    public int  getDebugFlags() { return mDebugFlags; }
+    public void setPreserveEGLContextOnPause(boolean preserve) { mPreserveEGLContextOnPause = preserve; }
+    public boolean getPreserveEGLContextOnPause() { return mPreserveEGLContextOnPause; }
 
     // ---- Public callback / chooser interfaces ----
     public interface Renderer {

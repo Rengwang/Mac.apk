@@ -68,9 +68,8 @@ public class AssetFileDescriptor implements java.io.Closeable, android.os.Parcel
 
     public java.io.FileInputStream createInputStream() throws java.io.IOException {
         if (mFd == null) return null;
-        java.io.FileInputStream in = new java.io.FileInputStream(mFd.getFileDescriptor());
-        if (mStartOffset > 0) in.skip(mStartOffset);
-        return in;
+        return mLength < 0 && mStartOffset == 0
+            ? new ParcelFileDescriptor.AutoCloseInputStream(mFd) : new AutoCloseInputStream(this);
     }
 
     public java.io.FileOutputStream createOutputStream() throws java.io.IOException {
@@ -183,6 +182,31 @@ public class AssetFileDescriptor implements java.io.Closeable, android.os.Parcel
 
         @Override public int read(byte[] buffer) throws java.io.IOException {
             return read(buffer, 0, buffer.length);
+        }
+
+        @Override public byte[] readAllBytes() throws java.io.IOException {
+            return mRemaining < 0 ? super.readAllBytes() : readNBytes(Integer.MAX_VALUE);
+        }
+
+        @Override public byte[] readNBytes(int length) throws java.io.IOException {
+            if (length < 0) throw new IllegalArgumentException("length < 0");
+            if (mRemaining < 0) return super.readNBytes(length);
+            return new java.io.FilterInputStream(this) {}.readNBytes(
+                (int) Math.min(length, mRemaining));
+        }
+
+        @Override public long transferTo(java.io.OutputStream out) throws java.io.IOException {
+            if (mRemaining < 0) return super.transferTo(out);
+            java.util.Objects.requireNonNull(out);
+            byte[] buffer = new byte[(int) Math.min(mRemaining, 8192)];
+            long written = 0;
+            while (mRemaining > 0) {
+                int count = read(buffer);
+                if (count < 0) break;
+                out.write(buffer, 0, count);
+                written += count;
+            }
+            return written;
         }
 
         @Override public long skip(long count) throws java.io.IOException {

@@ -55,7 +55,7 @@ TO_JAVAP = {
 
 CONST_J = re.compile(r"public static final (int|long)\s+(\w+)\s*=\s*(-?\d+)L?;")
 NATIVE_J = re.compile(r"public static native\s+([\w.$\[\]]+)\s+(\w+)\s*\(([^)]*)\);")
-OBJFIELD_J = re.compile(r"public static final (EGL\w+) (\w+) = new EGL\w+\(0L\);")
+OBJFIELD_J = re.compile(r"public static final (EGL\w+)\s+(\w+)\s*=\s*(?:new EGL\w+\(0L\)|EGL14\.EGL_NO_\w+);")
 
 
 def to_javap(t):

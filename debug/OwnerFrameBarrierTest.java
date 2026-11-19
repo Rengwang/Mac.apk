@@ -1,5 +1,10 @@
 package android.os;
 
+import android.view.Choreographer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.locks.LockSupport;
+
 /** Regression for the vertical-fullscreen return stall: a private UI frame
  * task must remain owner-only yet cross a Choreographer sync barrier, while
  * ordinary synchronous and asynchronous guest semantics stay unchanged. */
@@ -66,6 +71,51 @@ public final class OwnerFrameBarrierTest {
         if (future.nextPollTimeoutMillis() != -1)
             throw new AssertionError("generic timeout exposed owner frame");
 
-        System.out.println("PASS: owner frame crosses barrier; sync and lifecycle stay blocked");
+        verifyMainFrameDeadlines();
+        System.out.println("PASS: owner frame barriers and main-frame deadlines/cancellation");
+    }
+
+    private static void verifyMainFrameDeadlines() {
+        Looper.prepareMainLooper();
+        Choreographer choreographer = Choreographer.getInstance();
+        List<String> calls = new ArrayList<>();
+        Object firstToken = new Object();
+        Object secondToken = new Object();
+        Runnable shared = () -> calls.add("kept");
+        int animation = Choreographer.CALLBACK_ANIMATION;
+        choreographer.postCallback(animation, shared, firstToken);
+        choreographer.postCallback(animation, shared, secondToken);
+        choreographer.removeCallbacks(animation, shared, firstToken);
+        Choreographer.macapkDriveMainFrame();
+        expectCalls(calls, "token-specific cancellation", "kept");
+
+        calls.clear();
+        choreographer.postCallback(animation, () -> calls.add("cancelled"), firstToken);
+        choreographer.postCallback(animation, () -> calls.add("kept"), secondToken);
+        choreographer.removeCallbacks(animation, null, firstToken);
+        Choreographer.macapkDriveMainFrame();
+        expectCalls(calls, "token-only cancellation", "kept");
+
+        calls.clear();
+        long end = System.nanoTime() + 80_000_000L;
+        choreographer.postCallbackDelayed(animation, () -> calls.add("later"), null, 50);
+        choreographer.postCallback(animation, () -> calls.add("earlier"), null);
+        choreographer.postCallback(Choreographer.CALLBACK_INPUT, () -> calls.add("input"), null);
+        long remaining;
+        while ((remaining = end - System.nanoTime()) > 0) LockSupport.parkNanos(remaining);
+        Choreographer.macapkDriveMainFrame();
+        expectCalls(calls, "phase and deadline order", "input", "earlier", "later");
+
+        calls.clear();
+        choreographer.postCallbackDelayed(animation, () -> calls.add("too early"), firstToken, 60_000);
+        Choreographer.macapkDriveMainFrame();
+        expectCalls(calls, "future deadline");
+        choreographer.removeCallbacks(animation, null, null);
+    }
+
+    private static void expectCalls(List<String> calls, String detail, String... expected) {
+        if (!calls.equals(List.of(expected))) {
+            throw new AssertionError(detail + ": wanted " + List.of(expected) + ", got " + calls);
+        }
     }
 }
